@@ -9,6 +9,7 @@ import struct
 import tarfile
 import time
 import urllib.parse
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -264,7 +265,7 @@ def test_download_resumes_a_connection_closed_early(tmp_path):
 def java_db_layer(tmp_path, rows):
     path = tmp_path / "trivy-java.db"
     path.unlink(missing_ok=True)
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         connection.executescript(
             "CREATE TABLE artifacts(id INTEGER PRIMARY KEY, group_id TEXT, artifact_id TEXT);"
             "CREATE TABLE indices(artifact_id INTEGER, version TEXT, sha1 BLOB, archive_type TEXT,"
