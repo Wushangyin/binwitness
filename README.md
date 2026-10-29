@@ -1,5 +1,7 @@
 # binwitness
 
+**English** · [简体中文](https://github.com/Wushangyin/binwitness/blob/main/README.zh-CN.md)
+
 Software composition analysis for **what was actually delivered**: jars, wars, `docker save` images, zip
 bundles and front-end builds, nested to any depth. Every component in the result carries the evidence it
 was identified by, so each line of a report can be defended. binwitness also checks another scanner's
@@ -92,7 +94,7 @@ What is examined:
 | a jar with several `pom.properties`, none named after the file (renamed, and shading other libraries) | each declared artifact is compared with the jar entry by entry, the one named in the manifest first; the one whose published entries all match is the jar (`content`), the others are contained in it |
 | renamed or re-zipped copies of a jar identified in the same delivery | every entry but the manifest, index and signatures has the CRC-32 and size of the identified jar: `content`, with no request. A copy whose entries match jars identified as different components (releases that changed only the version) stays unidentified and lists them in `same_content_as` |
 | jars with none of the above (Gradle builds, renamed and re-zipped), with `--class-search` | a class from the jar's main package is looked up on Maven Central search, narrowed to the version the manifest or file name suggests. A candidate is accepted only if its published entries match the jar's (`content`); the hint itself is never trusted. |
-| shaded jars | extra `pom.properties` inside the jar become components `contained in` the jar. So does a jar's only `pom.properties` when the jar's name does not mention it and either most of that artifact's published entries are missing (guice carries only cglib's) or the jar holds more entries of its own than the artifact has (a driver that bundles a compression library whole) |
+| shaded jars | extra `pom.properties` inside the jar become components contained in the jar (`contained_in`). So does a jar's only `pom.properties` when the jar's name does not mention it and either most of that artifact's published entries are missing (guice carries only cglib's) or the jar holds more entries of its own than the artifact has (a driver that bundles a compression library whole) |
 | `netty-all` style artifacts | the module list in `META-INF/io.netty.versions.properties` |
 | `package-lock.json` (v1-v3), `yarn.lock` (classic and berry), `pnpm-lock.yaml` | listed packages, with dev/runtime scope where the lockfile records it |
 | `node_modules/**/package.json` | installed packages |
