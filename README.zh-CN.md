@@ -32,6 +32,8 @@ Trivy、Syft/Grype 和 OSV-Scanner 在识别 jar、报告漏洞方面都做得�
 ## 安装
 
 ```
+pipx install binwitness
+# 或者安装最新提交
 pipx install git+https://github.com/Wushangyin/binwitness
 # 或者在克隆下来的目录里
 pip install .

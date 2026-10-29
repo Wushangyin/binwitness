@@ -60,6 +60,8 @@ the reviewer who receives a delivery from someone else and has to sign off on th
 ## Install
 
 ```
+pipx install binwitness
+# or the latest commit
 pipx install git+https://github.com/Wushangyin/binwitness
 # or, from a checkout
 pip install .

@@ -1,0 +1,50 @@
+name: publish
+# Trusted publishing: PyPI accepts uploads from this workflow in this repository, so no token is stored anywhere.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish again, e.g. v0.1.1"
+        required: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tag matches the package version
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          version=$(python -c 'import ast, pathlib; tree = ast.parse(pathlib.Path("src/binwitness/__init__.py").read_text()); print(next(n.value.value for n in tree.body if isinstance(n, ast.Assign) and n.targets[0].id == "__version__"))')
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::tag $TAG does not match __version__ $version"
+            exit 1
+          fi
+      - run: pip install -e ".[test]"
+      - run: pytest -q
+      - run: pip install build && python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+  pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/binwitness
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
