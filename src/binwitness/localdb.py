@@ -31,7 +31,6 @@ import urllib.request
 import zipfile
 import zlib
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -43,7 +42,7 @@ except ImportError:  # Windows
     fcntl = None
     import msvcrt
 
-from binwitness.net import RETRY_STATUSES, USER_AGENT, default_cache_dir, open_url
+from binwitness.net import RETRY_STATUSES, USER_AGENT, default_cache_dir, map_parallel, open_url
 from binwitness.vulns import KEV, OSV_ECOSYSTEM
 
 OSV_BUCKET = "https://osv-vulnerabilities.storage.googleapis.com"
@@ -527,8 +526,7 @@ class LocalDb:
 
     def _osv_apply(self, name, changes, entry, fetcher, workers):
         folder = OSV_FOLDER[name]
-        with ThreadPoolExecutor(workers) as pool:
-            answers = list(pool.map(lambda i: fetcher.read(f"{OSV_BUCKET}/{folder}/{i}.json"), changes))
+        answers = map_parallel(lambda i: fetcher.read(f"{OSV_BUCKET}/{folder}/{i}.json"), changes, workers)
         changed = removed = 0
         with closing(sqlite3.connect(self.path(name))) as connection, connection:
             for record_id, (status, body) in zip(changes, answers):

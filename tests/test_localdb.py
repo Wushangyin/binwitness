@@ -668,7 +668,8 @@ def test_cli_offline_online_replays_the_cache_without_datasets(tmp_path):
     replay = json.loads((tmp_path / "replay" / "binwitness.json").read_text())
     local = json.loads((tmp_path / "local" / "binwitness.json").read_text())
     assert (replay["options"]["lookup"], replay["data_sources"]["local"]) == ("online", {})
-    assert local["options"]["lookup"] == "local" and set(local["data_sources"]["local"]) == {"maven-hashes", "kev"}
+    # No findings, so the KEV catalog was not consulted.
+    assert local["options"]["lookup"] == "local" and set(local["data_sources"]["local"]) == {"maven-hashes"}
 
 
 def test_default_dataset_dir_is_not_a_cache_shard(monkeypatch, tmp_path):

@@ -50,6 +50,25 @@ def test_a_failed_lookup_is_not_remembered():
     assert ("gone.example", 443) not in net._addresses
 
 
+def test_a_connection_gets_less_time_than_a_reply(monkeypatch):
+    """A lost handshake is retried after CONNECT_TIMEOUT; the answer still gets the full request timeout."""
+    asked = []
+
+    class Connection:
+        def settimeout(self, value):
+            asked.append(("reply", value))
+
+    def create_connection(target, timeout, source_address=None):
+        asked.append(("connect", timeout))
+        return Connection()
+
+    monkeypatch.setattr(net.socket, "create_connection", create_connection)
+    net._addresses[("a.example", 443)] = (time.monotonic(), [(socket.AF_INET, socket.SOCK_STREAM, 6, "",
+                                                              ("192.0.2.1", 443))])
+    net._connect(("a.example", 443), 30)
+    assert asked == [("connect", net.CONNECT_TIMEOUT), ("reply", 30)]
+
+
 class Hello(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)

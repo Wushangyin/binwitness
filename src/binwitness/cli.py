@@ -1,9 +1,11 @@
-"""Command line: ``binwitness scan``, ``binwitness crosscheck`` and ``binwitness db``."""
+"""Command line: binwitness scan, binwitness crosscheck and binwitness db."""
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -16,6 +18,11 @@ from binwitness.net import Net, default_cache_dir
 from binwitness.output import render_summary, write_all
 from binwitness.scan import Options, scan
 from binwitness.vulns import SEVERITIES
+
+DESCRIPTION = ("Evidence-backed software composition analysis for delivered binaries: jars, wars, container images "
+               "and front-end builds.")
+# What a --fail-on gate cannot vouch for: components it could not name, or could not look up.
+UNCHECKED = ("jars_not_looked_up", "scripts_not_looked_up", "vulnerabilities_not_checked")
 
 
 def _network_arguments(parser: argparse.ArgumentParser):
@@ -121,7 +128,33 @@ def _database(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="binwitness", description=__doc__)
+    try:
+        return _main(argv)
+    except KeyboardInterrupt:
+        print("binwitness: interrupted", file=sys.stderr)
+        # Lookups already sent hold their worker threads until they answer or time out, and the interpreter
+        # waits for them before it exits. The cache is written atomically, so nothing is left half-written.
+        if threading.active_count() > 1:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(130)
+        return 130
+
+
+def _output_directory(parser: argparse.ArgumentParser, path: Path):
+    """Checked before the scan rather than after it: a large delivery takes many minutes to scan."""
+    if path.exists() and not path.is_dir():
+        parser.error(f"--out {path} is a file; give a directory for the result files")
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        parser.error(f"cannot create --out {path}: {error}")
+    if not os.access(path, os.W_OK):
+        parser.error(f"cannot write to --out {path}")
+
+
+def _main(argv: list[str] | None) -> int:
+    parser = argparse.ArgumentParser(prog="binwitness", description=DESCRIPTION)
     parser.add_argument("--version", action="version", version=f"binwitness {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -138,13 +171,19 @@ def main(argv: list[str] | None = None) -> int:
                      help="skip locations matching this glob (repeatable)")
     run.add_argument("--class-search", action="store_true",
                      help="identify rebuilt jars that carry no coordinates: search Maven Central for one class "
-                          "name per unidentified jar, then compare contents (sends that class name)")
+                          "name per unidentified jar and try coordinates its file name suggests, then compare "
+                          "contents (sends that class name and those coordinates)")
+    run.add_argument("--maven-repo", action="append", default=[], metavar="URL",
+                     help="another Maven repository that publishes releases Maven Central does not have "
+                          "(milestones, a vendor's own); checked after Central, in the order given (repeatable)")
     run.add_argument("--no-js", action="store_true", help="do not look up vendored JavaScript files")
     run.add_argument("--no-licenses", action="store_true", help="skip license resolution")
     run.add_argument("--no-vulns", action="store_true", help="skip vulnerability lookup")
     run.add_argument("--unpacker", help="rar/7z extractor to use (unrar, 7z or bsdtar; default: first on PATH)")
     run.add_argument("--fail-on", choices=[s.lower() for s in SEVERITIES[:4]],
-                     help="exit with status 3 if any vulnerability at or above this severity is found")
+                     help="exit with status 3 if any vulnerability at or above this severity is found, or 4 if "
+                          "none is but the scan could not check everything (failed or offline lookups) or "
+                          "found nothing to check")
     _network_arguments(run)
     _lookup_arguments(run)
 
@@ -182,12 +221,18 @@ def main(argv: list[str] | None = None) -> int:
         missing = [str(p) for p in args.inputs if not p.exists()]
         if missing:
             parser.error(f"not found: {', '.join(missing)}")
+        if args.fail_on and args.no_vulns:
+            parser.error("--fail-on needs the vulnerability lookup that --no-vulns turns off")
+        repositories = tuple(dict.fromkeys(url.rstrip("/") for url in args.maven_repo))
+        if any(not url.startswith(("https://", "http://")) for url in repositories):
+            parser.error("--maven-repo takes an http(s) URL")
+        _output_directory(parser, args.out)
         options = Options(first_party_groups=tuple(args.first_party_group),
                           first_party_jars=tuple(args.first_party_jar),
                           first_party_npm=tuple(args.first_party_npm), exclude=tuple(args.exclude),
                           scan_js=not args.no_js, licenses=not args.no_licenses,
                           vulnerabilities=not args.no_vulns, workers=args.workers, unpacker=args.unpacker,
-                          class_search=args.class_search)
+                          class_search=args.class_search, maven_repos=repositories)
         local = args.offline or args.lookup == "local"
         db = None if args.lookup == "online" else LocalDb.open(args.db_dir)
         result = scan(args.inputs, _net(args, offline=local), options, db=db)
@@ -198,8 +243,16 @@ def main(argv: list[str] | None = None) -> int:
             threshold = SEVERITIES.index(args.fail_on.upper())
             if any(SEVERITIES.index(v["severity"]) <= threshold for v in result["vulnerabilities"].values()):
                 return 3
+            summary = result["summary"]
+            unchecked = any(summary["incomplete"].get(k) for k in UNCHECKED)
+            if unchecked or not (summary["components"]["total"] or summary["jars"]["distinct_files"]):
+                print("binwitness: --fail-on: nothing at that severity was found, but the scan "
+                      + ("could not check everything" if unchecked else "found nothing to check"), file=sys.stderr)
+                return 4
         return 0
 
+    if args.out.is_dir():
+        parser.error(f"--out {args.out} is a directory; give the name of the JSON file to write")
     result = json.loads(args.result.read_text("utf-8"))
     report = crosscheck(result, load_other(args.other), _net(args), workers=min(args.workers, 4))
     args.out.parent.mkdir(parents=True, exist_ok=True)

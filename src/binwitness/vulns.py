@@ -4,9 +4,8 @@ from __future__ import annotations
 import functools
 import math
 import re
-from concurrent.futures import ThreadPoolExecutor
 
-from binwitness.net import Net, NetError
+from binwitness.net import Net, NetError, map_parallel
 from binwitness.versions import compare
 
 OSV = "https://api.osv.dev/v1"
@@ -15,20 +14,24 @@ SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN")
 OSV_ECOSYSTEM = {"maven": "Maven", "npm": "npm"}
 
 
-def query(net: Net, packages: list[tuple[str, str, str]], workers: int = 16) -> tuple[dict, list[str]]:
-    """(ecosystem, name, version) -> full OSV records.
+def query(net: Net, packages: list[tuple[str, str, str]], workers: int = 16) -> tuple[dict, list[str], set]:
+    """(ecosystem, name, version) -> full OSV records, the failures as messages, and the packages whose
+    answer is incomplete because a lookup failed: an empty list for those means "not checked", not "clean".
 
     Ids come from querybatch (one request per 500 packages); records are fetched by id and cached across
     scans, refetched only when querybatch reports a newer ``modified`` time than the cached copy."""
     wanted: dict[tuple, list[tuple[str, str]]] = {}
     failures = []
+    incomplete = set()
     for start in range(0, len(packages), 500):
         chunk = packages[start:start + 500]
         bodies = [{"package": {"name": n, "ecosystem": OSV_ECOSYSTEM[e]}, "version": v} for e, n, v in chunk]
         try:
             results = (net.post_json(f"{OSV}/querybatch", {"queries": bodies}) or {}).get("results", [])
         except NetError as error:
-            failures += [f"OSV {n}@{v}: {error}" for _, n, v in chunk]
+            failures.append(f"OSV: vulnerabilities of {len(chunk)} package{'' if len(chunk) == 1 else 's'} "
+                            f"not checked: {error}")
+            incomplete.update(chunk)
             continue
         for package, body, result in zip(chunk, bodies, results):
             hits = [(x["id"], x.get("modified", "")) for x in result.get("vulns", [])]
@@ -40,6 +43,7 @@ def query(net: Net, packages: list[tuple[str, str, str]], workers: int = 16) -> 
                     token = page.get("next_page_token")
             except NetError as error:
                 failures.append(f"OSV {package[1]}@{package[2]} (later pages): {error}")
+                incomplete.add(package)
             wanted[package] = hits
 
     def fetch(hit):
@@ -51,16 +55,17 @@ def query(net: Net, packages: list[tuple[str, str, str]], workers: int = 16) -> 
         return record
 
     unique = sorted({hit for hits in wanted.values() for hit in hits})
-    records = {}
-    with ThreadPoolExecutor(workers) as pool:
-        for hit, record in zip(unique, pool.map(_guard(fetch), unique)):
-            if isinstance(record, Exception):
-                failures.append(f"OSV record {hit[0]}: {record}")
-            elif record is not None:
-                records[hit[0]] = record
+    records, missing = {}, set()
+    for hit, record in zip(unique, map_parallel(_guard(fetch), unique, workers)):
+        if isinstance(record, Exception):
+            failures.append(f"OSV record {hit[0]}: {record}")
+            missing.add(hit[0])
+        elif record is not None:
+            records[hit[0]] = record
+    incomplete.update(package for package, hits in wanted.items() if any(i in missing for i, _ in hits))
     results = {package: [records[i] for i, _ in hits if i in records and not records[i].get("withdrawn")]
                for package, hits in wanted.items()}
-    return results, failures
+    return results, failures, incomplete
 
 
 def query_local(db, packages: list[tuple[str, str, str]]) -> dict:

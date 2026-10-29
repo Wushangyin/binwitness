@@ -14,11 +14,12 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import urllib.parse
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
 
-from binwitness.net import Net, NetError
+from binwitness import maven, vulns
+from binwitness.net import Net, NetError, map_parallel
 from binwitness.versions import in_range
 
 GITHUB = "https://api.github.com"
@@ -116,9 +117,11 @@ def advisories(net: Net, cve: str, kind: str, token: str | None) -> list[dict]:
 
 
 def classify(net: Net, ecosystem: str, name: str, version: str, vuln_id: str, bundled: list[tuple[str, str]],
-             token: str | None, same_file: list[tuple[str, str]] = ()) -> tuple[str, str]:
+             token: str | None, same_file: list[tuple[str, str]] = (), group_advisories=None) -> tuple[str, str]:
     """``same_file``: (name, version) the identical file is also published under; an advisory naming one of
-    them names this component."""
+    them names this component. ``group_advisories``: groupId -> OSV records of its modules, shared by the
+    findings of one crosscheck."""
+    group_advisories = group_advisories or (lambda group: _group_advisories(net, group))
     if not re.match(r"^(CVE-\d{4}-\d+|GHSA-[\w-]+)$", vuln_id):
         return "tool-specific-id", ""
     try:
@@ -128,7 +131,9 @@ def classify(net: Net, ecosystem: str, name: str, version: str, vuln_id: str, bu
             records = advisories(net, vuln_id, "reviewed", token)
         if not records:
             unreviewed = advisories(net, vuln_id, "unreviewed", token) if vuln_id.startswith("CVE-") else []
-            return ("unattributed", unreviewed[0]["ghsa_id"]) if unreviewed else ("no-github-record", "")
+            if unreviewed:
+                return "unattributed", unreviewed[0]["ghsa_id"]
+            return _cited_in_project(group_advisories, ecosystem, name, version, vuln_id) or ("no-github-record", "")
     except NetError as error:
         return "lookup-failed", str(error)
     named = []
@@ -155,7 +160,45 @@ def classify(net: Net, ecosystem: str, name: str, version: str, vuln_id: str, bu
     if ecosystem == "npm" and name.startswith("@") and any(n.split("/")[0] == name.split("/")[0]
                                                            for e, n, _ in named if e == "npm"):
         return "same-project-other-module", detail
-    return "other-package", detail
+    return _cited_in_project(group_advisories, ecosystem, name, version, vuln_id) or ("other-package", detail)
+
+
+def _cited_in_project(group_advisories, ecosystem: str, name: str, version: str,
+                      cve: str) -> tuple[str, str] | None:
+    """A verdict from an advisory of this project that cites the CVE without GitHub linking the two.
+
+    GitHub's own advisory for netty and HTTP/2 Rapid Reset (GHSA-xpw8-rcwv-8f8p) carries no CVE id, so a
+    search by CVE-2023-44487 finds the other projects' advisories but not netty's; OSV records the CVE as
+    related. OSV cannot be searched by CVE, so this reads the advisories of every module of the groupId."""
+    if ecosystem != "maven" or not cve.startswith("CVE-"):
+        return None
+    group = name.split(":")[0]
+    try:
+        records = group_advisories(group)
+    except NetError:
+        return None
+    cited = [r for r in records if cve in (r.get("aliases") or []) + (r.get("related") or [])]
+    for record in cited:
+        if vulns.affects(record, ecosystem, name, version):
+            return "confirmed", f"{record['id']} (OSV lists it as related to {cve})"
+    modules = sorted({a["package"]["name"] for r in cited for a in r.get("affected", [])
+                      if (a.get("package") or {}).get("ecosystem") == "Maven"
+                      and a["package"].get("name", "").startswith(group + ":") and a["package"]["name"] != name})
+    if modules:
+        ids = ", ".join(sorted({r["id"] for r in cited}))
+        return "same-project-other-module", f"{', '.join(modules)} ({ids}, which OSV lists as related to {cve})"
+    return None
+
+
+def _group_advisories(net: Net, group: str) -> list[dict]:
+    """OSV records of every Maven module of a groupId."""
+    modules = [f"{group}:{artifact}" for artifact in maven.group_artifacts(net, group)]
+    bodies = [{"package": {"name": module, "ecosystem": "Maven"}} for module in modules]
+    ids = set()
+    for start in range(0, len(bodies), 500):
+        answer = net.post_json(f"{vulns.OSV}/querybatch", {"queries": bodies[start:start + 500]}) or {}
+        ids |= {x["id"] for result in answer.get("results", []) for x in result.get("vulns", [])}
+    return [r for r in (net.get_json(f"{vulns.OSV}/vulns/{i}", stable=True) for i in sorted(ids)) if r]
 
 
 def _ghsa(net: Net, ghsa: str, token: str | None):
@@ -206,13 +249,21 @@ def crosscheck(result: dict, other: dict[tuple[str, str, str], set[str]], net: N
         for vuln in sorted(theirs - matched):
             pending.append((key, vuln, bundled.get(purls[key], [])))
 
+    held, lock = {}, threading.Lock()
+
+    def group_advisories(group):
+        # Read once per group, however many findings ask (netty: dozens of findings, one group).
+        with lock:
+            if group not in held:
+                held[group] = _group_advisories(net, group)
+            return held[group]
+
     def run(task):
         (ecosystem, name, version), vuln, inside = task
         return classify(net, ecosystem, name, version, vuln, inside, token,
-                        [(n, v) for _, n, v in same_file.get((ecosystem, name, version), [])])
+                        [(n, v) for _, n, v in same_file.get((ecosystem, name, version), [])], group_advisories)
 
-    with ThreadPoolExecutor(workers) as pool:
-        verdicts = list(pool.map(run, pending))
+    verdicts = map_parallel(run, pending, workers)
     only_theirs = [{"component": f"{key[1]}@{key[2]}", "id": vuln, "class": verdict, "detail": detail}
                    for (key, vuln, _), (verdict, detail) in zip(pending, verdicts)]
 

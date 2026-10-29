@@ -19,7 +19,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,12 @@ HOST_CONCURRENCY = {"search.maven.org": 2}
 # Answers normally arrive within two seconds, but now and then a connection stalls without ever replying.
 # A long timeout parks a worker on each stall for its full length; a short one gets it back to a retry.
 REQUEST_TIMEOUT = 30
+# Maven Central's search front end holds about a third of requests for 30 or 60 s before it passes on an answer
+# the index produced in milliseconds. Asking again after a few seconds is quicker than waiting that out.
+HOST_TIMEOUT = {"search.maven.org": 8}
+# A connection is made within a second or not at all: on some routes a share of handshakes is dropped outright.
+# A new connection, from another port, usually gets through, so waiting longer for the lost one only idles.
+CONNECT_TIMEOUT = 10
 # A connection's timeout does not cover the name lookup before it. When the resolver falls back to TCP and the
 # DNS server never answers (seen behind WSL's resolver), getaddrinfo blocks for good and the scan with it.
 # Looked-up addresses are kept for a few minutes, so a scan asks for each host about once.
@@ -51,6 +58,16 @@ class OfflineMiss(NetError):
 
 
 Transport = Callable[[str, str, bytes | None, dict], tuple[int, bytes, dict]]
+
+
+def map_parallel(function: Callable, items: Iterable, workers: int) -> list:
+    """``ThreadPoolExecutor.map`` into a list, except that an interrupt does not wait for the queue: the pool's
+    own exit would run every pending lookup, each up to a timeout and its retries, before Ctrl-C took effect."""
+    pool = ThreadPoolExecutor(workers)
+    try:
+        return list(pool.map(function, items))
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def resolve(host: str, port: int, timeout: float = REQUEST_TIMEOUT, lookup=socket.getaddrinfo) -> list:
@@ -80,9 +97,12 @@ def _connect(address, timeout=REQUEST_TIMEOUT, source_address=None, *args, **kwa
     failure = None
     for *_, target in resolve(host, port):
         try:
-            return socket.create_connection(target[:2], timeout, source_address)
+            connection = socket.create_connection(target[:2], min(timeout, CONNECT_TIMEOUT), source_address)
         except OSError as error:
             failure = error
+            continue
+        connection.settimeout(timeout)
+        return connection
     raise failure or OSError(f"no address for {host}")
 
 
@@ -119,7 +139,7 @@ def open_url(request: urllib.request.Request, timeout: float = REQUEST_TIMEOUT):
 def urllib_transport(method: str, url: str, body: bytes | None, headers: dict) -> tuple[int, bytes, dict]:
     request = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
-        with open_url(request) as response:
+        with open_url(request, HOST_TIMEOUT.get(request.host, REQUEST_TIMEOUT)) as response:
             return response.status, response.read(), dict(response.headers)
     except urllib.error.HTTPError as error:
         return error.code, error.read() or b"", dict(error.headers or {})

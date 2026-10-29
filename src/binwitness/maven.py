@@ -13,6 +13,7 @@ import struct
 import urllib.parse
 from collections import Counter
 
+from binwitness.jar import split_name
 from binwitness.licenses import detect, pom_licenses
 from binwitness.net import Net, NetError
 
@@ -23,15 +24,20 @@ CENTRAL_SEARCH = "https://search.maven.org/solrsearch/select"
 # directory of a jar with several hundred entries in one request; larger ones take a second.
 TAIL = 64 * 1024
 LIST_LIMIT = 20
+# io.netty has about 130 artifacts; a group larger than this is not one project.
+GROUP_LIMIT = 200
 # Rewritten whenever a jar is re-zipped, without changing any code it ships: the manifest (attributes
-# reordered, version headers dropped), the jar index, and signatures, which re-zipping invalidates.
-PACKAGING = re.compile(r"META-INF/(MANIFEST\.MF|INDEX\.LIST|[^/]+\.(SF|RSA|DSA|EC))$", re.I)
+# reordered, version headers dropped), the jar index, and signatures, which re-zipping invalidates. Maven's
+# build metadata (pom.xml, pom.properties) is in the same position: release builds rewrite the pom (Nacos
+# flattens it), and vendors strip it from the jars they rename.
+PACKAGING = re.compile(r"META-INF/(MANIFEST\.MF|INDEX\.LIST|[^/]+\.(SF|RSA|DSA|EC)|maven/.+)$", re.I)
+PACKAGING_TEXT = "the manifest, index, signatures and Maven build metadata"
 
 
 def lookup_hash(net: Net, sha1: str, filename: str, db=None, declared: tuple[str, str, str] | None = None) -> dict | None:
     """Registry entry whose published file has exactly this SHA-1, or None. ``declared`` is the coordinate in
     the jar's own pom.properties: of several coordinates publishing the same file, it names the original."""
-    stem = filename[:-4] if filename.lower().endswith(".jar") else filename
+    stem = split_name(filename)[0]
 
     def named(candidate) -> bool:
         return stem == f"{candidate[1]}-{candidate[2]}" or stem.startswith(f"{candidate[1]}-{candidate[2]}-")
@@ -75,38 +81,44 @@ def _deps_dev(net: Net, sha1: str) -> list[tuple]:
     return [(*h["versionKey"]["name"].split(":", 1), h["versionKey"]["version"], h.get("licenses", [])) for h in hits]
 
 
-def _published_url(coordinate: tuple[str, str, str], filename: str) -> str:
+def _published_url(coordinate: tuple[str, str, str], filename: str, repository: str = CENTRAL) -> str:
     group, artifact, version = coordinate
-    stem = filename[:-4] if filename.lower().endswith(".jar") else filename
+    stem, extension = split_name(filename)
     classifier = stem[len(f"{artifact}-{version}-"):] if stem.startswith(f"{artifact}-{version}-") else ""
-    name = f"{artifact}-{version}-{classifier}.jar" if classifier else f"{artifact}-{version}.jar"
-    return f"{CENTRAL}/{group.replace('.', '/')}/{artifact}/{version}/{name}"
+    name = f"{artifact}-{version}-{classifier}{extension}" if classifier else f"{artifact}-{version}{extension}"
+    return f"{repository}/{group.replace('.', '/')}/{artifact}/{version}/{name}"
 
 
-def published_status(net: Net, coordinate: tuple[str, str, str], filename: str, sha1: str) -> str:
-    """Compare a jar that no registry recognised with the file published under its declared coordinate.
+def published_status(net: Net, coordinate: tuple[str, str, str], filename: str, sha1: str,
+                     repositories: tuple[str, ...] = ()) -> tuple[str, str | None]:
+    """Compare a jar that no registry recognised with the file published under its declared coordinate:
+    (status, the repository that publishes it). ``repositories`` are consulted after Maven Central.
 
-    Only the checksum Maven Central serves next to the file decides. The local hash index cannot: it keeps
+    Only the checksum a repository serves next to the file decides. The local hash index cannot: it keeps
     one coordinate per file, mixes classifier jars in with the main one, and has stale entries
     (javassist 3.18.1-GA), and a wrong "differs" accuses a jar of having been rebuilt.
     """
     if coordinate[2].upper().endswith("SNAPSHOT"):
-        return "snapshot"
-    url = _published_url(coordinate, filename)
-    text = net.get(f"{url}.sha1", stable=True)
-    if text is None:
-        return "not-on-central"
-    published = text.decode("ascii", "replace").split()
-    return "identical" if published and published[0].lower() == sha1 else "differs"
+        return "snapshot", None
+    differing = None
+    for repository in (CENTRAL, *repositories):
+        text = net.get(f"{_published_url(coordinate, filename, repository)}.sha1", stable=True)
+        if text is None:
+            continue
+        published = text.decode("ascii", "replace").split()
+        if published and published[0].lower() == sha1:
+            return "identical", repository
+        differing = differing or repository
+    return ("differs", differing) if differing else ("not-on-central", None)
 
 
 def compare_with_published(net: Net, coordinate: tuple[str, str, str], filename: str,
-                           local: dict[str, tuple[int, int]]) -> dict | None:
+                           local: dict[str, tuple[int, int]], repository: str = CENTRAL) -> dict | None:
     """Entry-by-entry comparison with the published jar, read from its central directory alone.
 
     None when the published jar's directory cannot be read (absent, zip64, malformed).
     """
-    url = _published_url(coordinate, filename)
+    url = _published_url(coordinate, filename, repository)
     tail = net.get(url, stable=True, headers={"Range": f"bytes=-{TAIL}"})
     if tail is None:
         return None
@@ -162,6 +174,26 @@ def find_by_class(net: Net, class_name: str, versions: list[str]) -> list[tuple[
     return sorted(found, key=lambda c: not class_name.startswith(c[0] + "."))
 
 
+def group_artifacts(net: Net, group: str) -> list[str]:
+    """The artifactIds Maven Central lists under a groupId (one search result per artifact)."""
+    query = urllib.parse.quote(f'g:"{group}"')
+    docs = (net.get_json(f"{CENTRAL_SEARCH}?q={query}&rows={GROUP_LIMIT}&wt=json", stable=True) or {}).get(
+        "response", {}).get("docs", [])
+    return sorted({d["a"] for d in docs if d.get("g") == group and d.get("a")})
+
+
+def find_artifacts_by_class(net: Net, class_name: str) -> list[tuple[str, str]]:
+    """Artifacts on Maven Central that contain this class in any release, as (groupId, artifactId).
+
+    For releases published elsewhere only (milestones on a vendor's repository): Central's index still knows
+    the artifact from its other releases."""
+    query = urllib.parse.quote(f"fc:{class_name}")
+    docs = (net.get_json(f"{CENTRAL_SEARCH}?q={query}&rows={LIST_LIMIT}&wt=json", stable=True) or {}).get(
+        "response", {}).get("docs", [])
+    found = list(dict.fromkeys((d["g"], d["a"]) for d in docs if d.get("g") and d.get("a")))
+    return sorted(found, key=lambda c: not class_name.startswith(c[0] + "."))
+
+
 def _central_directory(net: Net, url: str, tail: bytes) -> dict[str, tuple[int, int]] | None:
     """name -> (CRC-32, size) of the file entries, from the end of a zip (or the whole of it)."""
     at = len(tail)
@@ -204,10 +236,16 @@ def registry_licenses(net: Net, coordinate: tuple[str, str, str]) -> list[str]:
     return [e for e in found.get("licenses", []) if e and e.lower() != "non-standard"]
 
 
-def central_licenses(net: Net, group: str, artifact: str, version: str, depth: int = 0) -> list[str]:
-    """``<licenses>`` of the published POM, following ``<parent>`` the way Maven inherits it (4 levels)."""
-    pom = net.get(f"{CENTRAL}/{group.replace('.', '/')}/{artifact}/{version}/{artifact}-{version}.pom",
-                  stable=True)
+def central_licenses(net: Net, group: str, artifact: str, version: str, depth: int = 0,
+                     repositories: tuple[str, ...] = ()) -> list[str]:
+    """``<licenses>`` of the published POM, following ``<parent>`` the way Maven inherits it (4 levels).
+    ``repositories`` are consulted after Maven Central."""
+    pom = None
+    for repository in (CENTRAL, *repositories):
+        pom = net.get(f"{repository}/{group.replace('.', '/')}/{artifact}/{version}/{artifact}-{version}.pom",
+                      stable=True)
+        if pom:
+            break
     if not pom:
         return []
     text = pom.decode("utf-8", "replace")
@@ -218,10 +256,12 @@ def central_licenses(net: Net, group: str, artifact: str, version: str, depth: i
     ref = {k: re.search(rf"<{k}>\s*([^<]+?)\s*</{k}>", parent.group(1)) for k in ("groupId", "artifactId", "version")}
     if not all(ref.values()):
         return []
-    return central_licenses(net, *(ref[k].group(1) for k in ("groupId", "artifactId", "version")), depth + 1)
+    return central_licenses(net, *(ref[k].group(1) for k in ("groupId", "artifactId", "version")), depth + 1,
+                            repositories)
 
 
-def licenses_for(net: Net, coordinate: tuple[str, str, str], hinted: list[str] | None) -> dict | None:
+def licenses_for(net: Net, coordinate: tuple[str, str, str], hinted: list[str] | None,
+                 repositories: tuple[str, ...] = ()) -> dict | None:
     """License declaration from the registry; ``hinted`` are expressions a hash lookup already returned."""
     expressions = [e for e in (hinted or []) if e and e.lower() != "non-standard"] or registry_licenses(
         net, coordinate)
@@ -230,4 +270,8 @@ def licenses_for(net: Net, coordinate: tuple[str, str, str], hinted: list[str] |
     names = central_licenses(net, *coordinate)
     if names:
         return {"names": names, "source": "Maven Central POM"}
+    for repository in repositories:
+        names = central_licenses(net, *coordinate, repositories=(repository,))
+        if names:
+            return {"names": names, "source": f"POM from {repository}"}
     return None

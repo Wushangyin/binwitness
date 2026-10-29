@@ -9,20 +9,31 @@ $ binwitness scan release.zip -o out
 walked 1 input(s): 5 distinct jars, 0 npm package entries, 0 distinct scripts
 identified jars: 5 of 5
 vulnerabilities: 133 distinct across 22 components
-components   34  (maven 34; exact 5, content 0, declared 29)
-jars         5 distinct: third-party 5, first-party 0, unidentified 0
-vulns        133 distinct: critical 12, high 73, medium 46, low 2; known exploited 2
+components   34  (maven 34; exact 5, declared 29)
+jars         5 distinct: third-party 5
+vulns        133 distinct: critical 12, high 73, medium 46, low 2, known exploited 2
+  critical CVE-2021-44228       org.apache.logging.log4j:log4j-core 2.14.1, fixed in 2.15.0 KEV
+  critical CVE-2021-45046       org.apache.logging.log4j:log4j-core 2.14.1, fixed in 2.16.0 KEV
+  critical CVE-2015-7501        commons-collections:commons-collections 3.2.1, fixed in 3.2.2
+  critical CVE-2019-16942       com.fasterxml.jackson.core:jackson-databind 2.9.10, fixed in 2.9.10.1
+  critical CVE-2019-16943       com.fasterxml.jackson.core:jackson-databind 2.9.10, fixed in 2.9.10.1
+  critical CVE-2019-17531       com.fasterxml.jackson.core:jackson-databind 2.9.10, fixed in 2.9.10.1
+  critical CVE-2019-20330       com.fasterxml.jackson.core:jackson-databind 2.9.10, fixed in 2.9.10.2
+  critical CVE-2020-8840        com.fasterxml.jackson.core:jackson-databind 2.9.10, fixed in 2.9.10.3
+  critical CVE-2020-9546        com.fasterxml.jackson.core:jackson-databind 2.9.10, fixed in 2.9.10.4
+  critical CVE-2020-9547        com.fasterxml.jackson.core:jackson-databind 2.9.10, fixed in 2.9.10.4
+  ... 75 more (vulnerabilities.csv)
 licenses     permissive 34
 ```
 
-示例中的 `release.zip` 装有从 Maven Central 下载的五个 jar：log4j-core 2.14.1、jackson-databind 2.9.10、commons-collections 3.2.1、mybatis 3.4.6 和 netty-all 4.1.54.Final。扫描从中识别出 34 个组件：netty-all 内含的 27 个模块，以及 shade 进 mybatis 的 ognl 和 javassist。`netty-all` 本身名下没有任何漏洞公告，它的模块名下有 71 条。（数字基于 2026 年 10 月的数据，会随新公告的发布而增长。）
+示例中的 `release.zip` 装有从 Maven Central 下载的五个 jar：log4j-core 2.14.1、jackson-databind 2.9.10、commons-collections 3.2.1、mybatis 3.4.6 和 netty-all 4.1.54.Final。扫描从中识别出 34 个组件：netty-all 内含的 27 个模块，以及 shade 进 mybatis 的 ognl 和 javassist。`netty-all` 本身名下没有任何漏洞公告，它的模块名下有 71 条。摘要先列最严重的发现（恶意包、已知被利用、严重、高危）及各自的修复版本，全部发现见 `vulnerabilities.csv`。（数字基于 2026 年 10 月的数据，会随新公告的发布而增长。）
 
 ## 为什么还要一个 SCA 工具
 
 Trivy、Syft/Grype 和 OSV-Scanner 在识别 jar、报告漏洞方面都做得很好。binwitness 面向的是另一种角色：接收别人的交付物、并要为检查结果签字负责的审查者。
 
 - **只认证据，不靠猜测**。一个组件被识别出来，要么因为文件与某个已发布构件逐字节相同（`exact`），要么因为其中每个条目都与已发布构件逐条对上（`content`），要么因为构件自己声明了坐标（`declared`）。从不由文件名推断坐标。其余一律列为未识别，并附上它携带的线索。
-- **区分重新打包与被修改**。fat jar 构建常把依赖重新压缩：删掉目录条目、改写 manifest、时间戳也变了。文件哈希因此对不上，但代码并没有变。binwitness 读取已发布 jar 的中央目录（用 Range 请求只取文件末尾几 KB），逐条比较每个条目的 CRC-32 和大小。只有 manifest、jar 索引或签名不同的，判为 `repackaged`；类或资源文件不同的，判为 `differs`，并列出改动、新增和缺少的条目。打在另一个 jar 里、而外层 jar 与其发布件完全相同的，判为 `inside-published`：那是上游自己放进去的。
+- **区分重新打包与被修改**。fat jar 构建常把依赖重新压缩：删掉目录条目、改写 manifest、时间戳也变了。文件哈希因此对不上，但代码并没有变。binwitness 读取已发布 jar 的中央目录（用 Range 请求只取文件末尾几 KB），逐条比较每个条目的 CRC-32 和大小。只有 manifest、jar 索引、签名或 `META-INF/maven` 下的 Maven 构建元数据不同的，判为 `repackaged`；类或资源文件不同的，判为 `differs`，并列出改动、新增和缺少的条目。打在另一个 jar 里、而外层 jar 与其发布件完全相同的，判为 `inside-published`：那是上游自己放进去的。
 - **拆开捆绑在一起的代码**。fat jar（`BOOT-INF/lib`、`WEB-INF/lib`）、shade 过的 jar（内嵌 `pom.properties`）以及 `netty-all` 这类合集构件，都会展开成各自的模块。漏洞公告登记在模块名下，只按 `netty-all` 自己的名字查会全部漏掉。
 - **能核对其他扫描工具的结论**。`binwitness crosscheck` 读入另一个工具的结果，对其中 binwitness 没有复现的每条发现，到 GitHub 已审核的漏洞库里查原始公告，再归入以下一类：确属漏报、属于同一项目的另一个模块、属于另一个包、版本不在受影响范围内、上游登记时未指明任何包。按产品名（CPE）匹配的工具会把一条公告挂到同一产品的所有模块上，这个命令能看出一份报告里有多少是这类噪声。
 - **结果注明数据时效**。每个响应都连同获取时间一起缓存，结果中记录每个数据源用到的最旧和最新数据。`--offline` 可以在不联网的机器上用缓存重放一次扫描。
@@ -39,7 +50,7 @@ pipx install git+https://github.com/Wushangyin/binwitness
 pip install .
 ```
 
-打开 rar 和 7z 压缩包需要 `PATH` 中有 `unrar`、`7z` 或 `bsdtar`，也可以用 `--unpacker` 指定。
+打开 rar 和 7z 压缩包需要 `PATH` 中有 `unrar`、`7z` 或 `bsdtar`，也可以用 `--unpacker` 指定。Java EE 资源适配器（`.rar`）实为 zip，不需要这些工具。
 
 ## 扫描
 
@@ -53,42 +64,51 @@ binwitness scan INPUT... -o OUTDIR [options]
 | `--first-party-jar acme-` | 自有代码的 jar 文件名前缀，可重复。 |
 | `--first-party-npm @acme/` | 自有 npm 包的名称前缀，可重复。 |
 | `--exclude GLOB` | 跳过某些位置，例如用 `*!/<registry/unrelated:*>` 跳过多镜像 tar 包中的某一个镜像 |
-| `--class-search` | 识别不带坐标的重新构建 jar（见下文）。每个这样的 jar 会向 Maven Central 发送一个类名 |
-| `--no-js` | 不查询随项目拷入的 JavaScript 文件 |
-| `--fail-on high` | 发现该等级及以上的问题时以状态码 3 退出（用于 CI） |
+| `--class-search` | 识别不带坐标的重新构建 jar（见下文）。每个这样的 jar 会向 Maven Central 发送一个类名，并查询其名称提示的坐标 |
+| `--maven-repo URL` | 另一个发布了 Maven Central 没有的版本的 Maven 仓库：里程碑仓库、厂商或贵公司自己的仓库。在中央仓之后按给出的顺序查询校验和、jar 目录和 POM 许可证。可重复 |
+| `--no-js` / `--no-licenses` / `--no-vulns` | 不查询随项目拷入的 JavaScript 文件 / 许可证 / 漏洞 |
+| `--fail-on high` | 发现该等级及以上的问题时以状态码 3 退出；没有发现、但扫描未能查全（查询失败或离线查不到）或什么都没找到时以状态码 4 退出（用于 CI） |
+| `--unpacker PROGRAM` | 指定 rar/7z 解压程序（`unrar`、`7z` 或 `bsdtar`），默认用 `PATH` 中找到的第一个 |
 | `--lookup auto\|local\|online` | 由谁回答查询，见[本地数据集](#本地数据集)。默认 `auto` |
 | `--maven-mirror URL` | 从 Maven Central 的镜像获取中央仓文件（校验和、POM、jar 目录），适合离 Maven Central 较远的机器。哈希搜索和 deps.dev 仍访问各自的主机。镜像必须原样提供中央仓的文件并支持 `Range`，否则会下载整个 jar。结果会注明所用镜像（`options.mirrors`、`data_sources.online`） |
 | `--offline` / `--max-age H` | 不联网，只用本地数据集和响应缓存 / 联网获取的漏洞数据超过 H 小时（默认 12）就重新获取 |
+| `--workers N` | 并行查询数（默认 16）。Maven Central 搜索最多同时两个 |
+| `--cache-dir DIR` / `--db-dir DIR` | 响应缓存（默认 `~/.cache/binwitness`，或 `$BINWITNESS_CACHE`）/ 本地数据集（见[本地数据集](#本地数据集)） |
 
 检查的内容：
 
 | 交付物中的内容 | 识别方式 |
 |---|---|
-| 任何 `.jar`（顶层，或嵌在 fat jar、war、zip、tar、镜像里） | 按 SHA-1 依次查本地哈希索引（已安装时）、deps.dev、Maven Central 搜索。都查不到时，读 jar 自带的 `META-INF/maven/**/pom.properties`，与该坐标下的发布件比对：发布的校验和一致判 `exact`，条目一致判 `content`。 |
+| 任何 `.jar`，以及同样打包的插件和库（`.hpi`、`.jpi`、`.aar`、`.nar`、`.kar`、资源适配器 `.rar`），无论在顶层还是嵌在 fat jar、war、ear、zip、tar、镜像里 | 按 SHA-1 依次查本地哈希索引（已安装时）、deps.dev、Maven Central 搜索。都查不到时，读 jar 自带的 `META-INF/maven/**/pom.properties`，先在 Maven Central、再在 `--maven-repo` 仓库中与该坐标下的发布件比对：发布的校验和一致判 `exact`，条目一致判 `content`。 |
 | 含多份 `pom.properties`、且都与文件名不对应的 jar（改过名，又 shade 了其他库） | 逐个拿声明的构件与该 jar 逐条比对，manifest 中提到的优先；发布件条目全部对上的那个就是这个 jar（`content`），其余视为包含在其中 |
-| 同一交付物中已识别 jar 的改名或重新压缩副本 | 除 manifest、索引和签名外，每个条目的 CRC-32 和大小都与已识别的 jar 相同：判 `content`，不发任何请求。副本的条目同时对上多个不同组件的（只改了版本号的几次发布），保持未识别，并在 `same_content_as` 中列出这些组件 |
-| 以上都不满足的 jar（Gradle 构建、改名并重新压缩的），开启 `--class-search` 时 | 取 jar 主包下的一个类到 Maven Central 搜索，并按 manifest 或文件名提示的版本缩小范围。只接受发布件条目与该 jar 对上的候选（`content`），提示本身从不直接采信。 |
+| 同一交付物中已识别 jar 的改名或重新压缩副本 | 除 manifest、索引、签名和 Maven 构建元数据外，每个条目的 CRC-32 和大小都与已识别的 jar 相同：判 `content`，不发任何请求。副本的条目同时对上多个不同组件的（只改了版本号的几次发布），保持未识别，并在 `same_content_as` 中列出这些组件 |
+| 以上都不满足的 jar（Gradle 构建、改名并重新压缩的），开启 `--class-search` 时 | 候选依次来自三处：取 jar 主包下的一个类到 Maven Central 搜索，并按 manifest 或文件名提示的版本缩小范围；文件名和 manifest 提示的构件名，配上该包名以及同族已识别 jar 的 groupId（`spring-core` 旁边的 `spring-jcl`）；开启 `--maven-repo` 时，再取中央仓搜索为该类列出的构件，按提示的版本查。只接受发布件条目与该 jar 对上的候选（`content`），提示本身从不直接采信。 |
 | shade 过的 jar | jar 里多出的 `pom.properties` 成为包含在该 jar 中的组件（`contained_in`）。jar 唯一的 `pom.properties` 在以下情况下也这样处理：jar 的名字没有提到它，并且该构件的发布条目大半缺失（guice 只带有 cglib 的），或 jar 自有的条目比该构件还多（把整个压缩库打进去的数据库驱动） |
 | `netty-all` 这类合集构件 | `META-INF/io.netty.versions.properties` 中的模块清单 |
-| `package-lock.json`（v1-v3）、`yarn.lock`（classic 和 berry）、`pnpm-lock.yaml` | 锁文件列出的包；锁文件记录了 dev/runtime 范围的，一并保留 |
+| `package-lock.json`（v1-v3）、`yarn.lock`（classic 和 berry）、`pnpm-lock.yaml` | 锁文件列出的包；锁文件记录了 dev/runtime 范围的，一并保留。别名（`name@npm:other@1.0.0`）按实际安装的包命名。`node_modules` 里只认 npm 自己的 `node_modules/.package-lock.json`：各个包随发布带的锁文件从未被安装 |
 | `node_modules/**/package.json` | 已安装的包 |
 | `node_modules` 以外随项目拷入的 `.js` 文件 | 与某个 npm 发布版中的文件逐字节相同（jsDelivr）。文件头注释写明了发布版本、但找不到相同文件的，判 `declared`。 |
+| 扩展名看不出格式的文件（`app.bin`、`plugin.dat`） | 看文件头：自带类文件的 zip 按 jar 检查；其他 zip、tar（含 gzip 或 xz 压缩的）、rar 和 7z 压缩包会被打开 |
 
-容器镜像：按顺序叠加各层，包括 whiteout 删除标记，所以只检查最终镜像中存在的文件。属于 JDK/JRE 安装目录的 jar 会跳过并计数。
+容器镜像：支持 `docker save` 的 tar 包和 OCI 镜像布局（打成 tar 或解开成目录均可），多平台镜像的每个平台分别检查。按顺序叠加各层，包括 whiteout 删除标记，所以只检查最终镜像中存在的文件。属于 JDK/JRE 安装目录（`bin/java` 或 `lib/modules` 旁边有 `release` 文件的目录）的 jar 会跳过并计数。
 
-同一个文件有时以多个坐标发布：项目改过 groupId（`com.oracle.ojdbc` 与 `com.oracle.database.jdbc`）、别人重新发布的副本、某个 jar 没有变化的新版本。组件名优先取 jar 自带 `pom.properties` 中的坐标（如果在其中），否则取与文件名相符的那个。其余坐标随文件列出（`also_published_as`），登记在其中任何一个坐标下的漏洞公告都计入该组件，并注明公告针对的是哪个坐标。
+目录输入会跟随其中的符号链接；指回已遍历目录的链接不会重复进入。大于 16 MB 的条目先写入临时文件再读取，不整个放进内存；解压后膨胀一百倍以上的条目视为解压炸弹跳过。所有被跳过的内容（失效的链接、读不了的压缩包、解压炸弹、压缩包内的链接）都会列在警告中。
+
+同一个文件有时以多个坐标发布：项目改过 groupId（`com.oracle.ojdbc` 与 `com.oracle.database.jdbc`）、别人重新发布的副本、某个 jar 没有变化的新版本。组件名优先取 jar 自带 `pom.properties` 中的坐标（如果在其中），否则取与文件名相符的那个。内容同时对上同一版本几个副本的 jar，取打包差异最少的那个命名：是原件，而不是 `org.lucee` 重新发布的 `commons-collections`。其余坐标随文件列出（`also_published_as`），登记在其中任何一个坐标下的漏洞公告都计入该组件，并注明公告针对的是哪个坐标。
 
 ### 输出
 
 | 文件 | 内容 |
 |---|---|
 | `binwitness.json` | 全部信息：组件及其证据、位置、文件哈希、与发布件的比对、同一文件的其他坐标、许可证、漏洞；自有文件和未识别文件；警告；各数据源及获取时间 |
-| `sbom.cdx.json` | CycloneDX 1.5 SBOM，含漏洞、识别证据和出现位置 |
-| `components.csv`、`vulnerabilities.csv` | 同样的内容，表格形式 |
+| `sbom.cdx.json` | CycloneDX 1.5 SBOM，含漏洞、识别证据和出现位置。同一组件出现在几个不同文件里的，每个文件一条，各带哈希；自有 jar 和未识别 jar 作为 `file` 组件列出，带哈希。有 SPDX 编号的许可证写在 `license.id` 中。`metadata.component` 描述被扫描的对象 |
+| `components.csv`、`vulnerabilities.csv` | 同样的内容，表格形式，UTF-8 带字节顺序标记，Excel 打开非 ASCII 路径不会乱码 |
+
+查询失败时（服务宕机，或 `--offline` 时缓存里没有），摘要中会有一行 `INCOMPLETE` 说明哪些没查，`binwitness.json` 的 `summary.incomplete` 给出计数，没查漏洞的组件标有 `vulnerabilities_checked: false`。这些组件漏洞为零的意思是「没查」，不是「没有」。
 
 严重等级优先取公告自己给出的等级（GitHub 的评级），没有时按 CVSS v3 向量计算。来自 OpenSSF 恶意包数据源的记录按严重（critical）计。发现按 CVE 合并，同一漏洞的 GHSA 与 CVE 只计一次。每条发现都列出各组件的修复版本；已列入 CISA 已知被利用漏洞目录（KEV）的，注明列入日期。
 
-许可证优先从构件本身取：内嵌的 `pom.xml`、`Bundle-License` 头或 LICENSE 文件。LICENSE 会完整读取，以免漏看附在 GPL 正文之后的例外条款。构件本身没有时，依次查 deps.dev 和已发布的 POM（包括其父 POM）。许可证分为以下几类：`permissive`、`weak-copyleft`、`copyleft-with-exception`、`strong-copyleft`、`source-available`、`unknown`。
+许可证优先从构件本身取：内嵌的 `pom.xml`、`Bundle-License` 头或 LICENSE 文件。LICENSE 会完整读取，以免漏看附在 GPL 正文之后的例外条款。构件本身没有时，依次查 deps.dev 和已发布的 POM（包括其父 POM）。许可证分为以下几类：`permissive`、`weak-copyleft`、`copyleft-with-exception`、`strong-copyleft`、`source-available`、`unknown`。许可证名称写成 SPDX 编号，并带上原文写明的版本（`The Apache Software License, Version 2.0` 写作 `Apache-2.0`，`New BSD License` 写作 `BSD-3-Clause`）。原文没说明版本或变体的，例如单写一个 `BSD`，保持原样。GPL 原文既没写「only」也没写「or later」的，沿用 SPDX 的旧编号（`GPL-2.0`、`GPL-2.0-with-classpath-exception`），不替原文多说什么。
 
 ## 本地数据集
 
@@ -155,6 +175,8 @@ binwitness crosscheck out/binwitness.json other-tool.csv -o crosscheck.json
 | `unattributed` | 上游公告没有指明任何包（GitHub 的 "unreviewed"），需要人工判断 |
 | `no-github-record` / `tool-specific-id` | 没有可供核对的公开记录 |
 
+GitHub 按 CVE 搜索只能找到带有该 CVE 编号的公告，而项目自己发的公告有时只把它列为相关（netty 针对 HTTP/2 Rapid Reset 的公告，CVE-2023-44487）。所以对 GitHub 没有归到该组件名下的 Maven 发现，binwitness 还会读取该组件 groupId 下每个模块的 OSV 公告：有一条影响当前版本并引用了该 CVE 的，判 `confirmed`；引用它的是兄弟模块的，判 `same-project-other-module`。
+
 使用 GitHub 令牌可以把 API 限额从每小时 60 次提高到 5,000 次。binwitness 依次从 `GITHUB_TOKEN`、`GH_TOKEN` 或 `gh auth token` 读取令牌。
 
 ## 哪些信息会离开你的机器
@@ -164,14 +186,15 @@ binwitness 会向公共服务发送以下内容：
 - jar 的 SHA-1 哈希、JavaScript 文件的 SHA-256 哈希
 - 组件坐标和版本
 - CVE 编号
-- 仅在开启 `--class-search` 时：为其他方式都认不出的每个 jar 发送一个完整类名。`--first-party-group` 前缀下的类从不发送。未识别的 jar 可能是私有代码，其类名可能暴露包名，介意的话不要开启这个选项。
+- 仅在开启 `--class-search` 时：为其他方式都认不出的每个 jar 发送一个完整类名，并查询其文件名和 manifest 提示的坐标。`--first-party-group` 前缀下的类从不发送。未识别的 jar 可能是私有代码，其类名可能暴露包名，介意的话不要开启这个选项。
 
-不会上传任何文件内容。自有 jar 不做查询。使用 `--maven-mirror` 时，对中央仓文件的请求改发给镜像，镜像的运营方能看到你查了哪些坐标。使用 `--lookup local` 时不发送任何内容。`binwitness db sync` 只下载公开数据集，不发送任何与你的文件有关的信息。要在不联网的机器上扫描，从联网的机器上拷贝数据集目录，需要的话再拷贝响应缓存（`--cache-dir`，默认 `~/.cache/binwitness`）。
+不会上传任何文件内容。自有 jar 不做查询。使用 `--maven-mirror` 时，对中央仓文件的请求改发给镜像，镜像的运营方能看到你查了哪些坐标。`--maven-repo` 仓库的运营方同样能看到向它查询的坐标。使用 `--lookup local` 时不发送任何内容。`binwitness db sync` 只下载公开数据集，不发送任何与你的文件有关的信息。要在不联网的机器上扫描，从联网的机器上拷贝数据集目录，需要的话再拷贝响应缓存（`--cache-dir`，默认 `~/.cache/binwitness`）。
 
 | 服务 | 用途 |
 |---|---|
 | [deps.dev](https://deps.dev) | jar 哈希查坐标；许可证 |
-| [Maven Central](https://central.sonatype.com) | 哈希搜索兜底；发布的校验和；POM 中的许可证 |
+| [Maven Central](https://central.sonatype.com) | 哈希搜索兜底；发布的校验和；POM 中的许可证；`--class-search`；`crosscheck` 查 groupId 下的模块 |
+| 用 `--maven-repo` 指定的仓库 | 中央仓没有的版本的校验和、jar 目录和 POM 许可证 |
 | [OSV.dev](https://osv.dev) | 漏洞（GitHub 安全公告及其他来源） |
 | [jsDelivr](https://www.jsdelivr.com) | JavaScript 文件哈希 |
 | [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) | 已知被利用标记 |
@@ -186,12 +209,12 @@ binwitness 会向公共服务发送以下内容：
 
 - **本地匹配使用 binwitness 自己的版本排序**。本地数据集中的公告版本范围由 binwitness 实现的 Maven 和 semver 排序判断，在线 API 用的是 OSV 自己的实现。常规版本号上两者一致，不常见的版本字符串可能比较结果不同。
 - **漏洞覆盖范围就是 OSV 的覆盖范围**。没有指明包的公告（GitHub "unreviewed"、只有 CPE 的 NVD 记录）无法匹配到组件。不查询厂商私有漏洞库和各国的国家漏洞库。漏洞数应视为下限。拿 `crosscheck` 去核对商业工具的输出，是了解这类数据库能补充多少的实用办法。
-- **识别需要已发布的构件或声明**。私有构建、分叉版本，以及不带 `pom.properties` 的改包名副本会保持未识别，除非同一交付物里还有一份已识别的副本（或者 `--class-search` 找到了它）。shade 时没带上 `pom.properties` 的类认不出；binwitness 不做字节码或源码指纹。内容比对比较的是 CRC-32，能发现重新构建和一般修改，防不了蓄意伪造的碰撞。只含 manifest、许可证和 notice 的 jar（Spring Boot starter）在不同构件之间看起来都一样，从不按内容匹配，报告为不含代码。分类器 jar（`-linux-x86_64`）只与主构件比较。
+- **识别需要已发布的构件或声明**。私有构建、分叉版本，以及不带 `pom.properties` 的改包名副本会保持未识别，除非同一交付物里还有一份已识别的副本（或者 `--class-search` 找到了它）。只在其他仓库发布的版本（里程碑版、厂商自己的构建）要用 `--maven-repo` 才认得出。每个未识别的 jar 都写明原因，并给出 manifest 或文件名提示的身份（`hint`，未经核实）。shade 时没带上 `pom.properties` 的类认不出；binwitness 不做字节码或源码指纹。内容比对比较的是 CRC-32，能发现重新构建和一般修改，防不了蓄意伪造的碰撞。只含 manifest、许可证和 notice 的 jar（Spring Boot starter）在不同构件之间看起来都一样，从不按内容匹配，报告为不含代码。分类器 jar（`-linux-x86_64`）只与主构件比较。
 - **前端打包产物是不透明的**。webpack 或 rollup 合并进 chunk 的代码无法按哈希匹配。请把锁文件，或构建时用的 `node_modules`，随打包产物一起交付。文件头注释只能覆盖一部分。
 - **生态：Java（Maven）和 JavaScript（npm）**。操作系统软件包、Python、Go、.NET 和原生库不在范围内；镜像的操作系统层请用 Trivy 或 Syft。JDK/JRE 运行时 jar 会跳过。
 - **非常规许可证需要人工判断**。非标准许可证和自相矛盾的声明归为 `unknown`。并列多个许可证而没有写成 SPDX 表达式的，按任选其一理解。
-- **扫描速度取决于网络**。冷缓存扫描几乎全部时间都在等待查询：含 190 个 jar 的 war 约需三分钟，上千个 jar 的交付物约需一刻钟。卡住的请求（包括域名解析）30 秒后放弃并重试。用缓存重跑只需几秒，为一个交付物查过的常见库，扫下一个交付物时已在缓存中。
-- **在线服务可能宕机或限流**。查询失败会退避重试约一分钟，之后记为警告，扫描不会因此整体失败。
+- **扫描速度取决于网络**。冷缓存扫描几乎全部时间都在等待查询：含 190 个 jar 的 war 约需三分钟，上千个 jar 的交付物约需一刻钟。10 秒内建不起来的连接、卡住 30 秒的请求（包括域名解析）都会放弃并重试。`--class-search` 依赖的 Maven Central 搜索服务会把部分请求压上最长一分钟才回答，binwitness 对它最多同时发两个请求，8 秒没有回答就重发。用缓存重跑只需几秒，为一个交付物查过的常见库，扫下一个交付物时已在缓存中。
+- **在线服务可能宕机或限流**。查询失败会退避重试约一分钟，之后记为警告，扫描不会因此整体失败。此时结果标为 `INCOMPLETE`，`--fail-on` 以状态码 4 而不是 0 退出。
 
 ## 开发
 

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 class NpmPackage:
     name: str
     version: str
-    scope: str          # "runtime" | "dev" | "unknown"
+    scope: str | None   # "runtime" | "dev" | "unknown"; None when the source does not say
     license: str | None
     source: str         # which kind of file stated it
 
@@ -79,23 +79,41 @@ def _spec_name(spec: str) -> str:
 
 
 def _yarn(text: str) -> list[NpmPackage]:
-    out = []
-    name = None
+    """yarn classic (v1) and berry (v2+): a line of specs, then the entry's indented fields."""
+    entries: list[tuple[str, dict[str, str]]] = []
     for line in text.splitlines():
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         if not line.startswith(" ") and line.rstrip().endswith(":"):
-            first = line.rstrip()[:-1].split(",")[0]
-            name = None if first.strip().strip('"') == "__metadata" else _spec_name(first)
-            # Berry marks workspace and patch entries with a protocol other than npm.
-            if name and re.search(r"@(workspace|link|portal|file|patch):", first):
-                name = None
+            entries.append((line.rstrip()[:-1], {}))
             continue
-        match = re.match(r'^\s+version:?\s+"?([^"\s]+)"?\s*$', line)
-        if match and name and _usable(match.group(1)):
-            out.append(NpmPackage(name, match.group(1), "unknown", None, "yarn.lock"))
-            name = None
+        # Two spaces exactly: deeper lines belong to the entry's dependency lists.
+        field = re.match(r'^ {2}(\w+):?\s+"?([^"\s]+)"?\s*$', line)
+        if field and entries:
+            entries[-1][1].setdefault(field.group(1), field.group(2))
+    out = []
+    for key, fields in entries:
+        # Berry marks workspace and patch entries with a protocol other than npm.
+        if key.strip().strip('"') == "__metadata" or re.search(r"@(workspace|link|portal|file|patch):", key):
+            continue
+        name = _yarn_name([s.strip().strip('"') for s in key.split(",")], fields.get("resolution"))
+        if name and _usable(fields.get("version")):
+            out.append(NpmPackage(name, fields["version"], "unknown", None, "yarn.lock"))
     return out
+
+
+def _yarn_name(specs: list[str], resolution: str | None) -> str | None:
+    """The registry name an entry installs. An alias (``"eslint-v7@npm:eslint@^7.7.0"``) installs the package
+    after ``npm:``; its own name is only a directory name, and squatters have published under such names."""
+    if resolution:
+        match = re.match(r"^(@?[^@]+)@npm:", resolution)
+        return match.group(1) if match else None
+    for spec in specs:
+        target = spec.split("@npm:", 1)[1] if "@npm:" in spec else ""
+        # "name@npm:^1.0" is berry's plain form; only "alias@npm:real@^1.0" names another package.
+        if target.find("@", 1) > 0:
+            return _spec_name(target)
+    return _spec_name(specs[0])
 
 
 def _pnpm(text: str) -> list[NpmPackage]:
@@ -103,6 +121,9 @@ def _pnpm(text: str) -> list[NpmPackage]:
     in_packages = False
     current = None
     for line in text.splitlines():
+        # pnpm separates entries with blank lines; only a top-level key ends the section.
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
         if not line.startswith(" "):
             in_packages = line.rstrip() == "packages:"
             current = None
@@ -143,4 +164,5 @@ def _installed(text: str) -> list[NpmPackage]:
     if not isinstance(manifest, dict) or not manifest.get("name") or not _usable(manifest.get("version")):
         return []
     found = _license(manifest.get("license")) or _license(manifest.get("licenses"))
-    return [NpmPackage(manifest["name"], manifest["version"], "unknown", found, "node_modules package.json")]
+    # An installed copy says nothing about whether the package ships; a lockfile beside it does.
+    return [NpmPackage(manifest["name"], manifest["version"], None, found, "node_modules package.json")]

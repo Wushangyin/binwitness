@@ -1,14 +1,17 @@
 import json
+from pathlib import Path
 
 import pytest
 
-from binwitness.jar import jar_facts
-from binwitness.licenses import detect, expression_family, family
+from binwitness.jar import jar_facts, name_hints
+from binwitness.licenses import detect, expression_family, family, spdx_id
 from binwitness.npm import parse
 from binwitness.versions import compare, in_range
 from binwitness.vulns import cvss3_score
 
 from helpers import make_jar
+
+DATA = Path(__file__).parent / "data"
 
 
 def test_jar_picks_its_own_coordinates_and_lists_shaded_ones():
@@ -131,6 +134,67 @@ def test_pnpm_lock_versions_5_6_and_9():
         ("lodash", "4.17.21", "runtime"), ("react-dom", "18.2.0", "dev")]
     assert [(p.name, p.version, p.scope) for p in parse("pnpm-lock.yaml", v9)] == [
         ("lodash", "4.17.21", "unknown"), ("@types/node", "18.0.0", "unknown")]
+
+
+def test_yarn_classic_aliases_are_named_by_the_package_they_install():
+    # Excerpt of a real yarn.lock: "react-15@npm:react@^15" installs react, not a package called react-15.
+    packages = parse("yarn.lock", (DATA / "yarn-v1-aliases.lock").read_bytes())
+    assert [(p.name, p.version) for p in packages] == [
+        ("@typescript-eslint/parser", "2.34.0"), ("eslint", "7.32.0"), ("react", "15.6.2"),
+        ("scheduler", "0.13.0"), ("string-width", "4.2.3")]
+
+
+def test_pnpm_lockfiles_as_pnpm_writes_them_with_blank_lines():
+    # Real lockfiles separate every entry with a blank line; hand-written samples without them hid a parser
+    # that stopped at the first one.
+    v6 = parse("pnpm-lock.yaml", (DATA / "pnpm-v6-lock.yaml").read_bytes())
+    assert [(p.name, p.version, p.scope) for p in v6] == [
+        ("@ampproject/remapping", "2.2.0", "dev"), ("@babel/code-frame", "7.18.6", "dev"),
+        ("@babel/compat-data", "7.21.0", "unknown")]
+    v9 = parse("pnpm-lock.yaml", (DATA / "pnpm-v9-lock.yaml").read_bytes())
+    assert [(p.name, p.version) for p in v9] == [("@ant-design/colors", v) for v in ("6.0.0", "7.2.1", "8.0.1")]
+
+
+@pytest.mark.parametrize("text, names", [
+    ("The Apache Software License, Version 1.1", ["Apache-1.1"]),
+    ("Eclipse Public License - v 1.0", ["EPL-1.0"]),
+    ("epl-v10", ["EPL-1.0"]),
+    ("GNU Lesser General Public License, version 2.1", ["LGPL-2.1"]),
+    ("CDDL 1.1", ["CDDL-1.1"]),
+    ("Mozilla Public License 2.0", ["MPL-2.0"]),
+    ("New BSD License", ["BSD-3-Clause"]),
+    ("Apache License 2.0, New BSD License", ["Apache-2.0", "BSD-3-Clause"]),
+    ("BSD 2-Clause License", ["BSD-2-Clause"]),
+    ("Mulan Permissive Software License\uff0cVersion 2", ["MulanPSL-2.0"]),
+    ("http://license.coscl.org.cn/MulanPSL2", ["MulanPSL-2.0"]),
+    ("CC0 1.0 Universal", ["CC0-1.0"]),
+    ("Creative Commons Attribution-ShareAlike 4.0", ["CC-BY-SA-4.0"]),
+])
+def test_license_versions_are_read_next_to_the_name(text, names):
+    assert detect(text) == names
+
+
+def test_a_name_and_its_versioned_form_at_one_place_give_the_versioned_one():
+    assert detect("Apache License, Version 2.0", first_only=True) == ["Apache-2.0"]
+
+
+@pytest.mark.parametrize("name, identifier", [
+    ("Apache-2.0", "Apache-2.0"), ("EDL-1.0", "BSD-3-Clause"), ("MulanPSL-2.0", "MulanPSL-2.0"),
+    ("GPL-2.0-with-classpath-exception", "GPL-2.0-with-classpath-exception"), ("BSD", None), ("CDDL", None),
+    ("Bouncy Castle", None),
+])
+def test_spdx_ids_only_for_names_that_are_one(name, identifier):
+    assert spdx_id(name) == identifier
+
+
+def test_name_hints_from_file_name_and_manifest_title():
+    facts = jar_facts("spring-jcl-6.2.0-RC1.jar", make_jar(extra={
+        "META-INF/MANIFEST.MF": "Manifest-Version: 1.0\r\nImplementation-Title: spring-jcl\r\n"
+                                "Implementation-Version: 6.2.0-RC1\r\n\r\n"}))
+    assert name_hints(facts) == ["spring-jcl"]
+    renamed = jar_facts("x.jar", make_jar(extra={
+        "META-INF/MANIFEST.MF": "Manifest-Version: 1.0\r\nImplementation-Title: Some Library 1.0\r\n\r\n"}))
+    assert name_hints(renamed) == []
 
 
 def test_installed_package_json():

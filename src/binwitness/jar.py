@@ -9,12 +9,15 @@ import zipfile
 import zlib
 from collections import Counter
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from binwitness.licenses import detect, manifest_value, pom_licenses
 
 MANIFEST_KEYS = ("Implementation-Title", "Implementation-Version", "Implementation-Vendor",
                  "Bundle-SymbolicName", "Bundle-Version", "Automatic-Module-Name")
 NETTY_VERSIONS = "META-INF/io.netty.versions.properties"
+# Extensions a Maven artifact that is a zip of classes is published with.
+ARTIFACT_EXTENSION = re.compile(r"\.(jar|hpi|jpi|aar|nar|kar|rar)$", re.I)
 
 
 @dataclass
@@ -50,14 +53,44 @@ def entries(facts: JarFacts) -> dict[str, tuple[int, int]] | None:
     return out
 
 
-def jar_facts(filename: str, data: bytes) -> JarFacts:
-    facts = JarFacts(filename, hashlib.sha1(data).hexdigest(), hashlib.sha256(data).hexdigest(), len(data))
+def split_name(filename: str) -> tuple[str, str]:
+    """``caffeine-api.hpi`` -> (``caffeine-api``, ``.hpi``); names without a known extension keep their dots."""
+    match = ARTIFACT_EXTENSION.search(filename)
+    return (filename[:match.start()], match.group(0).lower()) if match else (filename, ".jar")
+
+
+def file_digests(source: bytes | Path) -> tuple[str, str, int]:
+    """SHA-1, SHA-256 and size, reading a file in chunks."""
+    sha1, sha256 = hashlib.sha1(), hashlib.sha256()
+    if isinstance(source, bytes):
+        sha1.update(source)
+        sha256.update(source)
+        return sha1.hexdigest(), sha256.hexdigest(), len(source)
+    size = 0
+    with open(source, "rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            sha1.update(chunk)
+            sha256.update(chunk)
+            size += len(chunk)
+    return sha1.hexdigest(), sha256.hexdigest(), size
+
+
+def jar_facts(filename: str, source: bytes | Path, digests: tuple[str, str, int] | None = None) -> JarFacts:
+    """``source``: the jar's bytes or its path; ``digests`` as :func:`file_digests` returns them, if known."""
+    facts = JarFacts(filename, *(digests or file_digests(source)))
     try:
-        archive = zipfile.ZipFile(io.BytesIO(data))
-        names = archive.namelist()
-    except (zipfile.BadZipFile, ValueError):
+        archive = zipfile.ZipFile(source if isinstance(source, Path) else io.BytesIO(source))
+    except (zipfile.BadZipFile, ValueError, OSError):
         facts.readable = False
         return facts
+    with archive:
+        _read_facts(facts, archive)
+    return facts
+
+
+def _read_facts(facts: JarFacts, archive: zipfile.ZipFile):
+    names = archive.namelist()
+
     def read(name: str) -> bytes:
         # A jar with one corrupt or encrypted entry is still a jar: report the entry, keep the rest.
         try:
@@ -73,7 +106,7 @@ def jar_facts(filename: str, data: bytes) -> JarFacts:
             g, a, v = (properties.get(k, "").strip() for k in ("groupId", "artifactId", "version"))
             if g and a and v:
                 gavs.append((g, a, v, name.rsplit("/", 1)[0]))
-    stem = filename[:-4] if filename.lower().endswith(".jar") else filename
+    stem = split_name(facts.filename)[0]
     pick = [x for x in gavs if stem == f"{x[1]}-{x[2]}"] or [x for x in gavs if stem.startswith(x[1] + "-")]
     if not pick and len(gavs) == 1:
         pick, facts.named_by_file = gavs, False
@@ -116,7 +149,6 @@ def jar_facts(filename: str, data: bytes) -> JarFacts:
         if len(modules) > 1:
             facts.merged = sorted(("io.netty", artifact, version) for artifact, version in modules.items()
                                   if artifact != own and version)
-    return facts
 
 
 def version_hints(facts: JarFacts) -> list[str]:
@@ -125,12 +157,21 @@ def version_hints(facts: JarFacts) -> list[str]:
     Hints only narrow a search; whatever the search returns is accepted only if its published contents match.
     """
     hints = [facts.manifest.get("Implementation-Version"), facts.manifest.get("Bundle-Version")]
-    stem = facts.filename[:-4] if facts.filename.lower().endswith(".jar") else facts.filename
+    stem = split_name(facts.filename)[0]
     # log4j-1.2-api-2.17.1: a digit after a hyphen does not always start the version, so try every one.
     for match in re.finditer(r"-(?=\d)", stem):
         parts = stem[match.end():].split("-")
         hints += ["-".join(parts[:i]) for i in range(len(parts), 0, -1)]
     return [h for h in dict.fromkeys(hints) if h and re.fullmatch(r"[\w.+-]{1,64}", h)][:8]
+
+
+def name_hints(facts: JarFacts) -> list[str]:
+    """ArtifactIds a jar suggests for itself: its file name without the version, and its manifest title.
+    Like :func:`version_hints`, they only say where to look."""
+    stem = split_name(facts.filename)[0]
+    names = [stem[:-len(v) - 1] for v in version_hints(facts) if stem.endswith("-" + v)]
+    names.append(facts.manifest.get("Implementation-Title", ""))
+    return [n for n in dict.fromkeys(names) if n and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", n)][:2]
 
 
 def representative_class(names) -> str | None:

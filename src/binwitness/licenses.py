@@ -26,7 +26,8 @@ PATTERNS = [
     ("0BSD", r"\b0bsd\b"),
     ("BSD", r"\bbsd\b|redistribution and use in source and binary forms|licenses/bsd"),
     ("Bouncy Castle", r"bouncy castle licen[cs]e"),
-    ("Public Domain", r"public domain|\bcc0\b"),
+    ("CC0-1.0", r"\bcc0\b|creative commons zero"),
+    ("Public Domain", r"public domain"),
     ("Unlicense", r"\bunlicense\b"),
     ("ISC", r"\bisc\b"),
     ("Zlib", r"\bzlib\b"),
@@ -37,13 +38,32 @@ PATTERNS = [
     ("WTFPL", r"\bwtfpl\b"),
     ("Mulan PSL", r"mulan"),
 ]
+# A version written right after the name: "EPL - v 1.0", "epl-v10", "LGPL, version 2.1", "MPL 2.0".
+_VERSION_AFTER = re.compile(r"[\s,:(-]*(?:licen[cs]e)?(?:\s*\([a-z0-9. -]+\))?[\s,:(-]*(?:v|version)?[\s.]*"
+                            r"(\d+)(?:\.(\d+))?")
+_VERSIONS = {"Apache": ("1.0", "1.1", "2.0"), "EPL": ("1.0", "2.0"), "EDL": ("1.0",), "MPL": ("1.0", "1.1", "2.0"),
+             "LGPL": ("2.0", "2.1", "3.0"), "CDDL": ("1.0", "1.1"), "CC-BY": ("3.0", "4.0"),
+             "CC-BY-SA": ("3.0", "4.0"), "Mulan PSL": ("1", "2")}
+_BSD_CLAUSES = [("BSD-3-Clause", r"bsd[- ]3[- ]clause|3-clause|three-clause|(new|revised|modified) bsd|"
+                                 r"neither the name"),
+                ("BSD-2-Clause", r"bsd[- ]2[- ]clause|2-clause|two-clause|simplified bsd|freebsd")]
+# The names :func:`detect` gives that are SPDX license ids, as CycloneDX 1.5 lists them (some are deprecated
+# there, kept because the text does not say which variant it is: GPL-2.0 does not tell "only" from "or later").
+SPDX_IDS = {"Apache-1.0", "Apache-1.1", "Apache-2.0", "MIT", "0BSD", "ISC", "Zlib", "BSL-1.0", "Python-2.0",
+            "BlueOak-1.0.0", "Unlicense", "WTFPL", "SSPL-1.0", "BUSL-1.1", "Elastic-2.0", "Artistic-2.0", "OFL-1.1",
+            "AGPL-3.0", "GPL-2.0", "GPL-3.0", "GPL-2.0-with-classpath-exception", "LGPL-2.0", "LGPL-2.1",
+            "LGPL-3.0", "EPL-1.0", "EPL-2.0", "MPL-1.0", "MPL-1.1", "MPL-2.0", "CDDL-1.0", "CDDL-1.1",
+            "BSD-2-Clause", "BSD-3-Clause", "CC0-1.0", "CC-BY-3.0", "CC-BY-4.0", "CC-BY-SA-3.0", "CC-BY-SA-4.0",
+            "MulanPSL-1.0", "MulanPSL-2.0"}
+# The Eclipse Distribution License 1.0 is the BSD 3-clause text, which is how SPDX lists it.
+_SPDX_ALIAS = {"EDL-1.0": "BSD-3-Clause", "EDL": "BSD-3-Clause"}
 
 FAMILIES = ("source-available", "strong-copyleft", "copyleft-with-exception", "weak-copyleft", "permissive")
 UNKNOWN = "unknown"
 _RANK_PREFIX = {"SSPL": 1, "BUSL": 0, "Elastic": 0, "AGPL": 1, "GPL": 1, "LGPL": 3, "EPL": 3, "MPL": 3,
                 "CDDL": 3, "CC-BY-SA": 3, "Artistic": 3, "OFL": 3}
-_PERMISSIVE = {"Apache-2.0", "Apache", "EDL", "MIT", "0BSD", "BSD", "Bouncy Castle", "Public Domain", "Unlicense",
-               "ISC", "Zlib", "BSL-1.0", "Python-2.0", "BlueOak-1.0.0", "CC-BY", "WTFPL", "Mulan PSL"}
+_PERMISSIVE = ("Apache", "EDL", "MIT", "0BSD", "BSD", "Bouncy Castle", "Public Domain", "Unlicense", "ISC", "Zlib",
+               "BSL-1.0", "Python-2.0", "BlueOak-1.0.0", "CC-BY", "CC0-1.0", "WTFPL", "Mulan PSL", "MulanPSL")
 
 
 def detect(text: str, first_only: bool = False) -> list[str]:
@@ -52,20 +72,26 @@ def detect(text: str, first_only: bool = False) -> list[str]:
     for name, pattern in PATTERNS:
         match = re.search(pattern, low)
         if match:
-            hits.append((match.start(), name))
+            hits.append((match.start(), -len(name), name, match.end()))
     if not hits:
         return []
-    names = [min(hits)[1]] if first_only else [n for _, n in sorted(hits)]
-    if "Apache-2.0" in names and "Apache" in names:
-        names.remove("Apache")
-    if "CC-BY-SA" in names and "CC-BY" in names:
-        names.remove("CC-BY")
+    # Where two names match at the same place ("apache license, version 2" is both Apache and Apache-2.0),
+    # the longer one is the more specific.
+    hits.sort()
+    chosen = hits[:1] if first_only else hits
+    if "CC-BY-SA" in [h[2] for h in chosen]:
+        chosen = [h for h in chosen if h[2] != "CC-BY"]
     out = []
-    for name in names:
-        if name == "GPL":
+    for at, _, name, end in chosen:
+        if name in _VERSIONS:
+            name = _with_version(name, low[end:end + 60])
+        elif name == "BSD":
+            name = next((clause for clause, pattern in _BSD_CLAUSES
+                         if re.search(pattern, low[max(0, at - 20):end + 40] if not first_only else low)),
+                        "BSD")
+        elif name == "GPL":
             # Read the version only next to the GPL mention: full LICENSE files append third-party notices
             # whose "version 3" has nothing to do with this component.
-            at = next(pos for pos, hit in hits if hit == "GPL")
             near = low[max(0, at - 200):at + 300]
             version = ("3.0" if re.search(r"version 3|v3\b|gpl-?3|gplv3", near)
                        else "2.0" if re.search(r"version 2|v2\b|gpl-?2|gplv2", near) else "")
@@ -75,7 +101,31 @@ def detect(text: str, first_only: bool = False) -> list[str]:
             elif "foss exception" in low or "foss-exception" in low:
                 name += "-with-FOSS-exception"
         out.append(name)
+    # "Apache License" next to "Apache License, Version 2.0" in one declaration says nothing more.
+    out = [n for n in out if not any(o != n and o.startswith(n + "-") and not o.startswith(("CC-BY-SA", "GPL-"))
+                                     for o in out)]
     return list(dict.fromkeys(out))
+
+
+def _with_version(name: str, after: str) -> str:
+    if name == "Mulan PSL":
+        # "Mulan Permissive Software License，Version 2" (a full-width comma), or "MulanPSL2" in its URL.
+        match = re.match(r"\s*(?:permissive software licen[cs]e|psl)[\s,，:-]*(?:v|version)?\s*(\d)", after)
+        return f"MulanPSL-{match.group(1)}.0" if match and match.group(1) in _VERSIONS[name] else name
+    match = _VERSION_AFTER.match(after)
+    if not match:
+        return name
+    major, minor = match.groups()
+    if minor is None and len(major) == 2:
+        major, minor = major[0], major[1]   # epl-v10, lgpl21
+    version = f"{major}.{minor or 0}"
+    return f"{name}-{version}" if version in _VERSIONS[name] else name
+
+
+def spdx_id(name: str) -> str | None:
+    """The SPDX id of a name :func:`detect` gives, or None when it has none (an unversioned "BSD")."""
+    name = _SPDX_ALIAS.get(name, name)
+    return name if name in SPDX_IDS else None
 
 
 def rank(name: str) -> int | None:
@@ -85,7 +135,7 @@ def rank(name: str) -> int | None:
     for prefix, value in _RANK_PREFIX.items():
         if name.startswith(prefix):
             return value
-    return 4 if name in _PERMISSIVE else None
+    return 4 if any(name == p or name.startswith(p + "-") for p in _PERMISSIVE) else None
 
 
 def family(names: list[str], conjunctive: bool = False) -> str:

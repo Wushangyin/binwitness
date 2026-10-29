@@ -6,17 +6,18 @@ import posixpath
 import sys
 import urllib.parse
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 from binwitness import __version__, maven, staticjs, vulns
 from binwitness.archive import Walker
-from binwitness.jar import JarFacts, entries, jar_facts, representative_class, version_hints
+from binwitness.jar import (JarFacts, entries, file_digests, jar_facts, name_hints, representative_class,
+                           split_name, version_hints)
 from binwitness.licenses import FAMILIES, UNKNOWN, expression_family, family
 from binwitness.localdb import OSV_DATASET
-from binwitness.net import Net, NetError, OfflineMiss
+from binwitness.net import Net, NetError, OfflineMiss, map_parallel
 from binwitness.npm import parse as parse_npm
 # The local index lacks some public jars (it keeps one coordinate per file, and Google's repository is not
 # Central), so absence from it does not mean that no registry has the file.
@@ -47,6 +48,8 @@ class Options:
     unpacker: str | None = None
     # Sends one class name per unidentified jar to Maven Central search, so it is opt-in.
     class_search: bool = False
+    # Repositories besides Maven Central that publish releases (milestones, vendors' own); checked after it.
+    maven_repos: tuple[str, ...] = ()
 
 
 @dataclass
@@ -64,6 +67,10 @@ def purl(ecosystem: str, name: str, version: str) -> str:
         scope, bare = name.split("/", 1)
         return f"pkg:npm/{quote(scope)}/{quote(bare)}@{quote(version)}"
     return f"pkg:npm/{quote(name)}@{quote(version)}"
+
+
+def _where(repository: str | None) -> str:
+    return "Maven Central" if repository in (None, maven.CENTRAL) else repository
 
 
 def _containers(location: str):
@@ -96,8 +103,11 @@ class _Components:
             item["files"].append(file)
         if contained_in and contained_in not in item["contained_in"]:
             item["contained_in"].append(contained_in)
-        # Shipped if any sighting says so; dev only when every sighting agrees.
-        if scope == "runtime" or item["scope"] is None:
+        # Shipped if any sighting says so; dev only when every sighting agrees. A sighting without a scope
+        # (an installed package.json) does not vote.
+        if scope is None:
+            pass
+        elif scope == "runtime" or item["scope"] is None:
             item["scope"] = scope
         elif item["scope"] != scope and item["scope"] != "runtime":
             item["scope"] = "unknown"
@@ -116,23 +126,30 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None) -> d
     scripts: dict[str, dict] = {}
     damaged = []
     for path in inputs:
-        for item in walker.walk(path):
-            if item.kind == "jar":
-                sha1 = hashlib.sha1(item.data).hexdigest()
-                if sha1 not in jars:
-                    facts = jar_facts(posixpath.basename(item.location), item.data)
-                    jars[sha1] = _Jar(facts)
-                    if facts.damaged:
-                        damaged.append(f"{item.location}: unreadable entries: {'; '.join(facts.damaged[:3])}")
-                jars[sha1].locations.append(item.location)
-            elif item.kind in ("lockfile", "npm-package"):
-                for package in parse_npm(posixpath.basename(item.location), item.data):
-                    npm_sightings.append((package, item.location))
-            elif item.kind == "js":
-                digest = hashlib.sha256(item.data).digest()
-                entry = scripts.setdefault(digest.hex(), {"digest": digest, "head": item.data[:staticjs.HEAD_SIZE],
-                                                          "locations": []})
-                entry["locations"].append(item.location)
+        with closing(walker.walk(path)) as items:
+            for item in items:
+                if item.kind == "jar":
+                    digests = file_digests(item.source)
+                    sha1 = digests[0]
+                    if sha1 not in jars:
+                        facts = jar_facts(posixpath.basename(item.location), item.source, digests)
+                        jars[sha1] = _Jar(facts)
+                        if facts.damaged:
+                            damaged.append(f"{item.location}: unreadable entries: {'; '.join(facts.damaged[:3])}")
+                    jars[sha1].locations.append(item.location)
+                elif item.kind in ("lockfile", "npm-package"):
+                    data = item.read()
+                    packages = parse_npm(posixpath.basename(item.location), data)
+                    # A lockfile of a project without dependencies is a few hundred bytes.
+                    if item.kind == "lockfile" and not packages and len(data) > 2048:
+                        damaged.append(f"{item.location}: no packages could be read from this lockfile")
+                    npm_sightings += [(package, item.location) for package in packages]
+                elif item.kind == "js":
+                    data = item.read()
+                    digest = hashlib.sha256(data).digest()
+                    entry = scripts.setdefault(digest.hex(), {"digest": digest, "head": data[:staticjs.HEAD_SIZE],
+                                                              "locations": []})
+                    entry["locations"].append(item.location)
     log(f"walked {len(inputs)} input(s): {len(jars)} distinct jars, {len(npm_sightings)} npm package entries, "
         f"{len(scripts)} distinct scripts")
 
@@ -163,18 +180,19 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None) -> d
                     "licenses": hit["licenses"], "alternatives": hit["alternatives"]}
         demoted = None
         if facts.coordinate:
-            published, comparison = check_published(facts, facts.coordinate, facts.filename)
+            published, comparison, repository = check_published(facts, facts.coordinate, facts.filename)
             if published == "identical":
                 # Neither hash index lists every release (javassist 3.18.1-GA is missing from both), but the
-                # checksum Maven Central publishes for the declared coordinates proves the file just as well.
+                # checksum a repository publishes for the declared coordinates proves the file just as well.
                 return {"coordinate": facts.coordinate, "confidence": "exact", "published": "identical",
-                        "method": "file SHA-1 equals the checksum Maven Central publishes for the jar's own "
-                                  "declared coordinates", "licenses": None}
+                        "repository": repository, "licenses": None,
+                        "method": f"file SHA-1 equals the checksum {_where(repository)} publishes for the jar's "
+                                  f"own declared coordinates"}
             if published == "repackaged":
                 return {"coordinate": facts.coordinate, "confidence": "content", "published": "repackaged",
-                        "comparison": comparison, "licenses": None,
-                        "method": "the jar's own pom.properties; every entry but the manifest, index and "
-                                  "signatures has the CRC-32 and size of the published artifact's"}
+                        "comparison": comparison, "repository": repository, "licenses": None,
+                        "method": f"the jar's own pom.properties; every entry but {maven.PACKAGING_TEXT} has the "
+                                  f"CRC-32 and size of the artifact {_where(repository)} publishes"}
             counts = (comparison or {}).get("counts", {})
             foreign = comparison and comparison["unchanged"] < counts["changed"] + counts["removed"]
             # The declared artifact is all there, but the jar holds more of its own: a host that bundles the
@@ -187,7 +205,7 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None) -> d
             if facts.named_by_file or not (foreign or hosting) or relocated:
                 return {"coordinate": facts.coordinate, "method": "the jar's own META-INF/maven pom.properties",
                         "confidence": "declared", "published": published, "comparison": comparison,
-                        "licenses": None, "lookup_failure": failure}
+                        "repository": repository, "licenses": None, "lookup_failure": failure}
             # Most of the published artifact is missing: the properties came with a library shaded into this
             # jar (guice carries only cglib's), so they name a component it contains, not the jar itself.
             demoted = facts.coordinate
@@ -197,34 +215,64 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None) -> d
                 return {**found, "licenses": None}
         return {"coordinate": None, "lookup_failure": failure, "demoted": demoted}
 
+    def published_name(facts: JarFacts, coordinate) -> str:
+        return f"{coordinate[1]}-{coordinate[2]}{split_name(facts.filename)[1]}"
+
+    def match(facts: JarFacts, coordinate, found_by: str):
+        published, comparison, repository = check_published(facts, coordinate, published_name(facts, coordinate))
+        if published not in ("identical", "repackaged"):
+            return None
+        how = (f"file SHA-1 equals the checksum {_where(repository)} publishes" if published == "identical"
+               else f"every entry but {maven.PACKAGING_TEXT} has the CRC-32 and size of what "
+                    f"{_where(repository)} publishes")
+        return {"coordinate": coordinate, "confidence": "exact" if published == "identical" else "content",
+                "published": published, "comparison": comparison, "repository": repository,
+                "method": f"{how} for the artifact {found_by}"}
+
+    def first_match(facts: JarFacts, candidates, found_by: str):
+        """The candidate coordinate whose published artifact this jar is, or holds the entries of.
+
+        Projects republish libraries under their own groupId with the classes unchanged (org.lucee has
+        commons-collections 3.2.1), and a class search may list such a copy first. Once one candidate matches,
+        the others of the same artifact and version are checked too: the closest names the jar, and the rest
+        become ``alternatives``, so that advisories filed against the original still count."""
+        candidates = list(candidates)
+        for index, coordinate in enumerate(candidates):
+            found = match(facts, coordinate, found_by)
+            if not found:
+                continue
+            same = [match(facts, other, found_by) for other in candidates[index + 1:] if other[1:] == coordinate[1:]]
+            matches = [found, *(m for m in same if m)]
+            best = min(matches, key=lambda m: (m["published"] != "identical",
+                                               len((m["comparison"] or {}).get("packaging_only", []))))
+            if len(matches) > 1:
+                best["alternatives"] = [m["coordinate"] for m in matches if m is not best]
+            return best
+        return None
+
     def find_declared(facts: JarFacts):
         """Of several pom.properties, none named after the file, the one whose published artifact has this
         jar's entries. A renamed woodstox carries its own and those of the schema libraries it shades."""
         hint = " ".join(facts.manifest.values())
         # The manifest only orders the checks; a candidate counts only if its published entries match.
-        for coordinate in sorted(facts.embedded, key=lambda c: c[1] not in hint)[:CONTENT_CANDIDATES]:
-            published, comparison = check_published(facts, coordinate, f"{coordinate[1]}-{coordinate[2]}.jar")
-            if published in ("identical", "repackaged"):
-                how = ("file SHA-1 equals the checksum Maven Central publishes" if published == "identical" else
-                       "every entry but the manifest, index and signatures has the CRC-32 and size")
-                return {"coordinate": coordinate, "confidence": "exact" if published == "identical" else "content",
-                        "published": published, "comparison": comparison,
-                        "method": f"{how} of the artifact named by one of the jar's pom.properties"}
-        return None
+        candidates = sorted(facts.embedded, key=lambda c: c[1] not in hint)[:CONTENT_CANDIDATES]
+        return first_match(facts, candidates, "named by one of the jar's pom.properties")
 
     def check_published(facts: JarFacts, coordinate, filename):
+        """(status, entry comparison, repository that publishes the artifact)."""
         try:
-            published = maven.published_status(net, coordinate, filename, facts.sha1)
+            published, repository = maven.published_status(net, coordinate, filename, facts.sha1,
+                                                            options.maven_repos)
             comparison = None
             if published == "differs" and facts.listing is not None:
-                comparison = maven.compare_with_published(net, coordinate, filename, entries(facts))
+                comparison = maven.compare_with_published(net, coordinate, filename, entries(facts), repository)
         except NetError:
-            return "unchecked", None
+            return "unchecked", None, None
         if comparison and not any(comparison["counts"].values()):
-            # Every class and resource has the published CRC and size; only the manifest, index or signatures
-            # were rewritten. A build that re-zips its dependencies does this.
+            # Every class and resource has the published CRC and size; only packaging (manifest, index,
+            # signatures, Maven metadata) was rewritten. A build that re-zips its dependencies does this.
             published = "repackaged"
-        return published, comparison
+        return published, comparison, repository
 
     def find_by_content(facts: JarFacts):
         local = entries(facts)
@@ -233,19 +281,46 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None) -> d
         if not class_name or not versions or (options.first_party_groups
                                               and class_name.startswith(options.first_party_groups)):
             return None
-        try:
-            candidates = maven.find_by_class(net, class_name, versions)
-        except NetError:
-            return None
-        for coordinate in candidates[:CONTENT_CANDIDATES]:
-            published, comparison = check_published(facts, coordinate, f"{coordinate[1]}-{coordinate[2]}.jar")
-            if published in ("identical", "repackaged"):
-                how = ("file SHA-1 equals the checksum Maven Central publishes" if published == "identical" else
-                       "every entry but the manifest, index and signatures has the CRC-32 and size")
-                return {"coordinate": coordinate, "confidence": "exact" if published == "identical" else "content",
-                        "published": published, "comparison": comparison,
-                        "method": f"{how} of the artifact Maven Central lists for class {class_name}"}
+        tried = []
+
+        def attempt(candidates, found_by):
+            fresh = [c for c in dict.fromkeys(candidates) if c not in tried][:CONTENT_CANDIDATES]
+            tried.extend(fresh)
+            return first_match(facts, fresh, found_by) if fresh else None
+
+        stages = [
+            (lambda: maven.find_by_class(net, class_name, versions), f"Maven Central lists for class {class_name}"),
+            # Central's class index misses releases (spring-context 6.2.0-RC1 lists only a Camel wrapper), and
+            # its search service throttles. The jar's own name and its siblings' groupIds need neither.
+            (lambda: guessed_coordinates(facts, class_name, versions), "named by the jar's file name or manifest"),
+        ]
+        if options.maven_repos:
+            # A release published only on another repository (a milestone): Central's index knows the
+            # artifact from its other releases, and the jar's version hints name the release to fetch.
+            stages.append((lambda: [(g, a, v) for g, a in maven.find_artifacts_by_class(net, class_name)[:3]
+                                    for v in versions[:3]],
+                           f"Maven Central lists for class {class_name} in other releases"))
+        for candidates, found_by in stages:
+            try:
+                found = attempt(candidates(), found_by)
+            except NetError:
+                continue
+            if found:
+                return found
         return None
+
+    def guessed_coordinates(facts: JarFacts, class_name: str, versions: list[str]):
+        """groupIds from the class's package and from identified jars of the same family (spring-jcl's classes
+        are org.apache.commons.logging, but spring-core beside it is org.springframework)."""
+        package = class_name.split(".")[:-1]
+        from_package = [".".join(package[:n]) for n in (3, 2) if len(package) >= n]
+        guesses = []
+        for artifact in name_hints(facts):
+            siblings = [g for g, _ in families.get(artifact.split("-")[0], Counter()).most_common(3)]
+            groups = sorted(dict.fromkeys(from_package + siblings),
+                            key=lambda g: (not (g in siblings and g in from_package), g not in from_package))
+            guesses += [(g, artifact, v) for g in groups for v in versions[:2]]
+        return guesses
 
     def match_copies() -> int:
         """Give a jar that nothing identified the coordinate of an identified jar with the same entries.
@@ -273,26 +348,32 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None) -> d
                 verdicts[sha1] = {
                     "coordinate": coordinate, "confidence": "content", "published": "repackaged",
                     "licenses": source.get("licenses"), "alternatives": source.get("alternatives"),
-                    "demoted": verdict.get("demoted"), "copy_of": original,
-                    "method": f"every entry but the manifest, index and signatures has the CRC-32 and size of "
+                    "demoted": verdict.get("demoted"), "copy_of": original, "repository": source.get("repository"),
+                    "method": f"every entry but {maven.PACKAGING_TEXT} has the CRC-32 and size of "
                               f"{jars[original].facts.filename} in the same delivery, identified as the "
                               f"published artifact"}
                 matched += 1
         return matched
 
-    with ThreadPoolExecutor(options.workers) as pool:
-        verdicts = dict(zip(jars, pool.map(identify, jars.values())))
+    verdicts = dict(zip(jars, map_parallel(identify, jars.values(), options.workers)))
     copies = match_copies()
-    if options.class_search:
+    # A second round when the first identified anything: spring-core found on a milestone repository names the
+    # groupId spring-jcl's guesses need. The lookups of the first round are answered from the cache.
+    for _ in range(2 if options.class_search else 0):
+        families: dict[str, Counter] = {}
+        for verdict in verdicts.values():
+            if verdict.get("coordinate"):
+                group, artifact, _ = verdict["coordinate"]
+                families.setdefault(artifact.split("-")[0], Counter())[group] += 1
         # After the copies, so that a class name leaves the machine only for a jar nothing else identifies.
         pending = [sha1 for sha1, v in verdicts.items() if not v.get("coordinate") and not v.get("first_party")]
-        with ThreadPoolExecutor(options.workers) as pool:
-            found = list(pool.map(lambda sha1: find_by_content(jars[sha1].facts), pending))
+        found = map_parallel(lambda sha1: find_by_content(jars[sha1].facts), pending, options.workers)
         for sha1, hit in zip(pending, found):
             if hit:
                 verdicts[sha1] = {**hit, "demoted": verdicts[sha1].get("demoted"), "licenses": None}
-        if any(found):
-            copies += match_copies()
+        if not any(found):
+            break
+        copies += match_copies()
     log(f"identified jars: {sum(1 for v in verdicts.values() if v.get('coordinate'))} of {len(jars)}"
         + (f" ({copies} as copies of others in the delivery)" if copies else ""))
 
@@ -332,7 +413,7 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None) -> d
             resources_of_third_party += 1
             continue
         if verdict.get("first_party") or (coordinate and is_first_party_jar(facts, coordinate)):
-            first_party.append({"filename": facts.filename, "sha1": sha1,
+            first_party.append({"filename": facts.filename, "sha1": sha1, "sha256": facts.sha256,
                                 "coordinate": ":".join(coordinate or facts.coordinate or ()) or None,
                                 "locations": jar.locations})
             parent_label = facts.filename
@@ -340,6 +421,8 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None) -> d
             file = {"filename": facts.filename, "sha1": sha1, "sha256": facts.sha256,
                     "confidence": verdict["confidence"], "published": published_status(verdict, jar.locations),
                     "locations": jar.locations}
+            if verdict.get("repository") not in (None, maven.CENTRAL):
+                file["repository"] = verdict["repository"]
             if verdict.get("comparison"):
                 file["comparison"] = verdict["comparison"]
             if verdict.get("copy_of"):
@@ -358,7 +441,8 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None) -> d
             known += [other for other in others if other not in known]
             parent_label = item["purl"]
         else:
-            reason = (verdict["lookup_failure"] if verdict.get("lookup_failure") == OFFLINE_UNKNOWN
+            reason = ("not a readable zip archive (truncated, damaged or not a jar at all)" if not facts.readable
+                      else verdict["lookup_failure"] if verdict.get("lookup_failure") == OFFLINE_UNKNOWN
                       else "registry lookup failed: " + verdict["lookup_failure"] if verdict.get("lookup_failure")
                       else "no registry has this file; its entries are those of jars identified as different "
                            "components, listed in same_content_as" if verdict.get("same_content_as")
@@ -370,6 +454,7 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None) -> d
                       else "no registry has this file and the jar declares no Maven coordinates")
             unidentified.append({"kind": "jar", "filename": facts.filename, "sha1": sha1, "sha256": facts.sha256,
                                  "size": facts.size, "manifest": facts.manifest, "reason": reason,
+                                 "hint": _manifest_hint(facts),
                                  "embedded_coordinates": [":".join(g) for g in embedded],
                                  "same_content_as": verdict.get("same_content_as", []),
                                  "license": ({"names": own_licenses, "source": facts.license_source,
@@ -400,19 +485,20 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None) -> d
     # Scripts inside an identified third-party jar (webjars, swagger-ui) belong to that jar.
     script_list = [s for s in scripts.values() if not inside_third_party(s["locations"])]
     unmatched_scripts = []
+    scripts_not_looked_up = 0
     if script_list:
         def identify_script(entry):
             try:
                 return staticjs.identify(net, entry["digest"], entry["head"])
             except NetError as error:
                 return {"error": str(error)}
-        with ThreadPoolExecutor(options.workers) as pool:
-            found = list(pool.map(identify_script, script_list))
+        found = map_parallel(identify_script, script_list, options.workers)
         for entry, hit in zip(script_list, found):
             if not hit or "error" in hit:
                 unmatched_scripts += entry["locations"]
                 if hit:
                     warnings.append(f"script lookup failed: {hit['error']}")
+                    scripts_not_looked_up += 1
                 continue
             for location in entry["locations"]:
                 components.add("npm", hit["name"], hit["version"], method=hit["method"],
@@ -421,13 +507,21 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None) -> d
             f"of {len(script_list)}")
 
     items = list(components.items.values())
+    for item in items:
+        item["scope"] = item["scope"] or "unknown"
+    licenses_not_looked_up = 0
     if options.licenses:
-        _attach_licenses(net, items, jar_hints, options.workers, warnings)
+        licenses_not_looked_up = _attach_licenses(net, items, jar_hints, options.workers, warnings,
+                                                  options.maven_repos)
     kev_dates = {}
     vulnerabilities = {}
+    kev_available = True
     if options.vulnerabilities:
-        vulnerabilities, kev_dates = _attach_vulnerabilities(net, db, items, also_published, options.workers,
-                                                             warnings, log)
+        vulnerabilities, kev_dates, kev_available = _attach_vulnerabilities(net, db, items, also_published,
+                                                                            options.workers, warnings, log)
+    if not (jars or npm_sightings or scripts):
+        warnings.append("nothing to identify: the inputs hold no jar, npm lockfile, node_modules package or "
+                        "JavaScript file that binwitness reads")
 
     items.sort(key=lambda c: (c["ecosystem"], c["name"], c["version"]))
     for item in items:
@@ -442,7 +536,9 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None) -> d
         "options": {"first_party_groups": list(options.first_party_groups),
                     "first_party_jars": list(options.first_party_jars),
                     "first_party_npm": list(options.first_party_npm), "exclude": list(options.exclude),
-                    "scan_js": options.scan_js, "class_search": options.class_search, "offline": net.offline,
+                    "scan_js": options.scan_js, "licenses": options.licenses,
+                    "vulnerabilities": options.vulnerabilities, "class_search": options.class_search,
+                    "maven_repos": list(options.maven_repos), "offline": net.offline,
                     "lookup": "online" if db is None else "local" if net.offline else "auto",
                     "mirrors": dict(net.mirrors)},
         "data_sources": {"online": net.provenance(), "local": db.provenance() if db else {}},
@@ -456,8 +552,18 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None) -> d
                                  + ", ".join(f"{host} {n}" for host, n in net.offline_missed_hosts.most_common())
                                  + ")"] if net.offline_misses else []) + (db.stale() if db else []),
     }
-    result["summary"] = summarize(result, len(jars), walker.skipped_runtime_jars, kev_dates)
-    result["summary"]["jars"]["inside_identified_libraries"] = resources_of_third_party
+    result["summary"] = summarize(result, len(jars), walker.skipped_runtime_jars, kev_dates,
+                                  resources_of_third_party)
+    incomplete = {
+        "jars_not_looked_up": sum(1 for u in result["unidentified"]
+                                  if u["reason"] == OFFLINE_UNKNOWN or u["reason"].startswith("registry lookup failed")),
+        "scripts_not_looked_up": scripts_not_looked_up,
+        "jar_files_not_compared": sum(1 for c in items for f in c["files"] if f["published"] == "unchecked"),
+        "vulnerabilities_not_checked": sum(1 for c in items if c.get("vulnerabilities_checked") is False),
+        "licenses_not_looked_up": licenses_not_looked_up,
+        "kev_catalog_unavailable": options.vulnerabilities and not kev_available,
+    }
+    result["summary"]["incomplete"] = {k: v for k, v in incomplete.items() if v}
     return result
 
 
@@ -480,7 +586,16 @@ def _content_print(facts: JarFacts) -> str | None:
     return hashlib.sha1(repr(kept).encode()).hexdigest() if kept else None
 
 
-def _attach_licenses(net, items, jar_hints, workers, warnings):
+def _manifest_hint(facts: JarFacts) -> str | None:
+    """What the manifest says the jar is. Anyone can write a manifest, so it only points where to look."""
+    name = facts.manifest.get("Implementation-Title") or facts.manifest.get("Bundle-SymbolicName") \
+        or facts.manifest.get("Automatic-Module-Name")
+    version = facts.manifest.get("Implementation-Version") or facts.manifest.get("Bundle-Version")
+    return " ".join(x for x in (name, version) if x) or None
+
+
+def _attach_licenses(net, items, jar_hints, workers, warnings, repositories=()) -> int:
+    """Sets each item's ``license``; returns how many could not be looked up."""
     def resolve(item):
         declared = item["declared_license"]
         try:
@@ -490,7 +605,8 @@ def _attach_licenses(net, items, jar_hints, workers, warnings):
                 return declared
             if item["ecosystem"] == "maven":
                 group, artifact = item["name"].split(":", 1)
-                return maven.licenses_for(net, (group, artifact, item["version"]), jar_hints.get(item["purl"]))
+                return maven.licenses_for(net, (group, artifact, item["version"]), jar_hints.get(item["purl"]),
+                                          repositories)
             quote = urllib.parse.quote
             found = net.get_json(f"{DEPS_DEV}/systems/npm/packages/{quote(item['name'], safe='')}/versions/"
                                  f"{quote(item['version'], safe='')}", stable=True) or {}
@@ -501,11 +617,11 @@ def _attach_licenses(net, items, jar_hints, workers, warnings):
             return None
         except NetError as error:
             warnings.append(f"license lookup failed for {item['purl']}: {error}")
+            failed.append(item["purl"])
             return None
 
-    unresolved = []
-    with ThreadPoolExecutor(workers) as pool:
-        found_all = list(pool.map(resolve, items))
+    unresolved, failed = [], []
+    found_all = map_parallel(resolve, items, workers)
     # One line for all of them: one per component would bury the other warnings.
     if unresolved:
         warnings.append(f"license unknown for {len(unresolved)} component{'' if len(unresolved) == 1 else 's'}: "
@@ -521,6 +637,7 @@ def _attach_licenses(net, items, jar_hints, workers, warnings):
         else:
             found["family"] = family(found["names"])
         item["license"] = found
+    return len(unresolved) + len(failed)
 
 
 def _attach_vulnerabilities(net, db, items, also_published, workers, warnings, log):
@@ -529,14 +646,10 @@ def _attach_vulnerabilities(net, db, items, also_published, workers, warnings, l
     packages = sorted({(c["ecosystem"], c["name"], c["version"]) for c in items}
                       | {other for others in also_published.values() for other in others})
     local = [p for p in packages if db is not None and db.has(OSV_DATASET[p[0]])]
-    found, failures = vulns.query(net, [p for p in packages if p not in local], workers=max(workers, 8))
+    found, failures, incomplete = vulns.query(net, [p for p in packages if p not in local],
+                                              workers=max(workers, 8))
     found.update(vulns.query_local(db, local) if local else {})
     warnings += failures
-    try:
-        kev_dates = db.kev() if db is not None and db.has("kev") else vulns.kev(net)
-    except NetError as error:
-        kev_dates = {}
-        warnings.append(f"CISA KEV catalog unavailable: {error}")
     table = {}
     for item in items:
         own = (item["ecosystem"], item["name"], item["version"])
@@ -566,14 +679,26 @@ def _attach_vulnerabilities(net, db, items, also_published, workers, warnings, l
                                                    + vulns.fixed_versions(record, package[0], package[1])))
             per_key[key] = entry
         item["vulnerabilities"] = sorted(per_key, key=lambda k: (vulns.SEVERITIES.index(table[k]["severity"]), k))
+        # An empty list from a failed lookup would read as "no known vulnerabilities".
+        item["vulnerabilities_checked"] = not any(p in incomplete
+                                                  for p in [own, *also_published.get(item["purl"], [])])
+    kev_dates, kev_available = {}, True
+    # The catalog is a megabyte; without findings there is nothing to look up in it.
+    if table:
+        try:
+            kev_dates = db.kev() if db is not None and db.has("kev") else vulns.kev(net)
+        except NetError as error:
+            kev_available = False
+            warnings.append(f"CISA KEV catalog unavailable: {error}")
     for key, entry in table.items():
         cves = [key, *entry["aliases"]]
         entry["kev_date_added"] = next((kev_dates[c] for c in cves if c in kev_dates), None)
     log(f"vulnerabilities: {len(table)} distinct across {sum(1 for c in items if c['vulnerabilities'])} components")
-    return table, kev_dates
+    return table, kev_dates, kev_available
 
 
-def summarize(result: dict, distinct_jars: int, skipped_runtime: int, kev_dates: dict) -> dict:
+def summarize(result: dict, distinct_jars: int, skipped_runtime: int, kev_dates: dict,
+              inside_identified: int = 0) -> dict:
     items, table = result["components"], result["vulnerabilities"]
     return {
         "components": {
@@ -593,6 +718,7 @@ def summarize(result: dict, distinct_jars: int, skipped_runtime: int, kev_dates:
             "repackaged": sum(1 for c in items for f in c["files"] if f["published"] == "repackaged"),
             "copies_of_identified_jars": sum(1 for c in items for f in c["files"] if f.get("same_entries_as")),
             "not_on_central": sum(1 for c in items for f in c["files"] if f["published"] == "not-on-central"),
+            "inside_identified_libraries": inside_identified,
             "skipped_java_runtime": skipped_runtime,
         },
         "vulnerabilities": {
@@ -608,7 +734,8 @@ def summarize(result: dict, distinct_jars: int, skipped_runtime: int, kev_dates:
 
 def _describe_input(path: Path) -> dict:
     if path.is_dir():
-        return {"name": path.name, "type": "directory"}
+        # "." has no name of its own.
+        return {"name": path.name or path.resolve().name or str(path), "type": "directory"}
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for block in iter(lambda: handle.read(1 << 20), b""):
