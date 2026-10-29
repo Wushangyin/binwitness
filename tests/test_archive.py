@@ -52,8 +52,13 @@ def test_image_can_be_excluded_by_tag(tmp_path):
     assert items == []
 
 
+# What javac reads the platform API from: a zip of class files under a name that says nothing.
+CT_SYM = make_zip({"META-INF/sym/rt.jar/java/lang/Object.class": b"\xca\xfe\xba\xbe"})
+
+
 def test_java_runtime_jars_are_skipped(tmp_path):
     image = make_image([{"usr/lib/jvm/java-8/jre/lib/rt.jar": make_jar(),
+                         "usr/lib/jvm/java-8/lib/ct.sym": CT_SYM,
                          "opt/openjdk-11/lib/jrt-fs.jar": make_jar(), "app/app-1.jar": make_jar()}])
     walker, items = walk(tmp_path, "image.tar", image)
     assert [loc.rsplit("/", 1)[1] for _, loc in items] == ["app-1.jar"]
@@ -214,13 +219,15 @@ def test_large_entries_are_read_from_a_temporary_file_removed_afterwards(tmp_pat
 
 def test_jars_of_a_java_installation_found_by_its_release_file_are_skipped(tmp_path):
     bundle = make_zip({"opt/runtime/release": "JAVA_VERSION=\"17\"", "opt/runtime/lib/modules": b"",
+                       "opt/runtime/lib/ct.sym": CT_SYM,
                        "opt/runtime/lib/vendor-crypto.jar": make_jar(), "app/app-1.jar": make_jar()})
     walker, items = walk(tmp_path, "bundle.zip", bundle)
     assert items == [("jar", "bundle.zip!/app/app-1.jar")] and walker.skipped_runtime_jars == 1
     root = tmp_path / "dist"
-    for name in ("runtime/release", "runtime/bin/java", "runtime/lib/vendor-crypto.jar", "app/app-1.jar"):
+    for name in ("runtime/release", "runtime/bin/java", "runtime/lib/ct.sym", "runtime/lib/vendor-crypto.jar",
+                 "app/app-1.jar"):
         (root / name).parent.mkdir(parents=True, exist_ok=True)
-        (root / name).write_bytes(make_jar() if name.endswith(".jar") else b"")
+        (root / name).write_bytes(CT_SYM if name.endswith(".sym") else make_jar() if name.endswith(".jar") else b"")
     walker = Walker()
     assert [i.location for i in walker.walk(root)] == ["dist/app/app-1.jar"] and walker.skipped_runtime_jars == 1
 

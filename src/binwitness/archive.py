@@ -241,6 +241,9 @@ class Walker:
         # Shared libraries (libc.so.6) and manual pages carry numbered extensions.
         if extension in NOT_ARCHIVES or extension.isdigit():
             return None
+        # A JDK keeps zips of its own under other names (lib/ct.sym, the API signatures javac reads).
+        if _is_java_runtime(inner_name) or inner_name.startswith(homes):
+            return None
         return "sniff"
 
     def _sniffed_kind(self, entry: _Entry, kind: str, location: str) -> str | None:
