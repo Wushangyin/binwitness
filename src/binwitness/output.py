@@ -5,6 +5,7 @@ import csv
 import functools
 import json
 import uuid
+from collections import Counter
 from pathlib import Path
 
 from binwitness import __version__
@@ -31,6 +32,7 @@ def write_all(result: dict, out_dir: Path) -> list[Path]:
 def cyclonedx(result: dict) -> dict:
     components = []
     refs: dict[str, list[str]] = {}
+    families = families_of(result)
     for c in result["components"]:
         group, name = c["name"].split(":", 1) if c["ecosystem"] == "maven" else ("", c["name"])
         technique, confidence = _TECHNIQUE[c["confidence"]]
@@ -56,6 +58,9 @@ def cyclonedx(result: dict) -> dict:
         properties += [{"name": "binwitness:contained-in", "value": p} for p in c["contained_in"]]
         if c.get("upgrade"):
             properties.append({"name": "binwitness:upgrade", "value": upgrade_text(c["upgrade"])})
+        if c.get("upgrade_family") in families:
+            properties.append({"name": "binwitness:upgrade-family",
+                               "value": family_text(families[c["upgrade_family"]])})
         if c.get("vulnerabilities_checked") is False:
             properties.append({"name": "binwitness:vulnerabilities", "value": "not checked: the lookup failed"})
         # One entry per file: a tampered copy and the original share coordinates but not hashes, and a
@@ -168,7 +173,8 @@ def components_csv(result: dict, path: Path):
         writer.writerow(["ecosystem", "name", "version", "purl", "scope", "confidence", "identified by",
                          "published artifact", "also published as", "contained in", "license family", "licenses",
                          *[s.lower() for s in SEVERITIES], "vulnerabilities", "occurrences", "first location",
-                         "upgrade"])
+                         "upgrade", "upgrade family"])
+        families = families_of(result)
         for c in result["components"]:
             license_ = c.get("license") or {}
             writer.writerow([
@@ -182,7 +188,8 @@ def components_csv(result: dict, path: Path):
                 *_counts(c, table),
                 " ".join(c["vulnerabilities"] + (["(lookup incomplete)"] if c.get("vulnerabilities_checked") is False
                                                  else [])),
-                len(c["locations"]), c["locations"][0], upgrade_text(c["upgrade"]) if c.get("upgrade") else ""])
+                len(c["locations"]), c["locations"][0], upgrade_text(c["upgrade"]) if c.get("upgrade") else "",
+                family_text(families[c["upgrade_family"]]) if c.get("upgrade_family") in families else ""])
 
 
 def vulnerabilities_csv(result: dict, path: Path):
@@ -211,6 +218,13 @@ def render_summary(result: dict) -> str:
                          ("inside identified libraries", j.get("inside_identified_libraries", 0)),
                          ("unidentified", j["unidentified"])]) if j["distinct_files"] else "")
         + (f"; {j['skipped_java_runtime']} Java runtime jars skipped" if j.get("skipped_java_runtime") else ""))
+    scripts = s.get("scripts") or {}
+    if any(scripts.values()):
+        lines.append("scripts      " + _listing([("matched", scripts["matched"]),
+                                                  ("version not determined", scripts["version_not_determined"]),
+                                                  ("bundles", scripts["bundles"]), ("unmatched", scripts["unmatched"]),
+                                                  ("project files not looked up",
+                                                   scripts["project_files_not_looked_up"])]))
     if j["differ_from_published"] or j["not_on_central"] or j["repackaged"]:
         lines.append(f"             {j['differ_from_published']} differ from the published artifact, "
                      f"{j['repackaged']} repackaged with unchanged contents"
@@ -229,9 +243,12 @@ def render_summary(result: dict) -> str:
         advice = (s.get("upgrades") or {})
         if options.get("upgrades") and advice.get("by_verdict"):
             unpublished = advice.get("fix_versions_not_published")
+            together = advice.get("families")
             lines.append("upgrades     " + _listing((_VERDICT_LABEL[k], n) for k, n in advice["by_verdict"].items())
                          + (f"; {unpublished} advisor{'y names' if unpublished == 1 else 'ies name'} a fixed version "
-                            "that is not published" if unpublished else ""))
+                            "that is not published" if unpublished else "")
+                         + (f"; {together} release famil{'y' if together == 1 else 'ies'} (artifacts of one group "
+                            "and version) with one target each" if together else ""))
     if not options.get("licenses", True):
         lines.append("licenses     not looked up (--no-licenses)")
     elif c["total"]:
@@ -263,7 +280,8 @@ INCOMPLETE = {
     "upgrade_versions_not_checked": "upgrade targets not checked for {n} components",
 }
 _VERDICT_LABEL = {"remove-malicious": "remove (malicious)", "upgrade": "upgrade on the same line",
-                  "upgrade-across-major": "only across a major version", "partial": "partial",
+                  "upgrade-across-major": "only across a major version", "relocated": "at new coordinates",
+                  "partial": "partial",
                   "no-published-fix": "no published fix", "unverified": "not checked"}
 # The summary names this many of the worst findings; the CSV and JSON have all of them.
 WORST_SHOWN = 10
@@ -282,8 +300,9 @@ def worst_findings(result: dict) -> list[dict]:
 
 
 def _worst(result: dict) -> list[str]:
-    """The worst findings, each with what it affects."""
+    """The worst findings, each with what it affects; how many others there are, so that the counts add up."""
     named = {c["purl"]: c for c in result["components"]}
+    families = families_of(result)
     worst = worst_findings(result)
     lines = []
     for x in worst[:WORST_SHOWN]:
@@ -291,12 +310,28 @@ def _worst(result: dict) -> list[str]:
         component = named.get(ref)
         label = f"{component['name']} {component['version']}" if component else ref
         more = f" and {len(x['affects']) - 1} more" if len(x["affects"]) > 1 else ""
-        fixed = finding_advice(component, x["id"], affected) if component else ""
+        fixed = finding_advice(component, x["id"], affected, families.get(component.get("upgrade_family"))) \
+            if component else ""
         flags = "".join((" MALICIOUS" if x["malicious"] else "", " KEV" if x["kev_date_added"] else ""))
         lines.append(f"  {x['severity'].lower():8} {x['id']:20} {label}{more}{fixed}{flags}")
-    if len(worst) > WORST_SHOWN:
-        lines.append(f"  ... {len(worst) - WORST_SHOWN} more (vulnerabilities.csv)")
+    listed = {x["id"] for x in worst}
+    rest = Counter(x["severity"] for x in result["vulnerabilities"].values() if x["id"] not in listed)
+    rest_text = _listing((s.lower(), rest[s]) for s in SEVERITIES if rest[s])
+    hidden = len(worst) - WORST_SHOWN
+    if hidden > 0 or rest:
+        lines.append("  ... " + ", and ".join(part for part in (
+            f"{hidden} more" if hidden > 0 else "", f"{rest_text} not listed here" if rest else "") if part)
+            + " (vulnerabilities.csv)")
     return lines
+
+
+def families_of(result: dict) -> dict[str, dict]:
+    return {f["family"]: f for f in result.get("upgrade_families") or []}
+
+
+def target_text(upgrade: dict) -> str:
+    """The target, and the variant builds that do equally well (33.7.2-android or 33.7.2-jre)."""
+    return " or ".join([upgrade["target"], *upgrade.get("alternatives", [])])
 
 
 def _next_fixed(component: dict, fixed: list[str]) -> str | None:
@@ -307,21 +342,40 @@ def _next_fixed(component: dict, fixed: list[str]) -> str | None:
 
 
 def upgrade_text(upgrade: dict) -> str:
-    text = upgrade["verdict"] + (f" {upgrade['target']}" if upgrade.get("target") else "")
-    if upgrade.get("target") and upgrade["remaining"]:
-        text += f" ({len(upgrade['remaining'])} remain)"
+    text = upgrade["verdict"]
+    if upgrade.get("target"):
+        text += f" {upgrade['target_package']} {upgrade['target']}" if upgrade.get("target_package") \
+            else f" {target_text(upgrade)}"
+        if upgrade["remaining"]:
+            text += f" ({len(upgrade['remaining'])} remain)"
     return text
 
 
-def finding_advice(component: dict, key: str, affected: dict) -> str:
-    """What to do about one finding: the component's upgrade advice when it speaks to this finding, else the
-    advisory's own fixed version."""
+def family_text(family: dict) -> str:
+    """org.springframework@5.3.4 (9 artifacts): upgrade-across-major 6.2.19"""
+    text = f"{family['family']} ({len(family['members'])} artifacts): {family['verdict']}"
+    if family.get("target"):
+        text += f" {family['target']}" + (f" ({len(family['remaining'])} remain)" if family["remaining"] else "")
+    return text
+
+
+def finding_advice(component: dict, key: str, affected: dict, family: dict | None = None) -> str:
+    """What to do about one finding: the advice for the component's release family or for the component
+    itself when it speaks to this finding, else the advisory's own fixed version."""
     upgrade = component.get("upgrade")
     target = upgrade and upgrade.get("target")
     if upgrade and upgrade["verdict"] == "remove-malicious":
         return ", remove it"
+    if family and family.get("target") and key in family["clears"]:
+        others = len(family["members"]) - 1
+        return (f", upgrade to {family['target']} with the other {others} {family['group']} "
+                f"artifact{'' if others == 1 else 's'}"
+                + (" (next major)" if family["verdict"] == "upgrade-across-major" else ""))
+    if target and upgrade.get("target_package") and key in upgrade["clears"]:
+        return f", move to {upgrade['target_package']} {target}"
     if target and key in upgrade["clears"]:
-        return f", upgrade to {target}" + (" (next major)" if upgrade["verdict"] == "upgrade-across-major" else "")
+        return f", upgrade to {target_text(upgrade)}" + (
+            " (next major)" if upgrade["verdict"] == "upgrade-across-major" else "")
     if upgrade and upgrade["verdict"] == "no-published-fix" and key in upgrade["remaining"]:
         return ", no published fix"
     if target and key in upgrade["remaining"]:

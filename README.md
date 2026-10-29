@@ -107,7 +107,7 @@ binwitness scan INPUT... -o OUTDIR [options]
 | `--first-party-group com.acme` | Maven groupId prefix of your own code. Repeatable. Not looked up, listed separately. |
 | `--first-party-jar acme-` | jar file-name prefix of your own code. Repeatable. |
 | `--first-party-npm @acme/` | npm name prefix of your own packages. Repeatable. |
-| `--exclude GLOB` | skip locations, e.g. `*!/<registry/unrelated:*>` for one image of a multi-image tarball |
+| `--exclude GLOB` | skip locations, e.g. `*!/<registry/unrelated:*>` for one image of a multi-image tarball. A directory every file under which the pattern skips (`*/target/*`) is not walked at all |
 | `--class-search` | identify rebuilt jars that carry no coordinates (see below). Sends one class name per such jar to Maven Central, and asks for the coordinates its name suggests |
 | `--maven-repo URL` | another Maven repository that publishes releases Maven Central does not have: milestones, a vendor's or your company's own. Checked after Central, in the order given, for checksums, jar directories and POM licenses. Repeatable |
 | `--no-js` / `--no-licenses` / `--no-vulns` | do not look up vendored JavaScript files / licenses / vulnerabilities |
@@ -132,7 +132,7 @@ What is examined:
 | `netty-all` style artifacts | the module list in `META-INF/io.netty.versions.properties` |
 | `package-lock.json` (v1-v3), `yarn.lock` (classic and berry), `pnpm-lock.yaml` | listed packages, with dev/runtime scope where the lockfile records it. An alias (`name@npm:other@1.0.0`) is named by the package it installs. Inside `node_modules`, only npm's own `node_modules/.package-lock.json` counts: the lockfiles that packages publish were never installed |
 | `node_modules/**/package.json` | installed packages |
-| vendored `.js` files outside `node_modules` | byte-identical match with a file of an npm release (jsDelivr). A banner comment that names a release without a matching file gives a `declared` identification. |
+| vendored `.js` files outside `node_modules` | byte-identical match with a file of an npm release (jsDelivr). The hash index names one release even when many hold the same file, so the version is kept only when the releases before and after it hold a different file, or when a lockfile or `package.json` in the delivery declares a version whose release holds the file. Otherwise the file is listed in `scripts_without_version` with the releases found to hold it, and no component or vulnerability is made of it. A banner comment that names a release without a matching file gives a `declared` identification. Build configuration (`*.config.js`, `.eslintrc.js`) and plain sources under `src/`, `scripts/` or `tests/` (outside asset and library directories, with no license notice, UMD wrapper or minification) are the project's own and are not looked up (`project_scripts`). Of the files nothing matches, bundler output (webpack, Vite, Parcel chunks) is listed in `bundled_scripts`, the rest in `unmatched_scripts`. |
 | a file whose extension says nothing (`app.bin`, `plugin.dat`) | its first bytes: a zip with classes of its own is examined as a jar; other zips, tars (also gzip or xz compressed), rar and 7z archives are opened |
 
 Container images: `docker save` tarballs and OCI image layouts, packed as a tar or unpacked into a
@@ -144,6 +144,11 @@ Directories are walked with their symbolic links followed; a link back into a di
 not followed again. Entries larger than 16 MB are read from a temporary file rather than kept in memory,
 and one that expands more than a hundredfold is skipped as a decompression bomb. Whatever is skipped (a
 broken link, an archive that cannot be read, a bomb, a link inside an archive) is listed in the warnings.
+Build caches are skipped and listed in `skipped_build_caches`: directories tagged with `CACHEDIR.TAG`
+(Cargo's `target/`), `.next/cache`, `node_modules/.cache`, `.angular/cache`, `.parcel-cache` and the
+like. Dependency files of ecosystems binwitness does not read (`requirements.txt`, `pyproject.toml`,
+`go.mod`, `Cargo.toml`, `Gemfile`, `composer.json` and others) are named in a warning and in
+`not_covered`, so that a result without their dependencies is not taken for a clean one.
 
 The same file is sometimes published under several coordinates: a project that moved its groupId
 (`com.oracle.ojdbc` and `com.oracle.database.jdbc`), a copy republished by someone else, a release that
@@ -194,6 +199,7 @@ block of the component in `binwitness.json`, the last column of `components.csv`
 | `upgrade` | a later release on the same major line is outside every advisory of the package |
 | `upgrade-across-major` | only a later major line leaves out more advisories; compatibility is not assessed |
 | `partial` | the best release on this line still falls inside some advisories, and no other line does better |
+| `relocated` | the artifact moved to new coordinates (its POM says so), and a release there leaves out more advisories than any release of the old ones: `target_package` names them, `same_coordinates` keeps the advice for the old ones |
 | `no-published-fix` | no published version of this coordinate leaves out more advisories (log4j 1.x): replace or remove it |
 | `remove-malicious` | a malicious package: remove it; no version of it is an upgrade |
 | `unverified` | the version list or the advisories could not be read; the advisories' own fixed versions are listed, unchecked |
@@ -215,11 +221,19 @@ How the target is chosen:
   `fix_versions_not_published` and never proposed.
 - Variant builds keep their variant: `33.0.0-jre` is proposed for a `-jre` guava, not `-android`. When the
   version in use has no variant and the best target is one (`1.2.83_noneautotype`), a caveat says so and
-  names the alternatives.
+  names the alternatives. Variant builds that do equally well are all named (`33.7.2-android or 33.7.2-jre`).
+- Maven artifacts of one group at one version (`spring-core`, `spring-web` and `spring-webmvc` 5.3.4) are
+  released together and upgraded together, so they form a release family with one target: a version every
+  member is published at, chosen by the advisories of all of them. Families are listed in
+  `upgrade_families`, each member names its family in `upgrade_family`, and `per_member` shows what each
+  member would need on its own. When some members stop being published, a caveat says so.
 - Caveats state what the advice does not know: a component bundled inside another artifact has to change
   with its host, a modified jar may carry local changes, declared coordinates are unverified, a finding
   that came through another coordinate of the same file has its fixed versions listed separately, a
-  development dependency may not ship.
+  development dependency may not ship, and a target whose license is more restrictive than the version
+  in use, or not one binwitness classifies, is named with both (`license-changes`: Elasticsearch 7.11 went
+  from Apache-2.0 to Elastic-2.0 or SSPL-1.0). Both sides are read from the registry, only when licenses
+  are looked up.
 
 Version lists come from `maven-metadata.xml` on Maven Central (through `--maven-mirror` when given) and
 the `--maven-repo` repositories, and from the npm registry. With the local hash index installed, `auto`
@@ -398,7 +412,8 @@ asked for, so that answers fit an assistant's context.
 
 binwitness sends the following to public services:
 
-- SHA-1 hashes of jars, and SHA-256 hashes of JavaScript files
+- SHA-1 hashes of jars, and SHA-256 hashes of JavaScript files that may be copied libraries (the project's
+  own plain sources and build configuration are not looked up)
 - component coordinates and versions
 - CVE identifiers
 - for upgrade advice, the names of vulnerable packages: to OSV for all of their advisories, and to Maven
@@ -420,8 +435,8 @@ scan a machine with no internet access, copy the dataset directory and, optional
 | [Maven Central](https://central.sonatype.com) | hash search fallback; published checksums; POM licenses; `--class-search`; version lists for upgrade advice; the modules of a groupId for `crosscheck` |
 | repositories given with `--maven-repo` | checksums, jar directories, POM licenses and version lists of releases Central does not have |
 | [OSV.dev](https://osv.dev) | vulnerabilities (GitHub Security Advisories and others); all advisories of a vulnerable package, for upgrade advice |
-| [npm registry](https://www.npmjs.com) | published versions of vulnerable npm packages, for upgrade advice |
-| [jsDelivr](https://www.jsdelivr.com) | JavaScript file hashes |
+| [npm registry](https://www.npmjs.com) | published versions of vulnerable npm packages, for upgrade advice, and of packages a JavaScript file matched |
+| [jsDelivr](https://www.jsdelivr.com) | JavaScript file hashes; file lists of the releases next to a match |
 | [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) | known exploited flag |
 | [OSV data bucket](https://google.github.io/osv.dev/data/) | `db sync` of the OSV datasets |
 | [ghcr.io](https://github.com/aquasecurity/trivy-java-db) | `db sync` of the Maven Central hash index |
@@ -454,9 +469,11 @@ These limits are deliberate, so read them before relying on a result:
   assessed. A version published after the version list was read is not considered.
 - **Front-end bundles are opaque.** Code that webpack or rollup merged into chunks cannot be matched by
   hash. Ship the lockfile, or the `node_modules` the build used, alongside the bundle. Banner comments
-  give only partial coverage.
+  give only partial coverage. Recognised bundles are counted apart (`bundled_scripts`) so that they are not
+  taken for unknown libraries.
 - **Ecosystems: Java (Maven) and JavaScript (npm).** OS packages, Python, Go, .NET and native libraries
-  are out of scope; use Trivy or Syft for an image's OS layer. JDK/JRE runtime jars are skipped.
+  are out of scope; use Trivy or Syft for an image's OS layer. Their dependency files are named in a
+  warning. JDK/JRE runtime jars are skipped.
 - **Unusual licenses need a human.** Non-standard licenses and contradictory declarations end up as
   `unknown`. Dual licenses listed without an SPDX expression are read as alternatives.
 - **Scanning speed depends on the network.** A cold-cache scan is almost entirely waiting for lookups: a

@@ -68,7 +68,7 @@ binwitness scan INPUT... -o OUTDIR [options]
 | `--first-party-group com.acme` | 自有代码的 Maven groupId 前缀，可重复。不做查询，单独列出。 |
 | `--first-party-jar acme-` | 自有代码的 jar 文件名前缀，可重复。 |
 | `--first-party-npm @acme/` | 自有 npm 包的名称前缀，可重复。 |
-| `--exclude GLOB` | 跳过某些位置，例如用 `*!/<registry/unrelated:*>` 跳过多镜像 tar 包中的某一个镜像 |
+| `--exclude GLOB` | 跳过某些位置，例如用 `*!/<registry/unrelated:*>` 跳过多镜像 tar 包中的某一个镜像。整个目录下的文件都会被该模式跳过时（`*/target/*`），这个目录根本不进入 |
 | `--class-search` | 识别不带坐标的重新构建 jar（见下文）。每个这样的 jar 会向 Maven Central 发送一个类名，并查询其名称提示的坐标 |
 | `--maven-repo URL` | 另一个发布了 Maven Central 没有的版本的 Maven 仓库：里程碑仓库、厂商或贵公司自己的仓库。在中央仓之后按给出的顺序查询校验和、jar 目录和 POM 许可证。可重复 |
 | `--no-js` / `--no-licenses` / `--no-vulns` | 不查询随项目拷入的 JavaScript 文件 / 许可证 / 漏洞 |
@@ -93,12 +93,12 @@ binwitness scan INPUT... -o OUTDIR [options]
 | `netty-all` 这类合集构件 | `META-INF/io.netty.versions.properties` 中的模块清单 |
 | `package-lock.json`（v1-v3）、`yarn.lock`（classic 和 berry）、`pnpm-lock.yaml` | 锁文件列出的包；锁文件记录了 dev/runtime 范围的，一并保留。别名（`name@npm:other@1.0.0`）按实际安装的包命名。`node_modules` 里只认 npm 自己的 `node_modules/.package-lock.json`：各个包随发布带的锁文件从未被安装 |
 | `node_modules/**/package.json` | 已安装的包 |
-| `node_modules` 以外随项目拷入的 `.js` 文件 | 与某个 npm 发布版中的文件逐字节相同（jsDelivr）。文件头注释写明了发布版本、但找不到相同文件的，判 `declared`。 |
+| `node_modules` 以外随项目拷入的 `.js` 文件 | 与某个 npm 发布版中的文件逐字节相同（jsDelivr）。同一个文件出现在多个版本里时，哈希索引也只报其中一个版本，所以只有前后相邻的版本里没有这个文件，或者交付物里的锁文件、`package.json` 声明的版本恰好含有这个文件时，才采用这个版本。否则把文件和查到含有它的版本列入 `scripts_without_version`，不生成组件，也不挂漏洞。文件头注释写明了发布版本、但找不到相同文件的，判 `declared`。构建配置（`*.config.js`、`.eslintrc.js`）以及 `src/`、`scripts/`、`tests/` 下的普通源码（不在资源或库目录里，没有许可证注释、UMD 包装，也未压缩）属于项目自己，不查询（`project_scripts`）。查不到的文件中，打包工具产物（webpack、Vite、Parcel 的 chunk）列入 `bundled_scripts`，其余列入 `unmatched_scripts`。 |
 | 扩展名看不出格式的文件（`app.bin`、`plugin.dat`） | 看文件头：自带类文件的 zip 按 jar 检查；其他 zip、tar（含 gzip 或 xz 压缩的）、rar 和 7z 压缩包会被打开 |
 
 容器镜像：支持 `docker save` 的 tar 包和 OCI 镜像布局（打成 tar 或解开成目录均可），多平台镜像的每个平台分别检查。按顺序叠加各层，包括 whiteout 删除标记，所以只检查最终镜像中存在的文件。属于 JDK/JRE 安装目录（`bin/java` 或 `lib/modules` 旁边有 `release` 文件的目录）的 jar 会跳过并计数。
 
-目录输入会跟随其中的符号链接；指回已遍历目录的链接不会重复进入。大于 16 MB 的条目先写入临时文件再读取，不整个放进内存；解压后膨胀一百倍以上的条目视为解压炸弹跳过。所有被跳过的内容（失效的链接、读不了的压缩包、解压炸弹、压缩包内的链接）都会列在警告中。
+目录输入会跟随其中的符号链接；指回已遍历目录的链接不会重复进入。大于 16 MB 的条目先写入临时文件再读取，不整个放进内存；解压后膨胀一百倍以上的条目视为解压炸弹跳过。所有被跳过的内容（失效的链接、读不了的压缩包、解压炸弹、压缩包内的链接）都会列在警告中。构建缓存会跳过，并列入 `skipped_build_caches`：带 `CACHEDIR.TAG` 标记的目录（Cargo 的 `target/`）、`.next/cache`、`node_modules/.cache`、`.angular/cache`、`.parcel-cache` 等。binwitness 不读取的生态的依赖文件（`requirements.txt`、`pyproject.toml`、`go.mod`、`Cargo.toml`、`Gemfile`、`composer.json` 等）会在警告和 `not_covered` 中点名，免得把不含这些依赖的结果当成没有问题。
 
 同一个文件有时以多个坐标发布：项目改过 groupId（`com.oracle.ojdbc` 与 `com.oracle.database.jdbc`）、别人重新发布的副本、某个 jar 没有变化的新版本。组件名优先取 jar 自带 `pom.properties` 中的坐标（如果在其中），否则取与文件名相符的那个。内容同时对上同一版本几个副本的 jar，取打包差异最少的那个命名：是原件，而不是 `org.lucee` 重新发布的 `commons-collections`。其余坐标随文件列出（`also_published_as`），登记在其中任何一个坐标下的漏洞公告都计入该组件，并注明公告针对的是哪个坐标。
 
@@ -125,6 +125,7 @@ binwitness scan INPUT... -o OUTDIR [options]
 | `upgrade` | 同一主版本线上有更晚的版本不在该包任何公告的影响范围内 |
 | `upgrade-across-major` | 只有更晚的主版本线能离开更多公告；不评估兼容性 |
 | `partial` | 这条线上最好的版本仍在部分公告范围内，其他版本线也不比它好 |
+| `relocated` | 构件已迁到新坐标（其 POM 写明），新坐标下有版本比旧坐标的任何版本都能离开更多公告：`target_package` 给出新坐标，`same_coordinates` 保留针对旧坐标的建议 |
 | `no-published-fix` | 这个坐标没有任何已发布版本能离开更多公告（log4j 1.x）：替换或移除 |
 | `remove-malicious` | 恶意包：移除，它的任何版本都不算升级 |
 | `unverified` | 读不到版本列表或公告；列出公告自己写的修复版本，未经核实 |
@@ -135,8 +136,9 @@ binwitness scan INPUT... -o OUTDIR [options]
 - 每个候选都拿该包的全部公告来核对，包括不影响当前版本的那些，所以不会建议一个被更晚公告覆盖的版本。按严重度加权，剩余发现最少者胜出（一条严重压过任意条高危；没有评级的按中危计）；相同时取最低版本。
 - 版本线按版本号的第一个数字划分（`2.x`）；日历式版本（`20231013`）算一条线，npm 的每个 `0.y` 各算一条线。只有更晚的版本线更好时，结论是 `upgrade-across-major`，并同时给出当前线上最好的版本。
 - 公告写了、但从未发布的修复版本（某个分支已停止发版，或包改名后修复登记在旧名下）列入 `fix_versions_not_published`，从不作为建议。
-- 变体构建保留其变体：`-jre` 的 guava 建议 `33.0.0-jre`，不建议 `-android`。当前版本没有变体、而最佳目标带变体（`1.2.83_noneautotype`）时，注意事项会说明并列出其他选择。
-- 注意事项写明建议本身不知道的情况：打包在别的构件里的组件要随宿主一起换；被修改过的 jar 可能带有本地改动；声明出来的坐标未经核实；经同一文件的另一个坐标查到的发现，其修复版本单独列出；开发依赖可能并不随产品交付。
+- 变体构建保留其变体：`-jre` 的 guava 建议 `33.0.0-jre`，不建议 `-android`。当前版本没有变体、而最佳目标带变体（`1.2.83_noneautotype`）时，注意事项会说明并列出其他选择。几个变体效果相同时全部列出（`33.7.2-android or 33.7.2-jre`）。
+- 同一 group、同一版本的 Maven 构件（`spring-core`、`spring-web`、`spring-webmvc` 5.3.4）是一起发布、一起升级的，因此算作一个发布族，只给一个目标：所有成员都发布过的某个版本，按全体成员的公告来选。发布族列在 `upgrade_families` 中，每个成员在 `upgrade_family` 中写明所属的族，`per_member` 给出各成员单独升级时需要的版本。有成员停止发布时，注意事项会说明。
+- 注意事项写明建议本身不知道的情况：打包在别的构件里的组件要随宿主一起换；被修改过的 jar 可能带有本地改动；声明出来的坐标未经核实；经同一文件的另一个坐标查到的发现，其修复版本单独列出；开发依赖可能并不随产品交付；目标版本的许可证比当前版本更严、或是 binwitness 不认识的许可证时，两边的许可证都会写明（`license-changes`，例如 Elasticsearch 7.11 从 Apache-2.0 改成了 Elastic-2.0 或 SSPL-1.0）。两边都以包仓库登记的为准，查许可证时才核对。
 
 版本列表来自 Maven Central 上的 `maven-metadata.xml`（指定 `--maven-mirror` 时经由镜像）和 `--maven-repo` 仓库，以及 npm registry。装了本地哈希索引时，`auto` 模式下只要索引里包含公告提到的全部修复版本，就用索引，建议中会注明列表截至索引的日期。`local` 模式下索引是唯一的列表，所以索引中没有的修复版本会让结论成为 `unverified`，而不是 `no-published-fix`；npm 的升级建议需要 registry 或缓存中的回答。
 
@@ -264,7 +266,7 @@ Claude Desktop、Cursor 等用 `mcpServers` JSON 文件配置的客户端填同�
 
 binwitness 会向公共服务发送以下内容：
 
-- jar 的 SHA-1 哈希、JavaScript 文件的 SHA-256 哈希
+- jar 的 SHA-1 哈希；可能是拷入的库的 JavaScript 文件的 SHA-256 哈希（项目自己的普通源码和构建配置不查询）
 - 组件坐标和版本
 - CVE 编号
 - 计算升级建议时，有漏洞的包的名称：发给 OSV 以取其全部公告，发给 Maven Central、`--maven-repo` 仓库或 npm registry 以取其已发布版本
@@ -278,8 +280,8 @@ binwitness 会向公共服务发送以下内容：
 | [Maven Central](https://central.sonatype.com) | 哈希搜索兜底；发布的校验和；POM 中的许可证；`--class-search`；升级建议的版本列表；`crosscheck` 查 groupId 下的模块 |
 | 用 `--maven-repo` 指定的仓库 | 中央仓没有的版本的校验和、jar 目录、POM 许可证和版本列表 |
 | [OSV.dev](https://osv.dev) | 漏洞（GitHub 安全公告及其他来源）；升级建议所需的有漏洞的包的全部公告 |
-| [npm registry](https://www.npmjs.com) | 升级建议所需的有漏洞的 npm 包的已发布版本 |
-| [jsDelivr](https://www.jsdelivr.com) | JavaScript 文件哈希 |
+| [npm registry](https://www.npmjs.com) | 升级建议所需的有漏洞的 npm 包的已发布版本；JavaScript 文件匹配到的包的已发布版本 |
+| [jsDelivr](https://www.jsdelivr.com) | JavaScript 文件哈希；匹配版本前后相邻版本的文件列表 |
 | [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) | 已知被利用标记 |
 | [OSV 数据存储桶](https://google.github.io/osv.dev/data/) | OSV 数据集的 `db sync` |
 | [ghcr.io](https://github.com/aquasecurity/trivy-java-db) | Maven Central 哈希索引的 `db sync` |
@@ -294,8 +296,8 @@ binwitness 会向公共服务发送以下内容：
 - **漏洞覆盖范围就是 OSV 的覆盖范围**。没有指明包的公告（GitHub "unreviewed"、只有 CPE 的 NVD 记录）无法匹配到组件。不查询厂商私有漏洞库和各国的国家漏洞库。漏洞数应视为下限。拿 `crosscheck` 去核对商业工具的输出，是了解这类数据库能补充多少的实用办法。
 - **识别需要已发布的构件或声明**。私有构建、分叉版本，以及不带 `pom.properties` 的改包名副本会保持未识别，除非同一交付物里还有一份已识别的副本（或者 `--class-search` 找到了它）。只在其他仓库发布的版本（里程碑版、厂商自己的构建）要用 `--maven-repo` 才认得出。每个未识别的 jar 都写明原因，并给出 manifest 或文件名提示的身份（`hint`，未经核实）。shade 时没带上 `pom.properties` 的类认不出；binwitness 不做字节码或源码指纹。内容比对比较的是 CRC-32，能发现重新构建和一般修改，防不了蓄意伪造的碰撞。只含 manifest、许可证和 notice 的 jar（Spring Boot starter）在不同构件之间看起来都一样，从不按内容匹配，报告为不含代码。分类器 jar（`-linux-x86_64`）只与主构件比较。
 - **升级建议只针对公告，不涉及兼容性**。它说明哪个已发布版本不在 OSV 中该包公告的影响范围内。应用换上它能否构建和运行、版本是否由 BOM、父 POM 或其他包决定、受影响的代码是否可达，都不做评估。读取版本列表之后才发布的版本不在考虑之内。
-- **前端打包产物是不透明的**。webpack 或 rollup 合并进 chunk 的代码无法按哈希匹配。请把锁文件，或构建时用的 `node_modules`，随打包产物一起交付。文件头注释只能覆盖一部分。
-- **生态：Java（Maven）和 JavaScript（npm）**。操作系统软件包、Python、Go、.NET 和原生库不在范围内；镜像的操作系统层请用 Trivy 或 Syft。JDK/JRE 运行时 jar 会跳过。
+- **前端打包产物是不透明的**。webpack 或 rollup 合并进 chunk 的代码无法按哈希匹配。请把锁文件，或构建时用的 `node_modules`，随打包产物一起交付。文件头注释只能覆盖一部分。认出的打包产物单独计数（`bundled_scripts`），不当作未知的库。
+- **生态：Java（Maven）和 JavaScript（npm）**。操作系统软件包、Python、Go、.NET 和原生库不在范围内；镜像的操作系统层请用 Trivy 或 Syft。这些生态的依赖文件会在警告中点名。JDK/JRE 运行时 jar 会跳过。
 - **非常规许可证需要人工判断**。非标准许可证和自相矛盾的声明归为 `unknown`。并列多个许可证而没有写成 SPDX 表达式的，按任选其一理解。
 - **扫描速度取决于网络**。冷缓存扫描几乎全部时间都在等待查询：含 190 个 jar 的 war 约需三分钟，上千个 jar 的交付物约需一刻钟。10 秒内建不起来的连接、卡住 30 秒的请求（包括域名解析）都会放弃并重试。`--class-search` 依赖的 Maven Central 搜索服务会把部分请求压上最长一分钟才回答，binwitness 对它最多同时发两个请求，8 秒没有回答就重发。用缓存重跑只需几秒，为一个交付物查过的常见库，扫下一个交付物时已在缓存中。
 - **在线服务可能宕机或限流**。查询失败会退避重试约一分钟，之后记为警告，扫描不会因此整体失败。此时结果标为 `INCOMPLETE`，`--fail-on` 以状态码 4 而不是 0 退出。

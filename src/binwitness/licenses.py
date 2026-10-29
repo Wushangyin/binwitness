@@ -34,7 +34,8 @@ PATTERNS = [
     ("BSL-1.0", r"boost software licen[cs]e|\bbsl-1\.0\b"),
     ("Python-2.0", r"python software foundation licen[cs]e|\bpython-2\.0\b|\bpsf\b"),
     ("BlueOak-1.0.0", r"blue ?oak"),
-    ("CC-BY", r"\bcc-by\b(?!-)|creative commons attribution(?!-)"),
+    # CC-BY-4.0, but not the NonCommercial or NoDerivatives variants (CC-BY-NC-4.0), which are not open licenses.
+    ("CC-BY", r"\bcc-by(?=-\d|\b(?!-))|creative commons attribution(?!-)"),
     ("WTFPL", r"\bwtfpl\b"),
     ("Mulan PSL", r"mulan"),
 ]

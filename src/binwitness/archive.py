@@ -34,6 +34,18 @@ ZIP_SUFFIXES = (".zip", ".war", ".ear", ".sar", ".esa", ".eba")
 TAR_SUFFIXES = (".tar", ".tgz", ".tar.gz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")
 LOCKFILES = {"package-lock.json", "npm-shrinkwrap.json", ".package-lock.json", "yarn.lock", "pnpm-lock.yaml"}
 SKIP_DIRS = {".git", ".svn", ".hg", "__MACOSX"}
+# Build tools' caches: never deployed, and nothing in them is a published file (.next/cache runs to gigabytes).
+# Directories tagged with CACHEDIR.TAG (Cargo's target/, pytest's cache) count as well.
+CACHEDIR_SIGNATURE = b"Signature: 8a477f597d28d172789f06886806bc55"
+CACHE_DIRS = ((".next", "cache"), (".nuxt", "cache"), (".angular", "cache"), ("node_modules", ".cache"),
+              ("node_modules", ".vite"), (".parcel-cache",), (".turbo",))
+# Manifests of ecosystems binwitness does not read: a delivery holding only these would otherwise look empty.
+FOREIGN_MANIFESTS = {"requirements.txt": "Python", "pyproject.toml": "Python", "setup.py": "Python",
+                     "pipfile": "Python", "pipfile.lock": "Python", "poetry.lock": "Python", "uv.lock": "Python",
+                     "go.mod": "Go", "cargo.toml": "Rust", "cargo.lock": "Rust", "gemfile": "Ruby",
+                     "gemfile.lock": "Ruby", "composer.json": "PHP", "composer.lock": "PHP",
+                     "packages.config": ".NET", "pubspec.yaml": "Dart", "package.swift": "Swift",
+                     "podfile": "CocoaPods", "mix.exs": "Elixir"}
 # Files with these extensions never hold anything this tool reads, so their content is not sniffed. Office
 # documents, wheels and browser extensions are zips too, but carry no Java or npm components.
 NOT_ARCHIVES = frozenset("""
@@ -105,6 +117,8 @@ class Walker:
     unpacker: str | None = None
     warnings: list[str] = field(default_factory=list)
     skipped_runtime_jars: int = 0
+    skipped_caches: list[str] = field(default_factory=list)
+    not_covered: dict[str, list[str]] = field(default_factory=dict)
 
     def walk(self, path: Path) -> Iterator[Item]:
         path = Path(path)
@@ -134,7 +148,15 @@ class Walker:
                     dirs[:] = []
                     continue
                 visited.add((status.st_dev, status.st_ino))
-            dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
+            kept = []
+            for name in sorted(dirs):
+                if name in SKIP_DIRS or self._pruned(f"{prefix}{relative}{name}"):
+                    continue
+                if _is_cache(f"{relative}{name}".split("/")) or _tagged_cache(here / name):
+                    self.skipped_caches.append(f"{prefix}{relative}{name}")
+                    continue
+                kept.append(name)
+            dirs[:] = kept
             images = self._image_list(lambda name: _read_small(here / name), lambda name: (here / name).is_file(),
                                       (prefix + relative).rstrip("/")) if _may_be_image(files) else None
             if images is not None:
@@ -149,6 +171,8 @@ class Walker:
             for name in sorted(files):
                 full = here / name
                 rel = relative + name
+                if any(fnmatch(prefix + rel, pattern) for pattern in self.exclude):
+                    continue
                 if full.is_symlink():
                     if not follow_links:
                         self.warnings.append(f"{prefix}{rel}: symbolic link inside an archive, not followed")
@@ -167,11 +191,16 @@ class Walker:
         # macOS archivers add __MACOSX/ and ._name AppleDouble entries: metadata, never content.
         if "__MACOSX/" in inner_name or posixpath.basename(inner_name).startswith("._"):
             return
+        if _is_cache(inner_name.split("/")[:-1]):
+            return
         kind = self._kind(inner_name, posixpath.basename(inner_name).lower(), homes)
         if kind is None:
             return
         if kind == "runtime-jar":
             self.skipped_runtime_jars += 1
+            return
+        if kind.startswith("foreign:"):
+            self.not_covered.setdefault(kind.split(":", 1)[1], []).append(location)
             return
         try:
             if kind in ("sniff", "rar"):
@@ -219,6 +248,10 @@ class Walker:
 
     def _kind(self, inner_name: str, lower: str, homes: tuple[str, ...] = ()) -> str | None:
         parts = inner_name.split("/")
+        foreign = FOREIGN_MANIFESTS.get(lower) or ("Python" if lower.startswith("requirements")
+                                                   and lower.endswith(".txt") else None)
+        if foreign and not {"node_modules", "site-packages", "vendor"} & set(parts[:-1]):
+            return f"foreign:{foreign}"
         if lower in LOCKFILES:
             return "lockfile" if _is_project_lockfile(parts) else None
         if lower == "package.json":
@@ -266,6 +299,11 @@ class Walker:
                                  f"{entry.size} bytes, skipped as a likely decompression bomb")
             return True
         return False
+
+    def _pruned(self, label: str) -> bool:
+        """A directory every file under which --exclude leaves out ("*/target/*", or "*/target" itself)."""
+        return any(fnmatch(label, pattern) or (pattern.endswith("*") and fnmatch(label + "/", pattern[:-1]))
+                   for pattern in self.exclude)
 
     def _zip(self, source: bytes | Path, location: str, depth: int, inside_jar: bool = False) -> Iterator[Item]:
         with zipfile.ZipFile(source if isinstance(source, Path) else io.BytesIO(source)) as archive:
@@ -549,6 +587,18 @@ def _open_layer_file(path: Path) -> tarfile.TarFile:
         if handle.read(4) == ZSTD_MAGIC:
             raise _Unsupported("zstd-compressed layers are not supported")
     return tarfile.open(path, mode="r:*")
+
+
+def _tagged_cache(directory: Path) -> bool:
+    try:
+        with open(directory / "CACHEDIR.TAG", "rb") as handle:
+            return handle.read(len(CACHEDIR_SIGNATURE)) == CACHEDIR_SIGNATURE
+    except OSError:
+        return False
+
+
+def _is_cache(parts: list[str]) -> bool:
+    return any(tuple(parts[i:i + len(pair)]) == pair for pair in CACHE_DIRS for i in range(len(parts)))
 
 
 def _blob_path(descriptor) -> str | None:

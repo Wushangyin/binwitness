@@ -774,7 +774,7 @@ def test_upgrade_advice_names_the_nearest_release_outside_the_advisories(tmp_pat
     assert codec["fix_versions_not_published"] == [{"id": "CVE-2023-0002", "fixed": "9.9"}]
     assert [c["code"] for c in codec["caveats"]] == ["embedded-in-host"]
     assert result["summary"]["upgrades"] == {"by_verdict": {"upgrade": 1, "no-published-fix": 1},
-                                             "fix_versions_not_published": 1}
+                                             "fix_versions_not_published": 1, "families": 0}
     assert "upgrade_versions_not_checked" not in result["summary"]["incomplete"]
     summary = render_summary(result)
     assert "CVE-2023-0001        org.example:lib 1.0, upgrade to 1.1 KEV" in summary
@@ -783,7 +783,7 @@ def test_upgrade_advice_names_the_nearest_release_outside_the_advisories(tmp_pat
     out = tmp_path / "out"
     write_all(result, out)
     rows = {r.split(",")[1]: r for r in (out / "components.csv").read_text("utf-8-sig").splitlines()}
-    assert rows["name"].endswith(",upgrade") and rows["org.example:lib"].endswith(",upgrade 1.1")
+    assert rows["name"].endswith(",upgrade,upgrade family") and rows["org.example:lib"].endswith(",upgrade 1.1,")
     assert {"name": "binwitness:upgrade", "value": "upgrade 1.1"} in next(
         c for c in cyclonedx(result)["components"] if c["name"] == "lib")["properties"]
 
@@ -795,3 +795,11 @@ def test_without_upgrade_advice_no_version_list_or_package_query_is_fetched(tmp_
     assert not any("upgrade" in c for c in result["components"])
     assert result["options"]["upgrades"] is False and result["summary"]["upgrades"]["by_verdict"] == {}
     assert "fixed in 1.1 KEV" in render_summary(result) and "upgrades " not in render_summary(result)
+
+
+def test_the_summary_counts_the_findings_it_does_not_list(tmp_path, delivery):
+    result, _ = run(tmp_path, delivery, ScriptedTransport(routes()))
+    lines = render_summary(result).splitlines()
+    at = lines.index("vulns        2 distinct: critical 1, medium 1, known exploited 1")
+    assert lines[at + 1].startswith("  critical CVE-2023-0001        org.example:lib 1.0, upgrade to 1.1")
+    assert lines[at + 2] == "  ... medium 1 not listed here (vulnerabilities.csv)"

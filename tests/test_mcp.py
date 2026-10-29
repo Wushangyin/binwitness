@@ -62,7 +62,9 @@ def test_without_a_root_only_opening_a_result_works(tmp_path, result_dir):
     overview = served.open_result(str(result_dir))
     assert next(iter(overview)) == "coverage"
     coverage = overview["coverage"]
-    assert coverage["not_identified"] == {"unidentified_jars": 1, "unmatched_scripts": 0, "first_party_jars": 1}
+    assert coverage["not_identified"] == {"unidentified_jars": 1, "unmatched_scripts": 0, "bundled_scripts": 0,
+                                          "scripts_without_version": 0, "first_party_jars": 1}
+    assert coverage["not_covered"] == {}
     assert coverage["lookups_complete"] and coverage["statement"] == STATEMENT
     assert coverage["result"] == str((result_dir / "binwitness.json").resolve())
     assert overview["worst_findings"][0]["id"] == "CVE-2023-0001"
@@ -328,3 +330,53 @@ def test_over_stdio_a_scan_runs_to_its_overview(tmp_path):
     assert not overview["coverage"]["lookups_complete"]
     summary = (tmp_path / "results" / started["scan_id"] / "summary.txt").read_text("utf-8")
     assert summary.startswith("components")
+
+
+def named_components(*specs):
+    out = []
+    for ecosystem, name, version in specs:
+        path = name.replace(":", "/") if ecosystem == "maven" else name.replace("@", "%40")
+        out.append({"purl": f"pkg:{ecosystem}/{path}@{version}", "ecosystem": ecosystem, "name": name,
+                    "version": version})
+    return {"components": out}
+
+
+def test_an_exact_name_wins_over_a_part_of_one():
+    found = named_components(("maven", "org.springframework:spring-web", "5.3.4"),
+                             ("maven", "org.springframework:spring-webmvc", "5.3.4"),
+                             ("maven", "org.springframework:spring-websocket", "5.3.4"),
+                             ("npm", "@babel/core", "7.0.0"))
+    assert Service._find(found, "spring-web")["name"] == "org.springframework:spring-web"
+    assert Service._find(found, "org.springframework:spring-web")["version"] == "5.3.4"
+    assert Service._find(found, "@babel/core")["version"] == "7.0.0"
+    assert Service._find(found, "@babel/core@7.0.0")["name"] == "@babel/core"
+    assert Service._find(found, "webmvc")["name"] == "org.springframework:spring-webmvc"
+    two = named_components(("maven", "org.springframework:spring-web", "5.3.4"),
+                           ("maven", "org.springframework:spring-web", "5.3.20"))
+    assert Service._find(two, "spring-web@5.3.20")["version"] == "5.3.20"
+    with pytest.raises(Refused, match="matches 2 components.*give the version"):
+        Service._find(two, "spring-web")
+
+
+def test_a_release_family_is_one_step_with_what_each_member_would_need_alone(tmp_path, result_dir):
+    result = json.loads((result_dir / "binwitness.json").read_text())
+    lib = next(c for c in result["components"] if c["name"] == "org.example:lib")
+    lib["upgrade_family"] = "org.example@1.0"
+    result["upgrade_families"] = [{
+        "family": "org.example@1.0", "group": "org.example", "version": "1.0",
+        "members": [lib["purl"], "pkg:maven/org.example/other@1.0"], "verdict": "upgrade", "target": "1.2",
+        "clears": ["CVE-2023-0001"], "remaining": [], "introduced": [], "caveats": [],
+        "per_member": [{"component": lib["purl"], "own_target": "1.1", "remaining": [], "introduced": []},
+                       {"component": "pkg:maven/org.example/other@1.0", "own_target": None, "remaining": [],
+                        "introduced": []}]}]
+    (result_dir / "binwitness.json").write_text(json.dumps(result))
+    served = service(tmp_path)
+    scan_id = served.open_result(str(result_dir))["scan_id"]
+    plan = served.upgrade_plan(scan_id)
+    first = plan["plan"][0]
+    assert (first["family"], first["target"], first["clears"]) == ("org.example@1.0", "1.2", ["CVE-2023-0001"])
+    assert not any(step.get("component") == lib["purl"] for step in plan["plan"])
+    assert PLAN_NOTES["family"] in plan["notes"]
+    shown = served.get_component(scan_id, "org.example:lib@1.0")["component"]
+    assert shown["upgrade_family"]["target"] == "1.2" and shown["upgrade"]["target"] == "1.1"
+    assert shown["findings"][0]["advice"] == "upgrade to 1.2 with the other 1 org.example artifact"

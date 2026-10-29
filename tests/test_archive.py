@@ -239,3 +239,52 @@ def test_zstd_compressed_archives_are_named_not_silently_dropped(tmp_path):
     assert sorted(walker.warnings) == [
         "bundle.zip!/blob.tar.zst: cannot open (_Unsupported: zstd compression is not supported)",
         "bundle.zip!/layer.tar: cannot open (_Unsupported: zstd compression is not supported)"]
+
+
+def test_build_caches_are_skipped_and_named(tmp_path):
+    project = tmp_path / "web"
+    files = {".next/cache/webpack/a.js": "x" * 2048, "node_modules/.cache/b/c.js": "x" * 2048,
+             "rust/target/debug/build/out.js": "x" * 2048, "rust/target/CACHEDIR.TAG": "Signature: "
+             "8a477f597d28d172789f06886806bc55\n", "other/CACHEDIR.TAG": "not a signature",
+             "other/app.js": "x" * 2048, ".next/static/chunk.js": "x" * 2048}
+    for name, content in files.items():
+        (project / name).parent.mkdir(parents=True, exist_ok=True)
+        (project / name).write_text(content)
+    bundle = make_zip({"site/.next/cache/d.js": "x" * 2048, "site/e.js": "x" * 2048})
+    (project / "site.zip").write_bytes(bundle)
+    walker = Walker()
+    items = sorted(i.location for i in walker.walk(project))
+    assert items == ["web/.next/static/chunk.js", "web/other/app.js", "web/site.zip!/site/e.js"]
+    assert walker.skipped_caches == ["web/.next/cache", "web/node_modules/.cache", "web/rust/target"]
+
+
+def test_an_excluded_directory_is_not_walked(tmp_path, monkeypatch):
+    project = tmp_path / "app"
+    (project / "target" / "debug").mkdir(parents=True)
+    (project / "target" / "debug" / "dangling").symlink_to(tmp_path / "nowhere")
+    (project / "kept").mkdir()
+    (project / "kept" / "dangling").symlink_to(tmp_path / "nowhere")
+    walker = Walker(exclude=("*/target/*",))
+    walked = []
+    original = archive.os.walk
+
+    def recording(*args, **kwargs):
+        for current, dirs, files in original(*args, **kwargs):
+            walked.append(current)
+            yield current, dirs, files
+    monkeypatch.setattr(archive.os, "walk", recording)
+    assert list(walker.walk(project)) == []
+    assert walked and not any("target" in current for current in walked)
+    assert walker.warnings == ["app/kept/dangling: broken symbolic link, skipped"]
+
+
+def test_manifests_of_other_ecosystems_are_noted_outside_their_installed_packages(tmp_path):
+    project = tmp_path / "mixed"
+    for name in ("requirements-dev.txt", "svc/go.mod", "rs/Cargo.toml", "venv/lib/site-packages/x/setup.py",
+                 "php/vendor/a/composer.json", "Gemfile"):
+        (project / name).parent.mkdir(parents=True, exist_ok=True)
+        (project / name).write_text("x")
+    walker = Walker()
+    assert list(walker.walk(project)) == []
+    assert walker.not_covered == {"Python": ["mixed/requirements-dev.txt"], "Go": ["mixed/svc/go.mod"],
+                                  "Rust": ["mixed/rs/Cargo.toml"], "Ruby": ["mixed/Gemfile"]}

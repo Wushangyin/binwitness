@@ -489,27 +489,51 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None) -> d
 
     # Scripts inside an identified third-party jar (webjars, swagger-ui) belong to that jar.
     script_list = [s for s in scripts.values() if not inside_third_party(s["locations"])]
-    unmatched_scripts = []
-    scripts_not_looked_up = 0
+    looked_up, project_scripts = [], []
+    for entry in script_list:
+        (looked_up if staticjs.worth_looking_up(entry["locations"], entry["head"]) else project_scripts).append(entry)
+    script_list = looked_up
+    declared_npm: dict[str, set] = {}
+    for package, _ in npm_sightings:
+        declared_npm.setdefault(package.name, set()).add(package.version)
+    unmatched_scripts, bundled_scripts, unpinned_scripts = [], [], []
+    scripts_not_looked_up = matched_scripts = 0
     if script_list:
         def identify_script(entry):
             try:
-                return staticjs.identify(net, entry["digest"], entry["head"])
+                return staticjs.identify(net, entry["digest"], entry["head"], declared_npm)
             except NetError as error:
                 return {"error": str(error)}
         found = map_parallel(identify_script, script_list, options.workers)
         for entry, hit in zip(script_list, found):
-            if not hit or "error" in hit:
+            if hit and "error" in hit:
                 unmatched_scripts += entry["locations"]
-                if hit:
-                    warnings.append(f"script lookup failed: {hit['error']}")
-                    scripts_not_looked_up += 1
-                continue
-            for location in entry["locations"]:
-                components.add("npm", hit["name"], hit["version"], method=hit["method"],
-                               confidence=hit["confidence"], location=location, scope="runtime")
-        log(f"scripts matched to npm releases: {sum(1 for h in found if h and 'error' not in h)} "
-            f"of {len(script_list)}")
+                warnings.append(f"script lookup failed: {hit['error']}")
+                scripts_not_looked_up += 1
+            elif not hit:
+                (bundled_scripts if staticjs.is_bundle(entry["locations"], entry["head"])
+                 else unmatched_scripts).extend(entry["locations"])
+            elif hit.get("version") is None and not hit.get("versions"):
+                unpinned_scripts.append({"package": hit["name"], "file": hit["file"],
+                                         "same_file_in": hit["same_file_in"], "reason": hit["reason"],
+                                         "locations": sorted(entry["locations"])})
+            else:
+                matched_scripts += len(entry["locations"])
+                for version in hit.get("versions") or [hit["version"]]:
+                    for location in entry["locations"]:
+                        components.add("npm", hit["name"], version, method=hit["method"],
+                                       confidence=hit["confidence"], location=location, scope="runtime")
+        log(f"scripts matched to npm releases: {sum(1 for h in found if h and (h.get('version') or h.get('versions')))}"
+            f" of {len(script_list)} looked up; {len(project_scripts)} project files not looked up")
+    if walker.skipped_caches:
+        log(f"skipped {len(walker.skipped_caches)} build cache director"
+            f"{'y' if len(walker.skipped_caches) == 1 else 'ies'}: {', '.join(walker.skipped_caches[:3])}"
+            + (f" and {len(walker.skipped_caches) - 3} more" if len(walker.skipped_caches) > 3 else ""))
+    for ecosystem, found_at in sorted(walker.not_covered.items()):
+        warnings.append(f"{ecosystem} dependency files found ({', '.join(found_at[:3])}"
+                        + (f" and {len(found_at) - 3} more" if len(found_at) > 3 else "")
+                        + f"): binwitness reads Java archives and npm packages only, so {ecosystem} dependencies "
+                          "are not in this result")
 
     items = list(components.items.values())
     for item in items:
@@ -525,9 +549,17 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None) -> d
         vulnerabilities, kev_dates, kev_available = _attach_vulnerabilities(net, db, items, also_published,
                                                                             options.workers, warnings, log)
     upgrades_not_checked = 0
+    families: list[dict] = []
     if options.vulnerabilities and options.upgrades:
         upgrades_not_checked = upgrades.attach(net, db, items, vulnerabilities, options.maven_repos, options.workers,
-                                               warnings, log)
+                                               warnings, log, families)
+        if options.licenses:
+            def target_license(ecosystem, name, version):
+                try:
+                    return _declared_license(net, ecosystem, name, version, repositories=options.maven_repos)
+                except NetError:
+                    return None
+            upgrades.note_license_changes(items, families, target_license, options.workers)
     if not (jars or npm_sightings or scripts):
         warnings.append("nothing to identify: the inputs hold no jar, npm lockfile, node_modules package or "
                         "JavaScript file that binwitness reads")
@@ -557,13 +589,26 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None) -> d
         "first_party": sorted(first_party, key=lambda x: x["filename"]),
         "unidentified": sorted(unidentified, key=lambda x: x["filename"]),
         "unmatched_scripts": sorted(set(unmatched_scripts)),
+        "bundled_scripts": sorted(set(bundled_scripts)),
+        "scripts_without_version": sorted(unpinned_scripts, key=lambda x: (x["package"], x["locations"])),
+        "project_scripts": sorted(location for entry in project_scripts for location in entry["locations"]),
+        "not_covered": {ecosystem: sorted(found_at) for ecosystem, found_at in sorted(walker.not_covered.items())},
+        "skipped_build_caches": walker.skipped_caches,
         "vulnerabilities": dict(sorted(vulnerabilities.items())),
+        "upgrade_families": families,
         "warnings": warnings + ([f"offline: {net.offline_misses} lookups were not in the cache ("
                                  + ", ".join(f"{host} {n}" for host, n in net.offline_missed_hosts.most_common())
                                  + ")"] if net.offline_misses else []) + (db.stale() if db else []),
     }
     result["summary"] = summarize(result, len(jars), walker.skipped_runtime_jars, kev_dates,
                                   resources_of_third_party)
+    result["summary"]["scripts"] = {
+        "matched": matched_scripts,
+        "version_not_determined": sum(len(x["locations"]) for x in unpinned_scripts),
+        "bundles": len(result["bundled_scripts"]),
+        "unmatched": len(result["unmatched_scripts"]),
+        "project_files_not_looked_up": len(result["project_scripts"]),
+    }
     incomplete = {
         "jars_not_looked_up": sum(1 for u in result["unidentified"]
                                   if u["reason"] == OFFLINE_UNKNOWN or u["reason"].startswith("registry lookup failed")),
@@ -610,19 +655,10 @@ def _attach_licenses(net, items, jar_hints, workers, warnings, repositories=()) 
     def resolve(item):
         declared = item["declared_license"]
         try:
-            if declared and declared.get("names"):
+            if declared and (declared.get("names") or declared.get("expressions")):
                 return declared
-            if declared and declared.get("expressions"):
-                return declared
-            if item["ecosystem"] == "maven":
-                group, artifact = item["name"].split(":", 1)
-                return maven.licenses_for(net, (group, artifact, item["version"]), jar_hints.get(item["purl"]),
-                                          repositories)
-            quote = urllib.parse.quote
-            found = net.get_json(f"{DEPS_DEV}/systems/npm/packages/{quote(item['name'], safe='')}/versions/"
-                                 f"{quote(item['version'], safe='')}", stable=True) or {}
-            expressions = [e for e in found.get("licenses", []) if e and e.lower() != "non-standard"]
-            return {"expressions": expressions, "source": "deps.dev"} if expressions else None
+            return _declared_license(net, item["ecosystem"], item["name"], item["version"],
+                                     jar_hints.get(item["purl"]), repositories)
         except OfflineMiss:
             unresolved.append(item["purl"])
             return None
@@ -638,17 +674,31 @@ def _attach_licenses(net, items, jar_hints, workers, warnings, repositories=()) 
         warnings.append(f"license unknown for {len(unresolved)} component{'' if len(unresolved) == 1 else 's'}: "
                         "the registry's answer is not in the cache, and this scan does not go online")
     for item, found in zip(items, found_all):
-        if not found:
-            item["license"] = {"family": UNKNOWN, "source": None}
-            continue
-        if found.get("expressions"):
-            families = [expression_family(e) for e in found["expressions"]]
-            known = [FAMILIES.index(f) for f in families if f != UNKNOWN]
-            found["family"] = FAMILIES[max(known)] if known else UNKNOWN
-        else:
-            found["family"] = family(found["names"])
-        item["license"] = found
+        item["license"] = _classified(found) if found else {"family": UNKNOWN, "source": None}
     return len(unresolved) + len(failed)
+
+
+def _declared_license(net, ecosystem, name, version, hint=None, repositories=()) -> dict | None:
+    """The registry's license declaration of a published version, with its family."""
+    if ecosystem == "maven":
+        group, artifact = name.split(":", 1)
+        found = maven.licenses_for(net, (group, artifact, version), hint, repositories)
+    else:
+        quote = urllib.parse.quote
+        answer = net.get_json(f"{DEPS_DEV}/systems/npm/packages/{quote(name, safe='')}/versions/"
+                              f"{quote(version, safe='')}", stable=True) or {}
+        expressions = [e for e in answer.get("licenses", []) if e and e.lower() != "non-standard"]
+        found = {"expressions": expressions, "source": "deps.dev"} if expressions else None
+    return _classified(found) if found else None
+
+
+def _classified(found: dict) -> dict:
+    if found.get("expressions"):
+        known = [FAMILIES.index(f) for f in map(expression_family, found["expressions"]) if f != UNKNOWN]
+        found["family"] = FAMILIES[max(known)] if known else UNKNOWN
+    else:
+        found["family"] = family(found["names"])
+    return found
 
 
 def _attach_vulnerabilities(net, db, items, also_published, workers, warnings, log):
@@ -744,6 +794,7 @@ def summarize(result: dict, distinct_jars: int, skipped_runtime: int, kev_dates:
                            if (n := sum(1 for c in items if (c.get("upgrade") or {}).get("verdict") == v))},
             "fix_versions_not_published": sum(len((c.get("upgrade") or {}).get("fix_versions_not_published") or [])
                                               for c in items),
+            "families": len(result.get("upgrade_families") or []),
         },
         "kev_catalog_entries": len(kev_dates),
     }

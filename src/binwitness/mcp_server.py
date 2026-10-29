@@ -24,7 +24,7 @@ from binwitness.crosscheck import CLASSES, crosscheck, load_other
 from binwitness.localdb import LocalDb
 from binwitness.maven import CENTRAL
 from binwitness.net import Net, NetError, default_cache_dir
-from binwitness.output import INCOMPLETE, finding_advice, upgrade_text, worst_findings
+from binwitness.output import INCOMPLETE, families_of, finding_advice, upgrade_text, worst_findings
 from binwitness.vulns import SEVERITIES
 
 # In the order of what leaves the machine: nothing, what the local datasets lack, everything.
@@ -47,12 +47,17 @@ PLAN_NOTES = {
     "bom-managed": "A Maven dependency's version is often set by a BOM or parent POM (a framework's dependency "
                    "management): change it there, or override it in dependencyManagement, rather than in the module "
                    "that uses it.",
+    "family": "A release family is the artifacts of one group at one version (spring-core, spring-web and "
+              "spring-beans 5.3.4): they are released together, so the plan gives them one step and one target that "
+              "every member is published at, weighed by the advisories of all of them. per_member keeps what each "
+              "artifact would need alone.",
     "transitive-npm": "An npm package may be a dependency of a dependency: upgrade the package that requires it, "
                       "or pin it with overrides (npm) or resolutions (yarn).",
 }
 SENDS_SCAN = ("Network use follows the lookup level: local sends nothing; auto asks public services only what the "
               "local datasets (binwitness db sync) lack; online asks them everything. What is sent: SHA-1 hashes of "
-              "jars and SHA-256 hashes of JavaScript files (deps.dev, Maven Central, jsDelivr), component "
+              "jars and SHA-256 hashes of JavaScript files that may be copied libraries (deps.dev, Maven Central, "
+              "jsDelivr), component "
               "coordinates and versions (OSV, Maven Central, npm registry, license sources), and with class_search "
               "one class name per jar nothing else identified. File contents are never sent.")
 
@@ -227,6 +232,7 @@ class Service:
         path, result = self._result(scan_id)
         s = result["summary"]
         named = {c["purl"]: c for c in result["components"]}
+        families = families_of(result)
         worst = []
         for entry in worst_findings(result)[:10]:
             ref, affected = next(iter(entry["affects"].items()))
@@ -234,7 +240,8 @@ class Service:
             worst.append({"id": entry["id"], "severity": entry["severity"], "summary": entry["summary"],
                           "known_exploited_since": entry["kev_date_added"], "malicious": entry["malicious"],
                           "component": ref, "other_components": len(entry["affects"]) - 1,
-                          "advice": finding_advice(component, entry["id"], affected).removeprefix(", ")
+                          "advice": finding_advice(component, entry["id"], affected,
+                                                   families.get(component.get("upgrade_family"))).removeprefix(", ")
                           if component else ""})
         options = result["options"]
         upgrades_block = dict(s.get("upgrades") or {})
@@ -295,7 +302,9 @@ class Service:
         path, result = self._result(scan_id)
         table = result["vulnerabilities"]
         component = self._find(result, purl)
-        out = {k: v for k, v in component.items() if k not in ("locations", "files", "vulnerabilities", "upgrade")}
+        family = families_of(result).get(component.get("upgrade_family"))
+        out = {k: v for k, v in component.items()
+               if k not in ("locations", "files", "vulnerabilities", "upgrade", "upgrade_family")}
         locations = component.get("locations") or []
         out["location_count"] = len(locations)
         if include_locations:
@@ -310,7 +319,7 @@ class Service:
                              "summary": entry["summary"], "known_exploited_since": entry["kev_date_added"],
                              "malicious": entry["malicious"], "fixed": affected["fixed"],
                              "via": affected.get("via"),
-                             "advice": finding_advice(component, key, affected).removeprefix(", ")})
+                             "advice": finding_advice(component, key, affected, family).removeprefix(", ")})
         out["findings"] = findings
         if not findings:
             out["findings_note"] = (
@@ -321,6 +330,8 @@ class Service:
         if component.get("upgrade"):
             out["upgrade"] = {**component["upgrade"],
                               "meaning": upgrades.VERDICT_TEXT[component["upgrade"]["verdict"]]}
+        if family:
+            out["upgrade_family"] = {**family, "meaning": PLAN_NOTES["family"]}
         return {"coverage": self._coverage(result, path), "component": out}
 
     def get_vulnerability(self, scan_id: str, vuln_id: str) -> dict:
@@ -334,8 +345,10 @@ class Service:
                           f"the ids found")
         entry = table[key]
         named = {c["purl"]: c for c in result["components"]}
+        families = families_of(result)
         affects = [{"component": ref, "fixed": x["fixed"], "via": x.get("via"),
-                    "advice": finding_advice(named[ref], key, x).removeprefix(", ") if ref in named else ""}
+                    "advice": finding_advice(named[ref], key, x, families.get(named[ref].get("upgrade_family")))
+                    .removeprefix(", ") if ref in named else ""}
                    for ref, x in entry["affects"].items()]
         packages = {(named[ref]["ecosystem"], named[ref]["name"]) for ref in entry["affects"] if ref in named}
         return {"coverage": self._coverage(result, path),
@@ -349,9 +362,28 @@ class Service:
             return {"coverage": self._coverage(result, path), "plan": [], "note": self._no_upgrades(result)}
         table, threshold = result["vulnerabilities"], _threshold(min_severity)
         steps, hosts, not_checked = [], {}, []
+        families = families_of(result)
+        for family in families.values():
+            ids = [*family["clears"], *family["remaining"]]
+            worst = min((table[k]["severity"] for k in ids if k in table), key=_rank, default=None)
+            if min_severity and _rank(worst) > threshold:
+                continue
+            if family["verdict"] == "unverified":
+                not_checked.append({"family": family["family"], "reason": family.get("reason")})
+                continue
+            step = {"action": self._action(family["verdict"]), "family": family["family"],
+                    "members": family["members"], "verdict": family["verdict"],
+                    "meaning": upgrades.VERDICT_TEXT[family["verdict"]], "target": family["target"],
+                    "clears": family["clears"], "remaining": family["remaining"],
+                    "introduced": family["introduced"], "worst_severity": worst,
+                    "known_exploited": any(table[k]["kev_date_added"] for k in ids if k in table),
+                    "caveats": [x["text"] for x in family["caveats"]], "per_member": family["per_member"]}
+            if family.get("same_line"):
+                step["same_line"] = family["same_line"]
+            steps.append(step)
         for c in sorted(result["components"], key=lambda c: c["purl"]):
             block = c.get("upgrade")
-            if not block:
+            if not block or c.get("upgrade_family") in families:
                 continue
             ids = [*block["clears"], *block["remaining"]]
             worst = min((table[k]["severity"] for k in ids if k in table), key=_rank, default=None)
@@ -367,7 +399,8 @@ class Service:
                     "introduced": block["introduced"], "worst_severity": worst,
                     "known_exploited": any(table[k]["kev_date_added"] for k in ids if k in table),
                     "caveats": [x["text"] for x in block["caveats"]]}
-            for extra in ("same_line", "alternatives", "osv_fixed", "fix_versions_not_published"):
+            for extra in ("same_line", "alternatives", "target_package", "same_coordinates", "osv_fixed",
+                          "fix_versions_not_published"):
                 if block.get(extra):
                     step[extra] = block[extra]
             if c["contained_in"] and not c["files"]:
@@ -385,12 +418,12 @@ class Service:
                           "meaning": upgrades.CAVEATS["embedded-in-host"].format(hosts=host)})
         order = {"remove": 0}
         steps.sort(key=lambda x: (order.get(x["action"], 1), not x["known_exploited"], _rank(x["worst_severity"]),
-                                  x.get("component") or x.get("host")))
+                                  x.get("component") or x.get("family") or x.get("host")))
         shown, paging = _page(steps, offset, limit)
         ecosystems = {c["ecosystem"] for c in result["components"] if c.get("upgrade")}
         notes = [PLAN_NOTES["compatibility"]] + [PLAN_NOTES[k] for k, e in (("bom-managed", "maven"),
                                                                              ("transitive-npm", "npm"))
-                                                 if e in ecosystems]
+                                                 if e in ecosystems] + ([PLAN_NOTES["family"]] if families else [])
         return {"coverage": self._coverage(result, path), **paging, "plan": shown, "notes": notes,
                 "not_checked": {"total": len(not_checked), "first": not_checked[:PAGE]},
                 "by_verdict": result["summary"].get("upgrades", {}).get("by_verdict", {})}
@@ -538,7 +571,11 @@ class Service:
                             for k, n in incomplete.items()},
             "not_identified": {"unidentified_jars": len(result["unidentified"]),
                                "unmatched_scripts": len(result["unmatched_scripts"]),
+                               "bundled_scripts": len(result.get("bundled_scripts") or []),
+                               "scripts_without_version": len(result.get("scripts_without_version") or []),
                                "first_party_jars": len(result["first_party"])},
+            # Ecosystems binwitness does not read, by the dependency files found: their dependencies are absent.
+            "not_covered": {k: len(v) for k, v in (result.get("not_covered") or {}).items()},
             "turned_off": off,
             "statement": STATEMENT,
             "lookup": options.get("lookup"),
@@ -571,24 +608,35 @@ class Service:
                 "known_exploited": any(table[k]["kev_date_added"] for k in c["vulnerabilities"]),
                 "vulnerabilities_checked": c.get("vulnerabilities_checked"),
                 "upgrade": upgrade_text(c["upgrade"]) if c.get("upgrade") else None,
+                "upgrade_family": c.get("upgrade_family"),
                 "published": sorted({f["published"] for f in c["files"]}),
                 "contained_in": len(c["contained_in"]),
                 "locations": len(c.get("locations") or [])}
 
     @staticmethod
     def _find(result: dict, wanted: str) -> dict:
+        """A purl, or a name with or without its version: group:artifact, the artifactId alone, an npm name
+        (@scope/name too). An exact name wins over a part of one; several exact matches are refused by name."""
         components = result["components"]
         exact = [c for c in components if c["purl"] == wanted]
         if exact:
             return exact[0]
-        name, _, version = wanted.removeprefix("pkg:").rpartition("@") if "@" in wanted else (wanted, "", "")
-        close = [c for c in components if wanted.lower() in c["purl"].lower()
-                 or (c["name"] == name and (not version or c["version"] == version))]
-        if len(close) == 1:
-            return close[0]
-        if close:
-            raise Refused(f"{wanted} matches {len(close)} components: "
-                          + ", ".join(c["purl"] for c in close[:10]) + "; give the full purl")
+        bare = wanted.removeprefix("pkg:")
+        at = bare.rfind("@")
+        name, version = (bare[:at], bare[at + 1:]) if at > 0 else (bare, "")
+
+        def of_version(found):
+            return [c for c in found if not version or c["version"] == version]
+
+        stages = (of_version([c for c in components if c["name"] == name]),
+                  of_version([c for c in components if c["ecosystem"] == "maven" and c["name"].split(":", 1)[1] == name]),
+                  [c for c in components if wanted.lower() in c["purl"].lower() or wanted.lower() in c["name"].lower()])
+        for found in stages:
+            if len(found) == 1:
+                return found[0]
+            if found:
+                raise Refused(f"{wanted} matches {len(found)} components: "
+                              + ", ".join(c["purl"] for c in found[:10]) + "; give the version or the full purl")
         raise Refused(f"no component {wanted} in this scan; list_components finds it by part of its name")
 
     def _local_db(self) -> LocalDb | None:
@@ -788,9 +836,10 @@ def build_server(service: Service):
 
     @server.tool(title="Upgrade plan", structured_output=True, annotations=reading,
                  description="What to change, worst first: remove malicious packages, upgrade to the nearest "
-                             "published version outside the advisories, replace what has no published fix, or "
-                             "change the host jar of bundled components. Each step lists what it clears, what "
-                             "remains and its caveats. Sends nothing.")
+                             "published version outside the advisories (one step and one target for the artifacts "
+                             "of a release family), move to the new coordinates of a relocated artifact, replace "
+                             "what has no published fix, or change the host jar of bundled components. Each step "
+                             "lists what it clears, what remains and its caveats. Sends nothing.")
     async def upgrade_plan(scan_id: ScanId, min_severity: Severity = None, offset: Offset = 0,
                            limit: Limit = PAGE) -> dict[str, Any]:
         return await call(service.upgrade_plan, scan_id, min_severity, offset, limit)

@@ -174,6 +174,15 @@ def test_license_versions_are_read_next_to_the_name(text, names):
     assert detect(text) == names
 
 
+@pytest.mark.parametrize("expression, expected", [
+    ("CC-BY-4.0", "permissive"), ("CC-BY-3.0", "permissive"), ("CC-BY-SA-4.0", "weak-copyleft"),
+    ("CC-BY-NC-4.0", "unknown"), ("CC-BY-ND-4.0", "unknown"), ("CC-BY-NC-SA-4.0", "unknown"),
+    ("MIT OR CC-BY-NC-4.0", "permissive"),
+])
+def test_creative_commons_attribution_is_permissive_but_not_its_restricted_variants(expression, expected):
+    assert expression_family(expression) == expected
+
+
 def test_a_name_and_its_versioned_form_at_one_place_give_the_versioned_one():
     assert detect("Apache License, Version 2.0", first_only=True) == ["Apache-2.0"]
 

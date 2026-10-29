@@ -276,3 +276,183 @@ def test_npm_versions_and_deprecations_come_from_the_abbreviated_document(tmp_pa
     assert found.versions == ["1.0.0", "1.0.1", "1.0.2"] and found.deprecated == {"1.0.1"}
     missing = published_versions(Net(cache_dir=tmp_path / "x", transport=ScriptedTransport({})), None, "npm", "nope")
     assert missing.versions is None and missing.error == "not in the npm registry"
+
+
+def test_variant_builds_that_do_equally_well_are_both_named_in_the_text():
+    from binwitness.output import upgrade_text
+    plain = case("guava", "20.0")
+    assert upgrade_text(plain).startswith("upgrade-across-major 33.7.2-android or 33.7.2-jre")
+    assert upgrade_text(case("guava", "31.1-jre")) == "upgrade-across-major 33.7.2-jre"
+
+
+def record(osv_id, name, events, severity="HIGH"):
+    return {"id": osv_id, "database_specific": {"severity": severity},
+            "affected": [{"package": {"ecosystem": "Maven", "name": name},
+                          "ranges": [{"type": "ECOSYSTEM", "events": events}]}]}
+
+
+class Store:
+    """Local datasets: OSV records and the hash index's versions per package."""
+
+    def __init__(self, records, versions):
+        self.records, self.versions = records, versions
+
+    def has(self, name):
+        return name in ("osv-maven", "maven-hashes")
+
+    def osv_records(self, ecosystem, name):
+        return [r for r in self.records if any(a["package"]["name"] == name for a in r["affected"])]
+
+    def maven_versions(self, group, artifact):
+        return self.versions.get(f"{group}:{artifact}", [])
+
+    def data_as_of(self, name):
+        return "2026-10-01T00:00:00Z"
+
+
+def item(name, version, findings=(), **extra):
+    group, artifact = name.split(":")
+    return {"purl": f"pkg:maven/{group}/{artifact}@{version}", "ecosystem": "maven", "name": name,
+            "version": version, "vulnerabilities": list(findings), "contained_in": [], "files": [{"published": "yes"}],
+            "confidence": "exact", "scope": "runtime"} | extra
+
+
+def table_for(items):
+    table = {}
+    for i in items:
+        for key in i["vulnerabilities"]:
+            table.setdefault(key, {"severity": "HIGH", "malicious": False, "affects": {}})["affects"][i["purl"]] = \
+                {"fixed": []}
+    return table
+
+
+FAMILY_RECORDS = [record("CVE-2026-0001", "org.example:core", [{"introduced": "0"}, {"fixed": "1.1"}]),
+                  record("CVE-2026-0002", "org.example:web", [{"introduced": "0"}, {"fixed": "1.3"}]),
+                  # Only the member without findings has this one, and only from 1.2 on.
+                  record("CVE-2026-0003", "org.example:jdbc", [{"introduced": "1.2"}, {"fixed": "1.4"}])]
+
+
+def family_scan(tmp_path, jdbc_versions):
+    versions = {"org.example:core": ["1.0", "1.1", "1.2", "1.3", "1.4", "1.5"],
+                "org.example:web": ["1.0", "1.1", "1.2", "1.3", "1.4", "1.5"], "org.example:jdbc": jdbc_versions}
+    items = [item("org.example:core", "1.0", ["CVE-2026-0001"]), item("org.example:web", "1.0", ["CVE-2026-0002"]),
+             item("org.example:jdbc", "1.0"), item("org.other:lib", "1.0")]
+    families = []
+    net = Net(cache_dir=tmp_path, offline=True, transport=ScriptedTransport({}))
+    upgrades.attach(net, Store(FAMILY_RECORDS, versions), items, table_for(items), families=families)
+    return {i["name"]: i for i in items}, families
+
+
+def test_artifacts_of_one_release_get_one_target_that_suits_them_all(tmp_path):
+    named, families = family_scan(tmp_path, ["1.0", "1.1", "1.2", "1.3", "1.4", "1.5"])
+    # Each alone: core 1.1, web 1.3; 1.3 puts jdbc inside an advisory of its own, so together it is 1.4.
+    assert (named["org.example:core"]["upgrade"]["target"], named["org.example:web"]["upgrade"]["target"]) == \
+        ("1.1", "1.3")
+    [family] = families
+    assert (family["family"], family["verdict"], family["target"]) == ("org.example@1.0", "upgrade", "1.4")
+    assert family["clears"] == ["CVE-2026-0001", "CVE-2026-0002"] and family["introduced"] == []
+    assert family["members"] == ["pkg:maven/org.example/core@1.0", "pkg:maven/org.example/jdbc@1.0",
+                                 "pkg:maven/org.example/web@1.0"]
+    assert {m["component"]: m["own_target"] for m in family["per_member"]}["pkg:maven/org.example/jdbc@1.0"] is None
+    assert all(named[n]["upgrade_family"] == "org.example@1.0" for n in ("org.example:core", "org.example:jdbc"))
+    assert "upgrade_family" not in named["org.other:lib"] and "upgrade" not in named["org.example:jdbc"]
+
+
+def test_a_member_that_stops_being_published_bounds_the_family(tmp_path):
+    _, [family] = family_scan(tmp_path, ["1.0", "1.1", "1.2", "1.3"])
+    assert (family["verdict"], family["target"], family["remaining"]) == ("partial", "1.1", ["CVE-2026-0002"])
+    ends = next(c for c in family["caveats"] if c["code"] == "family-ends")
+    assert ends["members"] == "pkg:maven/org.example/jdbc@1.0" and ends["latest"] == "1.5"
+
+
+def test_family_mutation_without_the_quiet_member_lands_inside_its_advisory(tmp_path, monkeypatch):
+    real = upgrades._families
+    monkeypatch.setattr(upgrades, "_families", lambda items, table: {
+        k: [m for m in v if m["vulnerabilities"]] for k, v in real(items, table).items()})
+    _, [family] = family_scan(tmp_path, ["1.0", "1.1", "1.2", "1.3", "1.4", "1.5"])
+    assert family["target"] == "1.3"
+
+
+def pom(relocated_to=None):
+    inner = f"<relocation><groupId>{relocated_to}</groupId></relocation>" if relocated_to else ""
+    return f"<project><distributionManagement>{inner}</distributionManagement></project>".encode()
+
+
+def relocation_scan(tmp_path, relocated_to):
+    records = [record("CVE-2026-0010", "org.example:connector", [{"introduced": "0"}, {"fixed": "1.1"}]),
+               # Never fixed under the old name: the fix came out after the move.
+               record("CVE-2026-0011", "org.example:connector", [{"introduced": "0"}]),
+               record("GHSA-new1-0011", "org.moved:connector", [{"introduced": "0"}, {"fixed": "1.3"}])]
+    records[2]["aliases"] = ["CVE-2026-0011"]
+    versions = {"org.example:connector": ["1.0", "1.1", "1.2"], "org.moved:connector": ["1.2", "1.3", "2.0"]}
+    transport = ScriptedTransport({"org/example/connector/1.2/connector-1.2.pom": pom(relocated_to)})
+    items = [item("org.example:connector", "1.0", ["CVE-2026-0010", "CVE-2026-0011"])]
+    upgrades.attach(Net(cache_dir=tmp_path, transport=transport), Store(records, versions), items, table_for(items))
+    return items[0]["upgrade"]
+
+
+def test_a_relocated_artifact_is_followed_to_its_new_coordinates(tmp_path):
+    from binwitness.output import finding_advice, upgrade_text
+    block = relocation_scan(tmp_path, "org.moved")
+    assert (block["verdict"], block["target_package"], block["target"]) == ("relocated", "org.moved:connector", "1.3")
+    assert block["clears"] == ["CVE-2026-0010", "CVE-2026-0011"] and block["remaining"] == []
+    assert block["same_coordinates"]["verdict"] == "partial" and block["same_coordinates"]["target"] == "1.1"
+    assert "relocated" in codes(block) and "org.example:connector 1.2" in block["caveats"][-1]["text"]
+    assert upgrade_text(block) == "relocated org.moved:connector 1.3"
+    assert finding_advice({"upgrade": block, "ecosystem": "maven", "version": "1.0"}, "CVE-2026-0011",
+                          {"fixed": []}) == ", move to org.moved:connector 1.3"
+
+
+def test_without_a_relocation_the_advice_stays_on_the_coordinates(tmp_path):
+    block = relocation_scan(tmp_path, None)
+    assert (block["verdict"], block["target"], block["remaining"]) == ("partial", "1.1", ["CVE-2026-0011"])
+
+
+def declared(family, *names):
+    return {"names": list(names), "family": family}
+
+
+MIT, LGPL = declared("permissive", "MIT"), declared("weak-copyleft", "LGPL-2.1")
+
+
+def test_a_target_under_a_more_restrictive_license_is_called_out():
+    licensed = {("maven", "org.example:connector", "1.0"): LGPL,
+                ("maven", "org.moved:connector", "2.0"): declared("strong-copyleft", "AGPL-3.0"),
+                ("maven", "org.example:same", "1.0"): MIT, ("maven", "org.example:same", "1.1"): MIT,
+                ("maven", "org.example:freer", "1.0"): LGPL, ("maven", "org.example:freer", "1.1"): MIT,
+                ("maven", "org.example:odd", "1.0"): MIT,
+                ("maven", "org.example:odd", "1.1"): {"expressions": ["LicenseRef-Proprietary"], "family": "unknown"},
+                # The target's license cannot be read, or the one in use is not classified: nothing to compare.
+                ("maven", "org.example:unread", "1.0"): MIT,
+                ("maven", "org.example:untold", "1.0"): declared("unknown", "Custom")}
+    moved = {"target": "2.0", "target_package": "org.moved:connector"}
+    # A license read from inside the jar is not compared: it may be a bundled library's.
+    items = [item("org.example:connector", "1.0", ["X"], license=declared("strong-copyleft", "GPL-3.0"),
+                  upgrade={**moved, "caveats": []}),
+             item("org.example:same", "1.0", ["X"], license=LGPL, upgrade={"target": "1.1", "caveats": []}),
+             item("org.example:freer", "1.0", ["X"], upgrade={"target": "1.1", "caveats": []}),
+             item("org.example:odd", "1.0", ["X"], upgrade={"target": "1.1", "caveats": []}),
+             item("org.example:unread", "1.0", ["X"], upgrade={"target": "1.1", "caveats": []}),
+             item("org.example:untold", "1.0", ["X"], upgrade={**moved, "caveats": []})]
+    upgrades.note_license_changes(items, [], lambda *key: licensed.get(key))
+    assert {i["name"]: codes(i["upgrade"]) for i in items} == {
+        "org.example:connector": ["license-changes"], "org.example:same": [], "org.example:freer": [],
+        "org.example:odd": ["license-changes"], "org.example:unread": [], "org.example:untold": []}
+    [change] = items[0]["upgrade"]["caveats"]
+    assert change["text"] == ("the target is licensed differently: org.moved:connector 2.0 AGPL-3.0 (strong-copyleft) "
+                              "against org.example:connector 1.0 LGPL-2.1 (weak-copyleft); read the new terms before "
+                              "upgrading")
+
+
+def test_a_release_family_names_the_members_whose_license_tightens():
+    members = [item("org.example:core", "1.0", ["X"]), item("org.example:web", "1.0"), item("org.example:cli", "1.0")]
+    family = {"family": "org.example@1.0", "members": [m["purl"] for m in members], "target": "2.0", "caveats": []}
+    tighter = declared("source-available", "BUSL-1.1")
+    licensed = {**{("maven", m["name"], "1.0"): MIT for m in members},
+                ("maven", "org.example:core", "2.0"): MIT, ("maven", "org.example:web", "2.0"): tighter,
+                ("maven", "org.example:cli", "2.0"): tighter}
+    upgrades.note_license_changes(members, [family], lambda *key: licensed.get(key))
+    [change] = family["caveats"]
+    assert [c["package"] for c in change["changes"]] == ["org.example:web", "org.example:cli"]
+    assert change["text"] == ("the target is licensed differently: org.example:web, org.example:cli 2.0 BUSL-1.1 "
+                              "(source-available) against 1.0 MIT (permissive); read the new terms before upgrading")
