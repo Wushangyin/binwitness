@@ -1,13 +1,16 @@
 """Version ordering for Maven and npm, enough to evaluate advisory ranges such as ``>= 2.0, < 2.9.10.1``."""
 from __future__ import annotations
 
+import functools
 import re
 
 _MAVEN_QUALIFIERS = {"alpha": 1, "a": 1, "beta": 2, "b": 2, "milestone": 3, "m": 3, "rc": 4, "cr": 4,
                      "snapshot": 5, "": 6, "ga": 6, "final": 6, "release": 6, "sp": 7}
 
 
-def maven_key(version: str):
+# Upgrade advice compares every published version of a package with every bound of its advisories.
+@functools.lru_cache(maxsize=1 << 16)
+def maven_key(version: str) -> tuple:
     """Approximation of Maven's ComparableVersion: numbers compare numerically, known qualifiers by rank,
     unknown qualifiers after releases (as Maven does) and lexically among themselves."""
     tokens = re.findall(r"\d+|[a-zA-Z]+", version.lower())
@@ -22,7 +25,7 @@ def maven_key(version: str):
     # Trailing zeros and release markers do not change the version: 1.0 == 1.0.0 == 1.0.Final.
     while key and key[-1] in ((2, 0, ""), (1, 6, "")):
         key.pop()
-    return key
+    return tuple(key)
 
 
 def _compare_maven(left: str, right: str) -> int:
@@ -44,6 +47,7 @@ def _compare_maven(left: str, right: str) -> int:
     return 0
 
 
+@functools.lru_cache(maxsize=1 << 16)
 def npm_key(version: str):
     match = re.match(r"^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?", version.strip())
     if not match:
@@ -77,3 +81,27 @@ def in_range(ecosystem: str, version: str, expression: str) -> bool | None:
         if not {"<": order < 0, "<=": order <= 0, ">": order > 0, ">=": order >= 0, "=": order == 0}[operator]:
             return False
     return True
+
+
+def prerelease(ecosystem: str, version: str) -> bool:
+    """alpha, beta, milestone, release candidate or snapshot; npm: any prerelease tag."""
+    if ecosystem.lower() == "npm":
+        key = npm_key(version)
+        if key is not None:
+            return key[3][0] == 0
+    return any(kind == 1 and 1 <= rank <= 5 for kind, rank, _ in maven_key(version))
+
+
+def variant(ecosystem: str, version: str) -> str | None:
+    """The suffix of a Maven version that names a build rather than a release stage: ``jre`` / ``android``
+    for Guava, ``noneautotype`` for fastjson 1.2.83_noneautotype. Variants are parallel builds of one
+    release, so 32.0.0-android is no upgrade for a 31.1-jre."""
+    match = re.search(r"[-_]([A-Za-z]+)$", version)
+    if ecosystem.lower() == "npm" or not match:
+        return None
+    suffix = match.group(1).lower()
+    return None if suffix in _MAVEN_QUALIFIERS else suffix
+
+
+def without_variant(version: str) -> str:
+    return re.sub(r"[-_][A-Za-z]+$", "", version)

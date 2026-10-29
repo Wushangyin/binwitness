@@ -4,28 +4,32 @@
 
 Software composition analysis for **what was actually delivered**: jars, wars, `docker save` images, zip
 bundles and front-end builds, nested to any depth. Every component in the result carries the evidence it
-was identified by, so each line of a report can be defended. binwitness also checks another scanner's
-findings against public advisory data and classifies each disagreement.
+was identified by, so each line of a report can be defended. For each vulnerable component it names the
+nearest published release outside the package's advisories. binwitness also checks another scanner's
+findings against public advisory data and classifies each disagreement, and an [MCP server](#mcp-server)
+lets an AI assistant run scans and read their results.
 
 ```
 $ binwitness scan release.zip -o out
 walked 1 input(s): 5 distinct jars, 0 npm package entries, 0 distinct scripts
 identified jars: 5 of 5
 vulnerabilities: 133 distinct across 22 components
+upgrade advice: upgrade 22
 components   34  (maven 34; exact 5, declared 29)
 jars         5 distinct: third-party 5
 vulns        133 distinct: critical 12, high 73, medium 46, low 2, known exploited 2
-  critical CVE-2021-44228       org.apache.logging.log4j:log4j-core 2.14.1, fixed in 2.15.0 KEV
-  critical CVE-2021-45046       org.apache.logging.log4j:log4j-core 2.14.1, fixed in 2.16.0 KEV
-  critical CVE-2015-7501        commons-collections:commons-collections 3.2.1, fixed in 3.2.2
-  critical CVE-2019-16942       com.fasterxml.jackson.core:jackson-databind 2.9.10, fixed in 2.9.10.1
-  critical CVE-2019-16943       com.fasterxml.jackson.core:jackson-databind 2.9.10, fixed in 2.9.10.1
-  critical CVE-2019-17531       com.fasterxml.jackson.core:jackson-databind 2.9.10, fixed in 2.9.10.1
-  critical CVE-2019-20330       com.fasterxml.jackson.core:jackson-databind 2.9.10, fixed in 2.9.10.2
-  critical CVE-2020-8840        com.fasterxml.jackson.core:jackson-databind 2.9.10, fixed in 2.9.10.3
-  critical CVE-2020-9546        com.fasterxml.jackson.core:jackson-databind 2.9.10, fixed in 2.9.10.4
-  critical CVE-2020-9547        com.fasterxml.jackson.core:jackson-databind 2.9.10, fixed in 2.9.10.4
+  critical CVE-2021-44228       org.apache.logging.log4j:log4j-core 2.14.1, upgrade to 2.25.4 KEV
+  critical CVE-2021-45046       org.apache.logging.log4j:log4j-core 2.14.1, upgrade to 2.25.4 KEV
+  critical CVE-2015-7501        commons-collections:commons-collections 3.2.1, upgrade to 3.2.2
+  critical CVE-2019-16942       com.fasterxml.jackson.core:jackson-databind 2.9.10, upgrade to 2.18.11
+  critical CVE-2019-16943       com.fasterxml.jackson.core:jackson-databind 2.9.10, upgrade to 2.18.11
+  critical CVE-2019-17531       com.fasterxml.jackson.core:jackson-databind 2.9.10, upgrade to 2.18.11
+  critical CVE-2019-20330       com.fasterxml.jackson.core:jackson-databind 2.9.10, upgrade to 2.18.11
+  critical CVE-2020-8840        com.fasterxml.jackson.core:jackson-databind 2.9.10, upgrade to 2.18.11
+  critical CVE-2020-9546        com.fasterxml.jackson.core:jackson-databind 2.9.10, upgrade to 2.18.11
+  critical CVE-2020-9547        com.fasterxml.jackson.core:jackson-databind 2.9.10, upgrade to 2.18.11
   ... 75 more (vulnerabilities.csv)
+upgrades     upgrade on the same line 22; 2 advisories name a fixed version that is not published
 licenses     permissive 34
 ```
 
@@ -33,8 +37,11 @@ licenses     permissive 34
 commons-collections 3.2.1, mybatis 3.4.6 and netty-all 4.1.54.Final. The scan finds 34 components in them:
 the 27 modules bundled in netty-all, plus ognl and javassist, which are shaded into mybatis. No advisory is
 filed against `netty-all` itself; its modules carry 71. The summary names the worst findings first
-(malicious, known exploited, critical, high) with the release that fixes each; `vulnerabilities.csv` has
-all of them. (Counts are from October 2026 data; they grow as advisories are published.)
+(malicious, known exploited, critical, high); `vulnerabilities.csv` has all of them. Each comes with the
+nearest published release outside every advisory of its package: jackson-databind 2.18.11, not the
+2.9.10.1 that fixes the first of its findings, since dozens of later advisories cover 2.9.10.1 too (see
+[Upgrade advice](#upgrade-advice)). (Counts are from October 2026 data; they grow as advisories are
+published.)
 
 ## Why another SCA tool
 
@@ -61,18 +68,25 @@ the reviewer who receives a delivery from someone else and has to sign off on th
   to a different package, out of the affected version range, or recorded upstream without any package.
   Tools that match by product name (CPE) attach an advisory to every module of a product. This command
   shows how much of a report is noise of that kind.
+- **Upgrade targets are checked, not copied.** An advisory's "fixed in" names the first fix of one
+  flaw. binwitness reads every advisory of the package and the versions actually published, and proposes
+  the nearest release outside all of them. A fixed version that an advisory names but nobody published
+  is reported as such, never proposed.
 - **Results state their data age.** Every response is cached with its fetch time, and the result records
   the oldest and newest data used from each source. `--offline` replays a scan from the cache on a
   machine without internet access.
 - **Online, local, or both.** Advisory databases and Maven Central's hash index can be kept on disk and
   updated incrementally, so that scans identify jars and match advisories without sending anything.
   How much to keep is up to you; see [Local datasets](#local-datasets).
-- **No dependencies.** binwitness uses only the Python standard library (3.10+).
+- **No dependencies.** binwitness uses only the Python standard library (3.10+). The optional MCP server
+  needs the MCP SDK.
 
 ## Install
 
 ```
 pipx install binwitness
+# with the MCP server
+pipx install "binwitness[mcp]"
 # or the latest commit
 pipx install git+https://github.com/Wushangyin/binwitness
 # or, from a checkout
@@ -97,6 +111,7 @@ binwitness scan INPUT... -o OUTDIR [options]
 | `--class-search` | identify rebuilt jars that carry no coordinates (see below). Sends one class name per such jar to Maven Central, and asks for the coordinates its name suggests |
 | `--maven-repo URL` | another Maven repository that publishes releases Maven Central does not have: milestones, a vendor's or your company's own. Checked after Central, in the order given, for checksums, jar directories and POM licenses. Repeatable |
 | `--no-js` / `--no-licenses` / `--no-vulns` | do not look up vendored JavaScript files / licenses / vulnerabilities |
+| `--no-upgrades` | do not work out [upgrade advice](#upgrade-advice) (saves the advisory and version-list lookups of each vulnerable package) |
 | `--fail-on high` | exit with status 3 if anything at or above that severity is found, and with 4 if nothing is but the scan could not check everything (failed or offline lookups) or found nothing to check (for CI) |
 | `--unpacker PROGRAM` | the rar/7z extractor to use (`unrar`, `7z` or `bsdtar`); by default the first one on `PATH` |
 | `--lookup auto\|local\|online` | where lookups are answered; see [Local datasets](#local-datasets). Default `auto` |
@@ -143,9 +158,9 @@ coordinate they name.
 
 | File | Content |
 |---|---|
-| `binwitness.json` | everything: components with evidence, locations, file hashes, published-artifact comparison, other coordinates of the same file, licenses, vulnerabilities; first-party and unidentified files; warnings; data sources with fetch times |
+| `binwitness.json` | everything: components with evidence, locations, file hashes, published-artifact comparison, other coordinates of the same file, licenses, vulnerabilities, upgrade advice; first-party and unidentified files; warnings; data sources with fetch times |
 | `sbom.cdx.json` | CycloneDX 1.5 SBOM with vulnerabilities, identity evidence and occurrences. A component found in several different files has one entry per file, each with its hashes; first-party and unidentified jars are `file` components with their hashes. Licenses with an SPDX id are given as `license.id`. `metadata.component` describes what was scanned |
-| `components.csv`, `vulnerabilities.csv` | the same in spreadsheet form, UTF-8 with a byte order mark so that Excel reads non-ASCII paths correctly |
+| `components.csv`, `vulnerabilities.csv` | the same in spreadsheet form, UTF-8 with a byte order mark so that Excel reads non-ASCII paths correctly. The last column of `components.csv` is the upgrade advice |
 
 When a lookup fails (a service is down, or `--offline` finds nothing cached), the summary has an
 `INCOMPLETE` line saying what was not checked, `summary.incomplete` in `binwitness.json` counts it, and
@@ -166,6 +181,51 @@ are grouped into families: `permissive`, `weak-copyleft`, `copyleft-with-excepti
 that does not say which version or variant, such as a bare `BSD`, is kept as it is. A GPL text that says
 neither "only" nor "or later" keeps SPDX's older id (`GPL-2.0`, `GPL-2.0-with-classpath-exception`), which
 claims no more than the text does.
+
+### Upgrade advice
+
+For each vulnerable component, binwitness reads every advisory of its package and the list of versions
+actually published, and works out which release leaves the findings behind. The result is the `upgrade`
+block of the component in `binwitness.json`, the last column of `components.csv` and the
+`binwitness:upgrade` property in the SBOM; the summary's worst findings show it too.
+
+| Verdict | Meaning |
+|---|---|
+| `upgrade` | a later release on the same major line is outside every advisory of the package |
+| `upgrade-across-major` | only a later major line leaves out more advisories; compatibility is not assessed |
+| `partial` | the best release on this line still falls inside some advisories, and no other line does better |
+| `no-published-fix` | no published version of this coordinate leaves out more advisories (log4j 1.x): replace or remove it |
+| `remove-malicious` | a malicious package: remove it; no version of it is an upgrade |
+| `unverified` | the version list or the advisories could not be read; the advisories' own fixed versions are listed, unchecked |
+
+How the target is chosen:
+
+- The candidates are the published versions later than the one in use. Pre-releases are left out unless
+  the version in use is one, and so are deprecated npm versions. When only a pre-release would leave out
+  more, a caveat names it.
+- Each candidate is checked against all of the package's advisories, including those that do not affect
+  the version in use, so the target is not a version that a later advisory covers. The winner has the
+  fewest remaining findings, weighted by severity (one critical outweighs any number of highs; an unrated one counts as medium); among
+  equals, the lowest version.
+- A line is the first number of the version (`2.x`); calendar versions (`20231013`) form one line, and
+  each npm `0.y` is a line of its own. When only a later line does better, the verdict is
+  `upgrade-across-major`, and the best release on the current line is given as well.
+- A fixed version that an advisory names but that was never published (a branch that stopped receiving
+  releases, or a fix filed under the package's old name after it moved) is listed in
+  `fix_versions_not_published` and never proposed.
+- Variant builds keep their variant: `33.0.0-jre` is proposed for a `-jre` guava, not `-android`. When the
+  version in use has no variant and the best target is one (`1.2.83_noneautotype`), a caveat says so and
+  names the alternatives.
+- Caveats state what the advice does not know: a component bundled inside another artifact has to change
+  with its host, a modified jar may carry local changes, declared coordinates are unverified, a finding
+  that came through another coordinate of the same file has its fixed versions listed separately, a
+  development dependency may not ship.
+
+Version lists come from `maven-metadata.xml` on Maven Central (through `--maven-mirror` when given) and
+the `--maven-repo` repositories, and from the npm registry. With the local hash index installed, `auto`
+uses the index when it contains every fixed version the advisories name; the advice then says the list
+is as of the index's date. In `local` mode the index is the only list, so a fix it does not contain makes
+the verdict `unverified`, not `no-published-fix`; npm advice needs the registry or a cached answer.
 
 ## Local datasets
 
@@ -274,6 +334,66 @@ module makes it `same-project-other-module`.
 A GitHub token raises the API limit from 60 to 5,000 lookups per hour. binwitness reads it from
 `GITHUB_TOKEN`, from `GH_TOKEN` or from `gh auth token`.
 
+## MCP server
+
+`binwitness mcp` lets an AI assistant run scans and read their results through the
+[Model Context Protocol](https://modelcontextprotocol.io), over stdio. It needs the optional SDK
+(`pipx install "binwitness[mcp]"`, or `pip install "binwitness[mcp]"`).
+
+```
+binwitness mcp --root ~/deliveries --lookup local
+```
+
+| Option | Purpose |
+|---|---|
+| `--root DIR` | a directory whose files the assistant may scan or cross-check (repeatable). Paths are resolved, symbolic links included, and must lie inside one. Without a root, only results opened by path can be read |
+| `--lookup auto\|local\|online` | the most a scan may use; a tool call can ask for less, never more. With `local`, nothing leaves the machine and `crosscheck` is not offered. Default `auto` |
+| `--allow-class-search` | let scans use `--class-search`, which sends class names (off by default) |
+| `--results DIR` | where scans are written (default `~/.local/share/binwitness/scans`, on Windows `%LOCALAPPDATA%\binwitness\scans`) |
+| `--cache-dir`, `--db-dir`, `--maven-mirror`, `--maven-repo`, `--workers`, `--max-age` | as for `scan` |
+
+Claude Code:
+
+```
+claude mcp add binwitness -- binwitness mcp --root /home/me/deliveries --lookup local
+```
+
+Claude Desktop, Cursor and other clients configured with an `mcpServers` JSON file take the same command:
+
+```json
+{
+  "mcpServers": {
+    "binwitness": {
+      "command": "binwitness",
+      "args": ["mcp", "--root", "/home/me/deliveries", "--lookup", "local"]
+    }
+  }
+}
+```
+
+| Tool | What it does | Sends |
+|---|---|---|
+| `start_scan` | scans files under a root in a separate `binwitness scan` process and returns a scan id at once; one scan at a time | what `scan` sends at the lookup level chosen |
+| `scan_status` | running (elapsed time, last progress line), finished, or failed (the end of the log) | nothing |
+| `open_result` | registers a `binwitness.json` made earlier and gives its overview | nothing |
+| `list_scans` | scans in the results directory and results opened in this session | nothing |
+| `overview` | counts, the worst findings with advice, upgrade verdicts, license families | nothing |
+| `list_components` | one line per component, filtered by text, severity, ecosystem, license family or verdict; 20 per page, at most 100 | nothing |
+| `list_unidentified` | jars the scan could not name, with the reason | nothing |
+| `get_component` | evidence, files, findings with fixed versions and advice, upgrade advice; locations on request | nothing |
+| `get_vulnerability` | one finding with its OSV record: details, ranges, references | the advisory id to OSV, when the local datasets lack the record and lookups are allowed |
+| `upgrade_plan` | steps, worst first: remove, upgrade, replace, or change the host of bundled components; each says what it clears, what remains and its caveats | nothing |
+| `crosscheck` | classifies another scanner's export against a scan and saves the full report | what `crosscheck` sends; not offered with `--lookup local` |
+
+Every answer about a result starts with `coverage`: whether every lookup succeeded, what was not
+identified or not checked, which lookups were off, the data sources and their dates, the binwitness
+version that scanned and the one serving. It also states what the result cannot say: a component without
+findings has no advisory in the data used as of its date, which is not evidence that it has no flaws, and
+there is no reachability analysis. The upgrade plan adds that compatibility with the application is not
+checked, that a Maven dependency's version is often set by a BOM or parent POM, and that an npm package
+may be a dependency of a dependency. Lists are paged and file locations are counted, not listed, unless
+asked for, so that answers fit an assistant's context.
+
 ## What leaves your machine
 
 binwitness sends the following to public services:
@@ -281,6 +401,8 @@ binwitness sends the following to public services:
 - SHA-1 hashes of jars, and SHA-256 hashes of JavaScript files
 - component coordinates and versions
 - CVE identifiers
+- for upgrade advice, the names of vulnerable packages: to OSV for all of their advisories, and to Maven
+  Central, the `--maven-repo` repositories or the npm registry for their published versions
 - with `--class-search` only: one fully qualified class name for each jar that nothing else identified,
   and the coordinates its file name and manifest suggest. Classes under `--first-party-group` prefixes are never sent. An unidentified jar may be private code,
   so its class name can reveal a package name. Leave the option off when that matters.
@@ -288,16 +410,17 @@ binwitness sends the following to public services:
 It never uploads file contents. First-party jars are not looked up. With `--maven-mirror`, requests for
 Maven Central files go to the mirror instead, so its operator sees which coordinates you checked. The
 operators of `--maven-repo` repositories see the coordinates asked of them in the same way. With
-`--lookup local` nothing is sent at all. `binwitness db sync` only downloads public datasets and sends nothing about your files. To
+`--lookup local` nothing is sent at all. The MCP server sends only what the scans and tools it runs send. `binwitness db sync` only downloads public datasets and sends nothing about your files. To
 scan a machine with no internet access, copy the dataset directory and, optionally, the response cache
 (`--cache-dir`, default `~/.cache/binwitness`) from a connected one.
 
 | Service | Used for |
 |---|---|
 | [deps.dev](https://deps.dev) | jar hash to coordinates; licenses |
-| [Maven Central](https://central.sonatype.com) | hash search fallback; published checksums; POM licenses; `--class-search`; the modules of a groupId for `crosscheck` |
-| repositories given with `--maven-repo` | checksums, jar directories and POM licenses of releases Central does not have |
-| [OSV.dev](https://osv.dev) | vulnerabilities (GitHub Security Advisories and others) |
+| [Maven Central](https://central.sonatype.com) | hash search fallback; published checksums; POM licenses; `--class-search`; version lists for upgrade advice; the modules of a groupId for `crosscheck` |
+| repositories given with `--maven-repo` | checksums, jar directories, POM licenses and version lists of releases Central does not have |
+| [OSV.dev](https://osv.dev) | vulnerabilities (GitHub Security Advisories and others); all advisories of a vulnerable package, for upgrade advice |
+| [npm registry](https://www.npmjs.com) | published versions of vulnerable npm packages, for upgrade advice |
 | [jsDelivr](https://www.jsdelivr.com) | JavaScript file hashes |
 | [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) | known exploited flag |
 | [OSV data bucket](https://google.github.io/osv.dev/data/) | `db sync` of the OSV datasets |
@@ -325,6 +448,10 @@ These limits are deliberate, so read them before relying on a result:
   matching compares CRC-32 values. It catches rebuilds and ordinary edits, not a deliberately forged
   collision. Jars that hold only a manifest, a license and a notice (Spring Boot starters) look alike
   across artifacts; they are never matched by content and are reported as holding no code. Classifier jars (`-linux-x86_64`) are compared only with the main artifact.
+- **Upgrade advice is about advisories, not compatibility.** It says which published version is outside
+  the package's advisories in OSV. Whether the application builds and runs with it, whether the version
+  is set by a BOM, a parent POM or another package, and whether the affected code is reachable are not
+  assessed. A version published after the version list was read is not considered.
 - **Front-end bundles are opaque.** Code that webpack or rollup merged into chunks cannot be matched by
   hash. Ship the lockfile, or the `node_modules` the build used, alongside the bundle. Banner comments
   give only partial coverage.
@@ -346,12 +473,13 @@ These limits are deliberate, so read them before relying on a result:
 ## Development
 
 ```
-pip install -e ".[test]"
+pip install -e ".[test,mcp]"
 pytest
 ```
 
 Tests build their own archives and answer network calls from scripted responses; they never touch the
-internet.
+internet. The MCP tests skip themselves when the SDK is not installed; one of them starts `binwitness mcp`
+over stdio and runs a scan through it.
 
 ## License
 

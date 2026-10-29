@@ -71,3 +71,17 @@ def test_ctrl_c_ends_with_130_and_one_line(tmp_path, jar, monkeypatch, capsys):
     monkeypatch.setattr(threading, "active_count", lambda: 1)
     assert cli.main(offline(tmp_path, jar, "-o", str(tmp_path / "out"))) == 130
     assert capsys.readouterr().err.strip() == "binwitness: interrupted"
+
+
+@pytest.mark.parametrize("extra, recorded", [
+    (["--lookup", "local"], "local"),
+    (["--offline"], "local"),
+    (["--lookup", "online", "--offline"], "online"),
+])
+def test_the_result_records_the_lookup_asked_for_even_with_no_datasets_installed(tmp_path, jar, extra, recorded):
+    import json
+    out = tmp_path / "out"
+    assert cli.main(["scan", str(jar), "-o", str(out), "--cache-dir", str(tmp_path / "cache"),
+                     "--db-dir", str(tmp_path / "db"), *extra]) == 0
+    options = json.loads((out / "binwitness.json").read_text("utf-8"))["options"]
+    assert (options["lookup"], options["offline"]) == (recorded, True)

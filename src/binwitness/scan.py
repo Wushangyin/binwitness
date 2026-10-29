@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from binwitness import __version__, maven, staticjs, vulns
+from binwitness import __version__, maven, staticjs, upgrades, vulns
 from binwitness.archive import Walker
 from binwitness.jar import (JarFacts, entries, file_digests, jar_facts, name_hints, representative_class,
                            split_name, version_hints)
@@ -50,6 +50,11 @@ class Options:
     class_search: bool = False
     # Repositories besides Maven Central that publish releases (milestones, vendors' own); checked after it.
     maven_repos: tuple[str, ...] = ()
+    # Advice on which published version leaves the findings behind: two lookups per vulnerable package.
+    upgrades: bool = True
+    # The lookup mode asked for, as recorded in the result. Not inferable from what was available: asking for
+    # local datasets that are not installed leaves no datasets, which is not an online scan.
+    lookup: str | None = None
 
 
 @dataclass
@@ -519,6 +524,10 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None) -> d
     if options.vulnerabilities:
         vulnerabilities, kev_dates, kev_available = _attach_vulnerabilities(net, db, items, also_published,
                                                                             options.workers, warnings, log)
+    upgrades_not_checked = 0
+    if options.vulnerabilities and options.upgrades:
+        upgrades_not_checked = upgrades.attach(net, db, items, vulnerabilities, options.maven_repos, options.workers,
+                                               warnings, log)
     if not (jars or npm_sightings or scripts):
         warnings.append("nothing to identify: the inputs hold no jar, npm lockfile, node_modules package or "
                         "JavaScript file that binwitness reads")
@@ -537,9 +546,10 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None) -> d
                     "first_party_jars": list(options.first_party_jars),
                     "first_party_npm": list(options.first_party_npm), "exclude": list(options.exclude),
                     "scan_js": options.scan_js, "licenses": options.licenses,
-                    "vulnerabilities": options.vulnerabilities, "class_search": options.class_search,
+                    "vulnerabilities": options.vulnerabilities,
+                    "upgrades": options.vulnerabilities and options.upgrades, "class_search": options.class_search,
                     "maven_repos": list(options.maven_repos), "offline": net.offline,
-                    "lookup": "online" if db is None else "local" if net.offline else "auto",
+                    "lookup": options.lookup or ("online" if db is None else "local" if net.offline else "auto"),
                     "mirrors": dict(net.mirrors)},
         "data_sources": {"online": net.provenance(), "local": db.provenance() if db else {}},
         "summary": {},
@@ -562,6 +572,7 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None) -> d
         "vulnerabilities_not_checked": sum(1 for c in items if c.get("vulnerabilities_checked") is False),
         "licenses_not_looked_up": licenses_not_looked_up,
         "kev_catalog_unavailable": options.vulnerabilities and not kev_available,
+        "upgrade_versions_not_checked": upgrades_not_checked,
     }
     result["summary"]["incomplete"] = {k: v for k, v in incomplete.items() if v}
     return result
@@ -728,6 +739,12 @@ def summarize(result: dict, distinct_jars: int, skipped_runtime: int, kev_dates:
             "malicious_packages": sum(1 for v in table.values() if v["malicious"]),
         },
         "licenses": {"by_family": dict(Counter((c.get("license") or {}).get("family", UNKNOWN) for c in items))},
+        "upgrades": {
+            "by_verdict": {v: n for v in upgrades.VERDICTS
+                           if (n := sum(1 for c in items if (c.get("upgrade") or {}).get("verdict") == v))},
+            "fix_versions_not_published": sum(len((c.get("upgrade") or {}).get("fix_versions_not_published") or [])
+                                              for c in items),
+        },
         "kev_catalog_entries": len(kev_dates),
     }
 

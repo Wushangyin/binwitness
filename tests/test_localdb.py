@@ -595,7 +595,15 @@ def test_local_lookup_needs_no_network(tmp_path, bundle):
     assert f"license unknown for {len(unknown)} components: the registry's answer is not in the cache, and this " \
            "scan does not go online" in result["warnings"]
     offline = next(w for w in result["warnings"] if w.startswith("offline: "))
-    assert offline.endswith("(api.deps.dev " + offline.split()[1] + ")")
+    hosts = dict(part.rsplit(" ", 1) for part in offline.split("(", 1)[1].rstrip(")").split(", "))
+    assert sum(map(int, hosts.values())) == int(offline.split()[1])
+    # License lookups, and the version list of netty-codec-http, which the hash index has no jar of.
+    assert set(hosts) == {"api.deps.dev", "repo1.maven.org"}
+    # The index holds lib 1.0 only, so the 1.1 that the advisory calls fixed may well be published since.
+    assert lib["upgrade"]["verdict"] == "unverified" and "(1.1) is not in the local hash index" in lib["upgrade"]["reason"]
+    codec = next(c for c in result["components"] if c["name"] == "io.netty:netty-codec-http")
+    assert codec["upgrade"]["verdict"] == "unverified" and "offline" in codec["upgrade"]["reason"]
+    assert result["summary"]["incomplete"]["upgrade_versions_not_checked"] == 2
 
 
 def test_auto_lookup_asks_online_only_for_what_the_index_lacks(tmp_path, bundle):

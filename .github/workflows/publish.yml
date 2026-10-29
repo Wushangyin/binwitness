@@ -27,7 +27,7 @@ jobs:
             echo "::error::tag $TAG does not match __version__ $version"
             exit 1
           fi
-      - run: pip install -e ".[test]"
+      - run: pip install -e ".[test,mcp]"
       - run: pytest -q
       - run: pip install build && python -m build
       - uses: actions/upload-artifact@v4

@@ -1,4 +1,4 @@
-"""Command line: binwitness scan, binwitness crosscheck and binwitness db."""
+"""Command line: binwitness scan, binwitness crosscheck, binwitness db and binwitness mcp."""
 from __future__ import annotations
 
 import argparse
@@ -127,6 +127,35 @@ def _database(args) -> int:
     return 1 if any(o.startswith("failed") for o in outcomes.values()) else 0
 
 
+def _repositories(parser: argparse.ArgumentParser, urls: list[str]) -> tuple[str, ...]:
+    repositories = tuple(dict.fromkeys(url.rstrip("/") for url in urls))
+    if any(not url.startswith(("https://", "http://")) for url in repositories):
+        parser.error("--maven-repo takes an http(s) URL")
+    return repositories
+
+
+def _serve(parser: argparse.ArgumentParser, args) -> int:
+    from binwitness import mcp_server
+    for root in args.root:
+        if not root.is_dir():
+            parser.error(f"--root {root} is not a directory")
+    config = mcp_server.Config(
+        lookup="local" if args.offline else args.lookup, roots=tuple(args.root),
+        results=args.results or mcp_server.default_results_dir(), allow_class_search=args.allow_class_search,
+        cache_dir=args.cache_dir, db_dir=args.db_dir, maven_mirror=args.maven_mirror,
+        maven_repos=_repositories(parser, args.maven_repo), workers=args.workers, max_age=args.max_age)
+    try:
+        server = mcp_server.build_server(mcp_server.Service(config))
+    except ImportError as error:
+        if (error.name or "").split(".")[0] not in ("mcp", "pydantic", "anyio"):
+            raise
+        print('binwitness mcp needs the MCP SDK: pip install "binwitness[mcp]" (or, installed with pipx: '
+              'pipx install --force "binwitness[mcp]")', file=sys.stderr)
+        return 2
+    server.run(transport="stdio")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         return _main(argv)
@@ -179,6 +208,9 @@ def _main(argv: list[str] | None) -> int:
     run.add_argument("--no-js", action="store_true", help="do not look up vendored JavaScript files")
     run.add_argument("--no-licenses", action="store_true", help="skip license resolution")
     run.add_argument("--no-vulns", action="store_true", help="skip vulnerability lookup")
+    run.add_argument("--no-upgrades", action="store_true",
+                     help="skip upgrade advice (which published version leaves the findings behind; reads each "
+                          "vulnerable package's version list and all of its advisories)")
     run.add_argument("--unpacker", help="rar/7z extractor to use (unrar, 7z or bsdtar; default: first on PATH)")
     run.add_argument("--fail-on", choices=[s.lower() for s in SEVERITIES[:4]],
                      help="exit with status 3 if any vulnerability at or above this severity is found, or 4 if "
@@ -214,25 +246,43 @@ def _main(argv: list[str] | None) -> int:
     remove.add_argument("datasets", nargs="+", metavar="DATASET", help=choices)
     _db_dir_argument(remove)
 
+    serve = commands.add_parser("mcp", help="serve scans and their results to an AI assistant over the Model "
+                                            "Context Protocol (stdio); needs the mcp extra",
+                                description="Serve scans and their results to an AI assistant over the Model "
+                                            "Context Protocol (stdio). --lookup is the most a scan may use; the "
+                                            "assistant can ask for less.")
+    serve.add_argument("--root", action="append", default=[], type=Path, metavar="DIR",
+                       help="a directory whose files the assistant may scan (repeatable); without one it can only "
+                            "read results opened by path")
+    serve.add_argument("--results", type=Path, default=None, metavar="DIR",
+                       help="where scans are written (default: binwitness/scans in the user data directory)")
+    serve.add_argument("--allow-class-search", action="store_true",
+                       help="let scans use --class-search, which sends class names to Maven Central")
+    serve.add_argument("--maven-repo", action="append", default=[], metavar="URL",
+                       help="another Maven repository for every scan (repeatable)")
+    _network_arguments(serve)
+    _lookup_arguments(serve)
+
     args = parser.parse_args(argv)
     if args.command == "db":
         return _database(args)
+    if args.command == "mcp":
+        return _serve(parser, args)
     if args.command == "scan":
         missing = [str(p) for p in args.inputs if not p.exists()]
         if missing:
             parser.error(f"not found: {', '.join(missing)}")
         if args.fail_on and args.no_vulns:
             parser.error("--fail-on needs the vulnerability lookup that --no-vulns turns off")
-        repositories = tuple(dict.fromkeys(url.rstrip("/") for url in args.maven_repo))
-        if any(not url.startswith(("https://", "http://")) for url in repositories):
-            parser.error("--maven-repo takes an http(s) URL")
+        repositories = _repositories(parser, args.maven_repo)
         _output_directory(parser, args.out)
         options = Options(first_party_groups=tuple(args.first_party_group),
                           first_party_jars=tuple(args.first_party_jar),
                           first_party_npm=tuple(args.first_party_npm), exclude=tuple(args.exclude),
                           scan_js=not args.no_js, licenses=not args.no_licenses,
                           vulnerabilities=not args.no_vulns, workers=args.workers, unpacker=args.unpacker,
-                          class_search=args.class_search, maven_repos=repositories)
+                          class_search=args.class_search, maven_repos=repositories, upgrades=not args.no_upgrades,
+                          lookup="local" if args.offline and args.lookup == "auto" else args.lookup)
         local = args.offline or args.lookup == "local"
         db = None if args.lookup == "online" else LocalDb.open(args.db_dir)
         result = scan(args.inputs, _net(args, offline=local), options, db=db)

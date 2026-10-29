@@ -317,6 +317,18 @@ class LocalDb:
                           "WHERE a.name = ? AND r.withdrawn = 0 ORDER BY r.id", (name,))
         return [json.loads(zlib.decompress(body)) for (body,) in rows]
 
+    def maven_versions(self, group: str, artifact: str) -> list[str]:
+        """Versions of an artifact that have a jar in the hash index: as of the index, not of today."""
+        rows = self._rows("maven-hashes", "SELECT DISTINCT i.version FROM indices i JOIN artifacts a "
+                          "ON a.id = i.artifact_id WHERE a.artifact_id = ? AND a.group_id = ?", (artifact, group))
+        if self._recent():
+            rows += self._rows("maven-hashes", "SELECT DISTINCT version FROM hashes WHERE group_id = ? "
+                               "AND artifact_id = ?", (group, artifact), self._recent())
+        return list(dict.fromkeys(version for (version,) in rows))
+
+    def data_as_of(self, name: str) -> str | None:
+        return (self.state.get(name) or {}).get("data_as_of")
+
     def kev(self) -> dict[str, str]:
         with self._lock:
             if self._kev is None:

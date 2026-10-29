@@ -10,7 +10,7 @@ readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
 authors = [{ name = "Wushangyin" }]
-keywords = ["sca", "sbom", "cyclonedx", "osv", "vulnerability", "license", "supply-chain", "audit"]
+keywords = ["sca", "sbom", "cyclonedx", "osv", "vulnerability", "license", "supply-chain", "audit", "mcp"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -30,6 +30,8 @@ Changelog = "https://github.com/Wushangyin/binwitness/releases"
 
 [project.optional-dependencies]
 test = ["pytest>=7"]
+# `binwitness mcp`: the scanner itself needs none of it.
+mcp = ["mcp>=2.3,<3"]
 
 [project.scripts]
 binwitness = "binwitness.cli:main"

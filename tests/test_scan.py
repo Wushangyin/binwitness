@@ -47,6 +47,17 @@ def querybatch(method, url, body):
                                    for i in AFFECTED.get(q["package"]["name"], [])]} for q in queries]}
 
 
+def package_query(method, url, body):
+    """Every record of a package, the question upgrade advice asks."""
+    name = json.loads(body)["package"]["name"]
+    return {"vulns": [RECORDS[i] for i in AFFECTED.get(name, [])]}
+
+
+def metadata(*versions):
+    listed = "".join(f"<version>{v}</version>" for v in versions)
+    return f"<metadata><versioning><versions>{listed}</versions></versioning></metadata>".encode()
+
+
 def routes(**overrides):
     table = {
         "/systems/maven/packages/org.example%3Apatched/": {"licenses": ["non-standard"]},
@@ -65,6 +76,10 @@ def routes(**overrides):
         "querybatch": querybatch,
         "/v1/vulns/": lambda m, url, b: RECORDS[url.rsplit("/", 1)[1]],
         "known_exploited": {"vulnerabilities": [{"cveID": "CVE-2023-0001", "dateAdded": "2024-02-02"}]},
+        # After "querybatch", which contains this.
+        "/v1/query": package_query,
+        "/org/example/lib/maven-metadata.xml": metadata("1.0", "1.1", "2.0-RC1"),
+        "/io/netty/netty-codec-http/maven-metadata.xml": metadata("4.1.54.Final", "4.1.77.Final"),
     }
     table.update(overrides)
     return table
@@ -744,3 +759,39 @@ def test_crosscheck_finds_a_cve_that_osv_relates_to_an_advisory_of_the_project(t
     assert verdicts["CVE-2023-7002"][0] == "same-project-other-module"
     assert "org.example:lib-extras" in verdicts["CVE-2023-7002"][1]
     assert sum("g%3A%22org.example%22" in url for _, url, _ in transport.calls) == 1
+
+
+def test_upgrade_advice_names_the_nearest_release_outside_the_advisories(tmp_path, delivery):
+    result, _ = run(tmp_path, delivery, ScriptedTransport(routes()))
+    named = {c["name"]: c for c in result["components"]}
+    lib = named["org.example:lib"]["upgrade"]
+    # 2.0-RC1 is newer but a release candidate.
+    assert (lib["verdict"], lib["target"], lib["clears"]) == ("upgrade", "1.1", ["CVE-2023-0001"])
+    assert lib["versions_source"] == {"source": "maven-metadata.xml", "repositories": [maven.CENTRAL]}
+    codec = named["io.netty:netty-codec-http"]["upgrade"]
+    # Two records of CVE-2023-0002 disagree (4.1.77.Final, 9.9): the one that covers more decides.
+    assert (codec["verdict"], codec["target"]) == ("no-published-fix", None)
+    assert codec["fix_versions_not_published"] == [{"id": "CVE-2023-0002", "fixed": "9.9"}]
+    assert [c["code"] for c in codec["caveats"]] == ["embedded-in-host"]
+    assert result["summary"]["upgrades"] == {"by_verdict": {"upgrade": 1, "no-published-fix": 1},
+                                             "fix_versions_not_published": 1}
+    assert "upgrade_versions_not_checked" not in result["summary"]["incomplete"]
+    summary = render_summary(result)
+    assert "CVE-2023-0001        org.example:lib 1.0, upgrade to 1.1 KEV" in summary
+    assert "upgrades     upgrade on the same line 1, no published fix 1; 1 advisory names a fixed version that " \
+           "is not published" in summary
+    out = tmp_path / "out"
+    write_all(result, out)
+    rows = {r.split(",")[1]: r for r in (out / "components.csv").read_text("utf-8-sig").splitlines()}
+    assert rows["name"].endswith(",upgrade") and rows["org.example:lib"].endswith(",upgrade 1.1")
+    assert {"name": "binwitness:upgrade", "value": "upgrade 1.1"} in next(
+        c for c in cyclonedx(result)["components"] if c["name"] == "lib")["properties"]
+
+
+def test_without_upgrade_advice_no_version_list_or_package_query_is_fetched(tmp_path, delivery):
+    transport = ScriptedTransport(routes())
+    result, _ = run(tmp_path, delivery, transport, upgrades=False)
+    assert not any("maven-metadata.xml" in url or url.endswith("/v1/query") for _, url, _ in transport.calls)
+    assert not any("upgrade" in c for c in result["components"])
+    assert result["options"]["upgrades"] is False and result["summary"]["upgrades"]["by_verdict"] == {}
+    assert "fixed in 1.1 KEV" in render_summary(result) and "upgrades " not in render_summary(result)

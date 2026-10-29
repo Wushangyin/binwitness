@@ -2,31 +2,33 @@
 
 [English](README.md) · **简体中文**
 
-面向**实际交付物**的软件成分分析：jar、war、`docker save` 镜像、zip 包和前端构建产物，不论嵌套多少层都会逐层拆开。结果中的每个组件都附带识别它的证据，报告的每一行都经得起追问。binwitness 还能用公开漏洞数据逐条核对其他扫描工具的结论，并为每一处分歧归类。
+面向**实际交付物**的软件成分分析：jar、war、`docker save` 镜像、zip 包和前端构建产物，不论嵌套多少层都会逐层拆开。结果中的每个组件都附带识别它的证据，报告的每一行都经得起追问。对每个有漏洞的组件，它会指出离开该包全部公告的最近已发布版本。binwitness 还能用公开漏洞数据逐条核对其他扫描工具的结论，并为每一处分歧归类；[MCP 服务](#mcp-服务)让 AI 助手可以发起扫描、阅读结果。
 
 ```
 $ binwitness scan release.zip -o out
 walked 1 input(s): 5 distinct jars, 0 npm package entries, 0 distinct scripts
 identified jars: 5 of 5
 vulnerabilities: 133 distinct across 22 components
+upgrade advice: upgrade 22
 components   34  (maven 34; exact 5, declared 29)
 jars         5 distinct: third-party 5
 vulns        133 distinct: critical 12, high 73, medium 46, low 2, known exploited 2
-  critical CVE-2021-44228       org.apache.logging.log4j:log4j-core 2.14.1, fixed in 2.15.0 KEV
-  critical CVE-2021-45046       org.apache.logging.log4j:log4j-core 2.14.1, fixed in 2.16.0 KEV
-  critical CVE-2015-7501        commons-collections:commons-collections 3.2.1, fixed in 3.2.2
-  critical CVE-2019-16942       com.fasterxml.jackson.core:jackson-databind 2.9.10, fixed in 2.9.10.1
-  critical CVE-2019-16943       com.fasterxml.jackson.core:jackson-databind 2.9.10, fixed in 2.9.10.1
-  critical CVE-2019-17531       com.fasterxml.jackson.core:jackson-databind 2.9.10, fixed in 2.9.10.1
-  critical CVE-2019-20330       com.fasterxml.jackson.core:jackson-databind 2.9.10, fixed in 2.9.10.2
-  critical CVE-2020-8840        com.fasterxml.jackson.core:jackson-databind 2.9.10, fixed in 2.9.10.3
-  critical CVE-2020-9546        com.fasterxml.jackson.core:jackson-databind 2.9.10, fixed in 2.9.10.4
-  critical CVE-2020-9547        com.fasterxml.jackson.core:jackson-databind 2.9.10, fixed in 2.9.10.4
+  critical CVE-2021-44228       org.apache.logging.log4j:log4j-core 2.14.1, upgrade to 2.25.4 KEV
+  critical CVE-2021-45046       org.apache.logging.log4j:log4j-core 2.14.1, upgrade to 2.25.4 KEV
+  critical CVE-2015-7501        commons-collections:commons-collections 3.2.1, upgrade to 3.2.2
+  critical CVE-2019-16942       com.fasterxml.jackson.core:jackson-databind 2.9.10, upgrade to 2.18.11
+  critical CVE-2019-16943       com.fasterxml.jackson.core:jackson-databind 2.9.10, upgrade to 2.18.11
+  critical CVE-2019-17531       com.fasterxml.jackson.core:jackson-databind 2.9.10, upgrade to 2.18.11
+  critical CVE-2019-20330       com.fasterxml.jackson.core:jackson-databind 2.9.10, upgrade to 2.18.11
+  critical CVE-2020-8840        com.fasterxml.jackson.core:jackson-databind 2.9.10, upgrade to 2.18.11
+  critical CVE-2020-9546        com.fasterxml.jackson.core:jackson-databind 2.9.10, upgrade to 2.18.11
+  critical CVE-2020-9547        com.fasterxml.jackson.core:jackson-databind 2.9.10, upgrade to 2.18.11
   ... 75 more (vulnerabilities.csv)
+upgrades     upgrade on the same line 22; 2 advisories name a fixed version that is not published
 licenses     permissive 34
 ```
 
-示例中的 `release.zip` 装有从 Maven Central 下载的五个 jar：log4j-core 2.14.1、jackson-databind 2.9.10、commons-collections 3.2.1、mybatis 3.4.6 和 netty-all 4.1.54.Final。扫描从中识别出 34 个组件：netty-all 内含的 27 个模块，以及 shade 进 mybatis 的 ognl 和 javassist。`netty-all` 本身名下没有任何漏洞公告，它的模块名下有 71 条。摘要先列最严重的发现（恶意包、已知被利用、严重、高危）及各自的修复版本，全部发现见 `vulnerabilities.csv`。（数字基于 2026 年 10 月的数据，会随新公告的发布而增长。）
+示例中的 `release.zip` 装有从 Maven Central 下载的五个 jar：log4j-core 2.14.1、jackson-databind 2.9.10、commons-collections 3.2.1、mybatis 3.4.6 和 netty-all 4.1.54.Final。扫描从中识别出 34 个组件：netty-all 内含的 27 个模块，以及 shade 进 mybatis 的 ognl 和 javassist。`netty-all` 本身名下没有任何漏洞公告，它的模块名下有 71 条。摘要先列最严重的发现（恶意包、已知被利用、严重、高危），全部发现见 `vulnerabilities.csv`。每条都附上离开该包全部公告的最近已发布版本：jackson-databind 给的是 2.18.11，而不是修复其第一条发现的 2.9.10.1，因为此后几十条公告同样覆盖 2.9.10.1（见[升级建议](#升级建议)）。（数字基于 2026 年 10 月的数据，会随新公告的发布而增长。）
 
 ## 为什么还要一个 SCA 工具
 
@@ -36,14 +38,17 @@ Trivy、Syft/Grype 和 OSV-Scanner 在识别 jar、报告漏洞方面都做得�
 - **区分重新打包与被修改**。fat jar 构建常把依赖重新压缩：删掉目录条目、改写 manifest、时间戳也变了。文件哈希因此对不上，但代码并没有变。binwitness 读取已发布 jar 的中央目录（用 Range 请求只取文件末尾几 KB），逐条比较每个条目的 CRC-32 和大小。只有 manifest、jar 索引、签名或 `META-INF/maven` 下的 Maven 构建元数据不同的，判为 `repackaged`；类或资源文件不同的，判为 `differs`，并列出改动、新增和缺少的条目。打在另一个 jar 里、而外层 jar 与其发布件完全相同的，判为 `inside-published`：那是上游自己放进去的。
 - **拆开捆绑在一起的代码**。fat jar（`BOOT-INF/lib`、`WEB-INF/lib`）、shade 过的 jar（内嵌 `pom.properties`）以及 `netty-all` 这类合集构件，都会展开成各自的模块。漏洞公告登记在模块名下，只按 `netty-all` 自己的名字查会全部漏掉。
 - **能核对其他扫描工具的结论**。`binwitness crosscheck` 读入另一个工具的结果，对其中 binwitness 没有复现的每条发现，到 GitHub 已审核的漏洞库里查原始公告，再归入以下一类：确属漏报、属于同一项目的另一个模块、属于另一个包、版本不在受影响范围内、上游登记时未指明任何包。按产品名（CPE）匹配的工具会把一条公告挂到同一产品的所有模块上，这个命令能看出一份报告里有多少是这类噪声。
+- **升级目标经过核实，不照抄公告**。公告里的「修复版本」只是某一个缺陷的首个修复。binwitness 读取该包的全部公告和实际发布过的版本，给出离开所有公告的最近版本。公告写了、但从未发布的修复版本会如实列出，从不作为建议。
 - **结果注明数据时效**。每个响应都连同获取时间一起缓存，结果中记录每个数据源用到的最旧和最新数据。`--offline` 可以在不联网的机器上用缓存重放一次扫描。
 - **联网、本地，或两者结合**。漏洞库和 Maven Central 的哈希索引可以保存在本地并增量更新，这样识别 jar、匹配漏洞时不必向外发送任何内容。保留多少由你决定，见[本地数据集](#本地数据集)。
-- **零依赖**。只用 Python 标准库（3.10+）。
+- **零依赖**。只用 Python 标准库（3.10+）。可选的 MCP 服务需要 MCP SDK。
 
 ## 安装
 
 ```
 pipx install binwitness
+# 带 MCP 服务
+pipx install "binwitness[mcp]"
 # 或者安装最新提交
 pipx install git+https://github.com/Wushangyin/binwitness
 # 或者在克隆下来的目录里
@@ -67,6 +72,7 @@ binwitness scan INPUT... -o OUTDIR [options]
 | `--class-search` | 识别不带坐标的重新构建 jar（见下文）。每个这样的 jar 会向 Maven Central 发送一个类名，并查询其名称提示的坐标 |
 | `--maven-repo URL` | 另一个发布了 Maven Central 没有的版本的 Maven 仓库：里程碑仓库、厂商或贵公司自己的仓库。在中央仓之后按给出的顺序查询校验和、jar 目录和 POM 许可证。可重复 |
 | `--no-js` / `--no-licenses` / `--no-vulns` | 不查询随项目拷入的 JavaScript 文件 / 许可证 / 漏洞 |
+| `--no-upgrades` | 不计算[升级建议](#升级建议)（省掉每个有漏洞的包的公告查询和版本列表查询） |
 | `--fail-on high` | 发现该等级及以上的问题时以状态码 3 退出；没有发现、但扫描未能查全（查询失败或离线查不到）或什么都没找到时以状态码 4 退出（用于 CI） |
 | `--unpacker PROGRAM` | 指定 rar/7z 解压程序（`unrar`、`7z` 或 `bsdtar`），默认用 `PATH` 中找到的第一个 |
 | `--lookup auto\|local\|online` | 由谁回答查询，见[本地数据集](#本地数据集)。默认 `auto` |
@@ -100,15 +106,39 @@ binwitness scan INPUT... -o OUTDIR [options]
 
 | 文件 | 内容 |
 |---|---|
-| `binwitness.json` | 全部信息：组件及其证据、位置、文件哈希、与发布件的比对、同一文件的其他坐标、许可证、漏洞；自有文件和未识别文件；警告；各数据源及获取时间 |
+| `binwitness.json` | 全部信息：组件及其证据、位置、文件哈希、与发布件的比对、同一文件的其他坐标、许可证、漏洞、升级建议；自有文件和未识别文件；警告；各数据源及获取时间 |
 | `sbom.cdx.json` | CycloneDX 1.5 SBOM，含漏洞、识别证据和出现位置。同一组件出现在几个不同文件里的，每个文件一条，各带哈希；自有 jar 和未识别 jar 作为 `file` 组件列出，带哈希。有 SPDX 编号的许可证写在 `license.id` 中。`metadata.component` 描述被扫描的对象 |
-| `components.csv`、`vulnerabilities.csv` | 同样的内容，表格形式，UTF-8 带字节顺序标记，Excel 打开非 ASCII 路径不会乱码 |
+| `components.csv`、`vulnerabilities.csv` | 同样的内容，表格形式，UTF-8 带字节顺序标记，Excel 打开非 ASCII 路径不会乱码。`components.csv` 的最后一列是升级建议 |
 
 查询失败时（服务宕机，或 `--offline` 时缓存里没有），摘要中会有一行 `INCOMPLETE` 说明哪些没查，`binwitness.json` 的 `summary.incomplete` 给出计数，没查漏洞的组件标有 `vulnerabilities_checked: false`。这些组件漏洞为零的意思是「没查」，不是「没有」。
 
 严重等级优先取公告自己给出的等级（GitHub 的评级），没有时按 CVSS v3 向量计算。来自 OpenSSF 恶意包数据源的记录按严重（critical）计。发现按 CVE 合并，同一漏洞的 GHSA 与 CVE 只计一次。每条发现都列出各组件的修复版本；已列入 CISA 已知被利用漏洞目录（KEV）的，注明列入日期。
 
 许可证优先从构件本身取：内嵌的 `pom.xml`、`Bundle-License` 头或 LICENSE 文件。LICENSE 会完整读取，以免漏看附在 GPL 正文之后的例外条款。构件本身没有时，依次查 deps.dev 和已发布的 POM（包括其父 POM）。许可证分为以下几类：`permissive`、`weak-copyleft`、`copyleft-with-exception`、`strong-copyleft`、`source-available`、`unknown`。许可证名称写成 SPDX 编号，并带上原文写明的版本（`The Apache Software License, Version 2.0` 写作 `Apache-2.0`，`New BSD License` 写作 `BSD-3-Clause`）。原文没说明版本或变体的，例如单写一个 `BSD`，保持原样。GPL 原文既没写「only」也没写「or later」的，沿用 SPDX 的旧编号（`GPL-2.0`、`GPL-2.0-with-classpath-exception`），不替原文多说什么。
+
+### 升级建议
+
+对每个有漏洞的组件，binwitness 读取该包的全部公告和实际发布过的版本列表，算出哪个版本能离开这些发现。结果写在 `binwitness.json` 中该组件的 `upgrade` 块里，也是 `components.csv` 的最后一列和 SBOM 中的 `binwitness:upgrade` 属性；摘要里的最严重发现同样带上它。
+
+| 结论 | 含义 |
+|---|---|
+| `upgrade` | 同一主版本线上有更晚的版本不在该包任何公告的影响范围内 |
+| `upgrade-across-major` | 只有更晚的主版本线能离开更多公告；不评估兼容性 |
+| `partial` | 这条线上最好的版本仍在部分公告范围内，其他版本线也不比它好 |
+| `no-published-fix` | 这个坐标没有任何已发布版本能离开更多公告（log4j 1.x）：替换或移除 |
+| `remove-malicious` | 恶意包：移除，它的任何版本都不算升级 |
+| `unverified` | 读不到版本列表或公告；列出公告自己写的修复版本，未经核实 |
+
+目标版本的选法：
+
+- 候选是比当前版本更晚的已发布版本。除非当前用的就是预发布版，否则不考虑预发布版，也不考虑已弃用的 npm 版本。只有某个预发布版能离开更多公告时，会在注意事项中点名。
+- 每个候选都拿该包的全部公告来核对，包括不影响当前版本的那些，所以不会建议一个被更晚公告覆盖的版本。按严重度加权，剩余发现最少者胜出（一条严重压过任意条高危；没有评级的按中危计）；相同时取最低版本。
+- 版本线按版本号的第一个数字划分（`2.x`）；日历式版本（`20231013`）算一条线，npm 的每个 `0.y` 各算一条线。只有更晚的版本线更好时，结论是 `upgrade-across-major`，并同时给出当前线上最好的版本。
+- 公告写了、但从未发布的修复版本（某个分支已停止发版，或包改名后修复登记在旧名下）列入 `fix_versions_not_published`，从不作为建议。
+- 变体构建保留其变体：`-jre` 的 guava 建议 `33.0.0-jre`，不建议 `-android`。当前版本没有变体、而最佳目标带变体（`1.2.83_noneautotype`）时，注意事项会说明并列出其他选择。
+- 注意事项写明建议本身不知道的情况：打包在别的构件里的组件要随宿主一起换；被修改过的 jar 可能带有本地改动；声明出来的坐标未经核实；经同一文件的另一个坐标查到的发现，其修复版本单独列出；开发依赖可能并不随产品交付。
+
+版本列表来自 Maven Central 上的 `maven-metadata.xml`（指定 `--maven-mirror` 时经由镜像）和 `--maven-repo` 仓库，以及 npm registry。装了本地哈希索引时，`auto` 模式下只要索引里包含公告提到的全部修复版本，就用索引，建议中会注明列表截至索引的日期。`local` 模式下索引是唯一的列表，所以索引中没有的修复版本会让结论成为 `unverified`，而不是 `no-published-fix`；npm 的升级建议需要 registry 或缓存中的回答。
 
 ## 本地数据集
 
@@ -179,6 +209,57 @@ GitHub 按 CVE 搜索只能找到带有该 CVE 编号的公告，而项目自己
 
 使用 GitHub 令牌可以把 API 限额从每小时 60 次提高到 5,000 次。binwitness 依次从 `GITHUB_TOKEN`、`GH_TOKEN` 或 `gh auth token` 读取令牌。
 
+## MCP 服务
+
+`binwitness mcp` 通过 [Model Context Protocol](https://modelcontextprotocol.io)（stdio）让 AI 助手发起扫描、阅读结果。需要可选的 SDK（`pipx install "binwitness[mcp]"` 或 `pip install "binwitness[mcp]"`）。
+
+```
+binwitness mcp --root ~/deliveries --lookup local
+```
+
+| 选项 | 作用 |
+|---|---|
+| `--root DIR` | 允许助手扫描或核对其中文件的目录，可重复。路径（含符号链接）先解析，必须落在某个 root 之内。不给 root 时，只能读取按路径打开的已有结果 |
+| `--lookup auto\|local\|online` | 扫描最多能用到的查询方式；单次工具调用只能要求更少，不能更多。`local` 时不发送任何内容，也不提供 `crosscheck`。默认 `auto` |
+| `--allow-class-search` | 允许扫描使用会发送类名的 `--class-search`（默认关闭） |
+| `--results DIR` | 扫描结果存放位置（默认 `~/.local/share/binwitness/scans`，Windows 上为 `%LOCALAPPDATA%\binwitness\scans`） |
+| `--cache-dir`、`--db-dir`、`--maven-mirror`、`--maven-repo`、`--workers`、`--max-age` | 同 `scan` |
+
+Claude Code：
+
+```
+claude mcp add binwitness -- binwitness mcp --root /home/me/deliveries --lookup local
+```
+
+Claude Desktop、Cursor 等用 `mcpServers` JSON 文件配置的客户端填同样的命令：
+
+```json
+{
+  "mcpServers": {
+    "binwitness": {
+      "command": "binwitness",
+      "args": ["mcp", "--root", "/home/me/deliveries", "--lookup", "local"]
+    }
+  }
+}
+```
+
+| 工具 | 作用 | 发送 |
+|---|---|---|
+| `start_scan` | 在单独的 `binwitness scan` 进程中扫描 root 下的文件，立即返回扫描编号；同一时间只跑一个 | 按所选查询方式，与 `scan` 相同 |
+| `scan_status` | 运行中（已用时间、最后一行进度）、已完成，或失败（日志末尾） | 无 |
+| `open_result` | 登记一个之前生成的 `binwitness.json` 并给出概览 | 无 |
+| `list_scans` | 结果目录中的扫描，以及本次会话打开的结果 | 无 |
+| `overview` | 计数、带建议的最严重发现、升级结论、许可证分类 | 无 |
+| `list_components` | 每个组件一行，可按文本、严重度、生态、许可证分类或升级结论筛选；每页 20 条，最多 100 条 | 无 |
+| `list_unidentified` | 未能识别的 jar 及原因 | 无 |
+| `get_component` | 证据、文件、带修复版本和建议的发现、升级建议；出现位置按需给出 | 无 |
+| `get_vulnerability` | 一条发现及其 OSV 记录：详情、受影响范围、参考链接 | 本地数据集没有该记录且允许联网时，向 OSV 发送公告编号 |
+| `upgrade_plan` | 按严重程度排列的步骤：移除、升级、替换，或为内嵌组件更换宿主；每一步写明能消除什么、还剩什么及注意事项 | 无 |
+| `crosscheck` | 拿另一个扫描工具的导出结果与某次扫描核对归类，完整报告存盘 | 与 `crosscheck` 相同；`--lookup local` 时不提供 |
+
+每个关于结果的回答都以 `coverage` 开头：是否每次查询都成功、哪些没识别或没查、哪些查询被关闭、各数据源及其日期、做扫描的和提供服务的 binwitness 版本。它还写明结果说明不了什么：没有发现的组件，只表示截至数据日期所用数据中没有针对它的公告，不能证明它没有缺陷；也不做可达性分析。升级计划另外写明：不检查与应用的兼容性；Maven 依赖的版本常由 BOM 或父 POM 决定；npm 包可能是依赖的依赖。列表分页，文件位置只给计数，要求时才列出，以免撑满助手的上下文。
+
 ## 哪些信息会离开你的机器
 
 binwitness 会向公共服务发送以下内容：
@@ -186,16 +267,18 @@ binwitness 会向公共服务发送以下内容：
 - jar 的 SHA-1 哈希、JavaScript 文件的 SHA-256 哈希
 - 组件坐标和版本
 - CVE 编号
+- 计算升级建议时，有漏洞的包的名称：发给 OSV 以取其全部公告，发给 Maven Central、`--maven-repo` 仓库或 npm registry 以取其已发布版本
 - 仅在开启 `--class-search` 时：为其他方式都认不出的每个 jar 发送一个完整类名，并查询其文件名和 manifest 提示的坐标。`--first-party-group` 前缀下的类从不发送。未识别的 jar 可能是私有代码，其类名可能暴露包名，介意的话不要开启这个选项。
 
-不会上传任何文件内容。自有 jar 不做查询。使用 `--maven-mirror` 时，对中央仓文件的请求改发给镜像，镜像的运营方能看到你查了哪些坐标。`--maven-repo` 仓库的运营方同样能看到向它查询的坐标。使用 `--lookup local` 时不发送任何内容。`binwitness db sync` 只下载公开数据集，不发送任何与你的文件有关的信息。要在不联网的机器上扫描，从联网的机器上拷贝数据集目录，需要的话再拷贝响应缓存（`--cache-dir`，默认 `~/.cache/binwitness`）。
+不会上传任何文件内容。自有 jar 不做查询。使用 `--maven-mirror` 时，对中央仓文件的请求改发给镜像，镜像的运营方能看到你查了哪些坐标。`--maven-repo` 仓库的运营方同样能看到向它查询的坐标。使用 `--lookup local` 时不发送任何内容。MCP 服务发送的只是它所运行的扫描和工具发送的内容。`binwitness db sync` 只下载公开数据集，不发送任何与你的文件有关的信息。要在不联网的机器上扫描，从联网的机器上拷贝数据集目录，需要的话再拷贝响应缓存（`--cache-dir`，默认 `~/.cache/binwitness`）。
 
 | 服务 | 用途 |
 |---|---|
 | [deps.dev](https://deps.dev) | jar 哈希查坐标；许可证 |
-| [Maven Central](https://central.sonatype.com) | 哈希搜索兜底；发布的校验和；POM 中的许可证；`--class-search`；`crosscheck` 查 groupId 下的模块 |
-| 用 `--maven-repo` 指定的仓库 | 中央仓没有的版本的校验和、jar 目录和 POM 许可证 |
-| [OSV.dev](https://osv.dev) | 漏洞（GitHub 安全公告及其他来源） |
+| [Maven Central](https://central.sonatype.com) | 哈希搜索兜底；发布的校验和；POM 中的许可证；`--class-search`；升级建议的版本列表；`crosscheck` 查 groupId 下的模块 |
+| 用 `--maven-repo` 指定的仓库 | 中央仓没有的版本的校验和、jar 目录、POM 许可证和版本列表 |
+| [OSV.dev](https://osv.dev) | 漏洞（GitHub 安全公告及其他来源）；升级建议所需的有漏洞的包的全部公告 |
+| [npm registry](https://www.npmjs.com) | 升级建议所需的有漏洞的 npm 包的已发布版本 |
 | [jsDelivr](https://www.jsdelivr.com) | JavaScript 文件哈希 |
 | [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) | 已知被利用标记 |
 | [OSV 数据存储桶](https://google.github.io/osv.dev/data/) | OSV 数据集的 `db sync` |
@@ -210,6 +293,7 @@ binwitness 会向公共服务发送以下内容：
 - **本地匹配使用 binwitness 自己的版本排序**。本地数据集中的公告版本范围由 binwitness 实现的 Maven 和 semver 排序判断，在线 API 用的是 OSV 自己的实现。常规版本号上两者一致，不常见的版本字符串可能比较结果不同。
 - **漏洞覆盖范围就是 OSV 的覆盖范围**。没有指明包的公告（GitHub "unreviewed"、只有 CPE 的 NVD 记录）无法匹配到组件。不查询厂商私有漏洞库和各国的国家漏洞库。漏洞数应视为下限。拿 `crosscheck` 去核对商业工具的输出，是了解这类数据库能补充多少的实用办法。
 - **识别需要已发布的构件或声明**。私有构建、分叉版本，以及不带 `pom.properties` 的改包名副本会保持未识别，除非同一交付物里还有一份已识别的副本（或者 `--class-search` 找到了它）。只在其他仓库发布的版本（里程碑版、厂商自己的构建）要用 `--maven-repo` 才认得出。每个未识别的 jar 都写明原因，并给出 manifest 或文件名提示的身份（`hint`，未经核实）。shade 时没带上 `pom.properties` 的类认不出；binwitness 不做字节码或源码指纹。内容比对比较的是 CRC-32，能发现重新构建和一般修改，防不了蓄意伪造的碰撞。只含 manifest、许可证和 notice 的 jar（Spring Boot starter）在不同构件之间看起来都一样，从不按内容匹配，报告为不含代码。分类器 jar（`-linux-x86_64`）只与主构件比较。
+- **升级建议只针对公告，不涉及兼容性**。它说明哪个已发布版本不在 OSV 中该包公告的影响范围内。应用换上它能否构建和运行、版本是否由 BOM、父 POM 或其他包决定、受影响的代码是否可达，都不做评估。读取版本列表之后才发布的版本不在考虑之内。
 - **前端打包产物是不透明的**。webpack 或 rollup 合并进 chunk 的代码无法按哈希匹配。请把锁文件，或构建时用的 `node_modules`，随打包产物一起交付。文件头注释只能覆盖一部分。
 - **生态：Java（Maven）和 JavaScript（npm）**。操作系统软件包、Python、Go、.NET 和原生库不在范围内；镜像的操作系统层请用 Trivy 或 Syft。JDK/JRE 运行时 jar 会跳过。
 - **非常规许可证需要人工判断**。非标准许可证和自相矛盾的声明归为 `unknown`。并列多个许可证而没有写成 SPDX 表达式的，按任选其一理解。
@@ -219,11 +303,11 @@ binwitness 会向公共服务发送以下内容：
 ## 开发
 
 ```
-pip install -e ".[test]"
+pip install -e ".[test,mcp]"
 pytest
 ```
 
-测试自己构造压缩包，网络调用由预设的响应回答，从不访问互联网。
+测试自己构造压缩包，网络调用由预设的响应回答，从不访问互联网。没装 SDK 时 MCP 测试自动跳过；其中一个测试通过 stdio 启动 `binwitness mcp` 并经由它跑一次扫描。
 
 ## 许可证
 

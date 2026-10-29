@@ -54,6 +54,8 @@ def cyclonedx(result: dict) -> dict:
         properties = [{"name": "binwitness:also-published-as", "value": p}
                       for p in dict.fromkeys(p for f in c["files"] for p in f.get("also_published_as", []))]
         properties += [{"name": "binwitness:contained-in", "value": p} for p in c["contained_in"]]
+        if c.get("upgrade"):
+            properties.append({"name": "binwitness:upgrade", "value": upgrade_text(c["upgrade"])})
         if c.get("vulnerabilities_checked") is False:
             properties.append({"name": "binwitness:vulnerabilities", "value": "not checked: the lookup failed"})
         # One entry per file: a tampered copy and the original share coordinates but not hashes, and a
@@ -165,7 +167,8 @@ def components_csv(result: dict, path: Path):
         writer = csv.writer(handle)
         writer.writerow(["ecosystem", "name", "version", "purl", "scope", "confidence", "identified by",
                          "published artifact", "also published as", "contained in", "license family", "licenses",
-                         *[s.lower() for s in SEVERITIES], "vulnerabilities", "occurrences", "first location"])
+                         *[s.lower() for s in SEVERITIES], "vulnerabilities", "occurrences", "first location",
+                         "upgrade"])
         for c in result["components"]:
             license_ = c.get("license") or {}
             writer.writerow([
@@ -179,7 +182,7 @@ def components_csv(result: dict, path: Path):
                 *_counts(c, table),
                 " ".join(c["vulnerabilities"] + (["(lookup incomplete)"] if c.get("vulnerabilities_checked") is False
                                                  else [])),
-                len(c["locations"]), c["locations"][0]])
+                len(c["locations"]), c["locations"][0], upgrade_text(c["upgrade"]) if c.get("upgrade") else ""])
 
 
 def vulnerabilities_csv(result: dict, path: Path):
@@ -223,13 +226,19 @@ def render_summary(result: dict) -> str:
             + [("known exploited", v["known_exploited"]), ("MALICIOUS", v["malicious_packages"])])
             if v["total"] else ""))
         lines += _worst(result)
+        advice = (s.get("upgrades") or {})
+        if options.get("upgrades") and advice.get("by_verdict"):
+            unpublished = advice.get("fix_versions_not_published")
+            lines.append("upgrades     " + _listing((_VERDICT_LABEL[k], n) for k, n in advice["by_verdict"].items())
+                         + (f"; {unpublished} advisor{'y names' if unpublished == 1 else 'ies name'} a fixed version "
+                            "that is not published" if unpublished else ""))
     if not options.get("licenses", True):
         lines.append("licenses     not looked up (--no-licenses)")
     elif c["total"]:
         lines.append("licenses     " + _listing(sorted(s["licenses"]["by_family"].items())))
     incomplete = s.get("incomplete") or {}
     if incomplete:
-        lines.append("INCOMPLETE   " + "; ".join(_INCOMPLETE[k].format(n=n) for k, n in incomplete.items())
+        lines.append("INCOMPLETE   " + "; ".join(INCOMPLETE[k].format(n=n) for k, n in incomplete.items())
                      + " (see warnings)")
     unnamed = [u for u in result["unidentified"] if u["reason"].startswith("no registry has this file")]
     if unnamed and not (options.get("class_search") and options.get("maven_repos")):
@@ -244,14 +253,18 @@ def render_summary(result: dict) -> str:
     return "\n".join(lines)
 
 
-_INCOMPLETE = {
+INCOMPLETE = {
     "jars_not_looked_up": "{n} jars not looked up",
     "scripts_not_looked_up": "{n} scripts not looked up",
     "jar_files_not_compared": "{n} jars not compared with the published artifact",
     "vulnerabilities_not_checked": "vulnerabilities not checked for {n} components",
     "licenses_not_looked_up": "licenses not looked up for {n} components",
     "kev_catalog_unavailable": "CISA KEV catalog unavailable",
+    "upgrade_versions_not_checked": "upgrade targets not checked for {n} components",
 }
+_VERDICT_LABEL = {"remove-malicious": "remove (malicious)", "upgrade": "upgrade on the same line",
+                  "upgrade-across-major": "only across a major version", "partial": "partial",
+                  "no-published-fix": "no published fix", "unverified": "not checked"}
 # The summary names this many of the worst findings; the CSV and JSON have all of them.
 WORST_SHOWN = 10
 
@@ -260,20 +273,25 @@ def _listing(pairs) -> str:
     return ", ".join(f"{k} {n}" for k, n in pairs if n) or "none"
 
 
-def _worst(result: dict) -> list[str]:
-    """Malicious packages, known-exploited and critical or high findings, each with what it affects."""
-    named = {c["purl"]: c for c in result["components"]}
+def worst_findings(result: dict) -> list[dict]:
+    """Malicious packages, known-exploited and critical or high findings, worst first."""
     worst = [x for x in result["vulnerabilities"].values()
              if x["malicious"] or x["kev_date_added"] or x["severity"] in ("CRITICAL", "HIGH")]
     worst.sort(key=lambda x: (not x["malicious"], not x["kev_date_added"], SEVERITIES.index(x["severity"]), x["id"]))
+    return worst
+
+
+def _worst(result: dict) -> list[str]:
+    """The worst findings, each with what it affects."""
+    named = {c["purl"]: c for c in result["components"]}
+    worst = worst_findings(result)
     lines = []
     for x in worst[:WORST_SHOWN]:
         ref, affected = next(iter(x["affects"].items()))
         component = named.get(ref)
         label = f"{component['name']} {component['version']}" if component else ref
         more = f" and {len(x['affects']) - 1} more" if len(x["affects"]) > 1 else ""
-        fixed = _next_fixed(component, affected["fixed"]) if component else None
-        fixed = f", fixed in {fixed}" if fixed else ""
+        fixed = finding_advice(component, x["id"], affected) if component else ""
         flags = "".join((" MALICIOUS" if x["malicious"] else "", " KEV" if x["kev_date_added"] else ""))
         lines.append(f"  {x['severity'].lower():8} {x['id']:20} {label}{more}{fixed}{flags}")
     if len(worst) > WORST_SHOWN:
@@ -286,3 +304,30 @@ def _next_fixed(component: dict, fixed: list[str]) -> str | None:
     fix on an older line (5.7.13 for a 6.1.5) is no upgrade path."""
     later = [f for f in fixed if compare(component["ecosystem"], f, component["version"]) > 0]
     return min(later, key=functools.cmp_to_key(lambda a, b: compare(component["ecosystem"], a, b)), default=None)
+
+
+def upgrade_text(upgrade: dict) -> str:
+    text = upgrade["verdict"] + (f" {upgrade['target']}" if upgrade.get("target") else "")
+    if upgrade.get("target") and upgrade["remaining"]:
+        text += f" ({len(upgrade['remaining'])} remain)"
+    return text
+
+
+def finding_advice(component: dict, key: str, affected: dict) -> str:
+    """What to do about one finding: the component's upgrade advice when it speaks to this finding, else the
+    advisory's own fixed version."""
+    upgrade = component.get("upgrade")
+    target = upgrade and upgrade.get("target")
+    if upgrade and upgrade["verdict"] == "remove-malicious":
+        return ", remove it"
+    if target and key in upgrade["clears"]:
+        return f", upgrade to {target}" + (" (next major)" if upgrade["verdict"] == "upgrade-across-major" else "")
+    if upgrade and upgrade["verdict"] == "no-published-fix" and key in upgrade["remaining"]:
+        return ", no published fix"
+    if target and key in upgrade["remaining"]:
+        return f", not fixed in {target} either"
+    later = _next_fixed(component, affected["fixed"])
+    if not later:
+        return ""
+    # Without a version list the advisory's number is all there is, and it may never have been published.
+    return f", fixed in {later}" + (" (not checked against the registry)" if upgrade or affected.get("via") else "")

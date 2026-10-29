@@ -10,10 +10,16 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
         python: ["3.10", "3.11", "3.12", "3.13"]
+        extras: ["test,mcp"]
+        include:
+          # The scanner must work without the MCP SDK; the tests that need it skip themselves.
+          - os: ubuntu-latest
+            python: "3.12"
+            extras: "test"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: pip install -e ".[test]"
+      - run: pip install -e ".[${{ matrix.extras }}]"
       - run: pytest -q
