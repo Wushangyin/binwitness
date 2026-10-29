@@ -188,8 +188,21 @@ def components_csv(result: dict, path: Path):
                 *_counts(c, table),
                 " ".join(c["vulnerabilities"] + (["(lookup incomplete)"] if c.get("vulnerabilities_checked") is False
                                                  else [])),
-                len(c["locations"]), c["locations"][0], upgrade_text(c["upgrade"]) if c.get("upgrade") else "",
+                len(c["locations"]), c["locations"][0], _upgrade_cell(c, families.get(c.get("upgrade_family"))),
                 family_text(families[c["upgrade_family"]]) if c.get("upgrade_family") in families else ""])
+
+
+def _upgrade_cell(component: dict, family: dict | None) -> str:
+    """A family member moves with its family: the family's advice comes first, so that a reader of this
+    column alone does not upgrade spring-web and spring-core to different versions."""
+    own = upgrade_text(component["upgrade"]) if component.get("upgrade") else ""
+    if not family:
+        return own
+    text = family["verdict"]
+    if family.get("target"):
+        text += f" {family['target']}" + (f" ({len(family['remaining'])} remain)" if family["remaining"] else "")
+    text += " with its family"
+    return text + (f" (alone: {own})" if own else "")
 
 
 def vulnerabilities_csv(result: dict, path: Path):

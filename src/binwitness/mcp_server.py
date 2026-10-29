@@ -377,7 +377,10 @@ class Service:
                     "clears": family["clears"], "remaining": family["remaining"],
                     "introduced": family["introduced"], "worst_severity": worst,
                     "known_exploited": any(table[k]["kev_date_added"] for k in ids if k in table),
-                    "caveats": [x["text"] for x in family["caveats"]], "per_member": family["per_member"]}
+                    "caveats": [x["text"] for x in family["caveats"]],
+                    # A member with no target of its own and nothing left at the family's target adds only bulk.
+                    "per_member": [m for m in family["per_member"]
+                                   if m["own_target"] or m["remaining"] or m["introduced"]]}
             if family.get("same_line"):
                 step["same_line"] = family["same_line"]
             steps.append(step)
@@ -616,7 +619,9 @@ class Service:
     @staticmethod
     def _find(result: dict, wanted: str) -> dict:
         """A purl, or a name with or without its version: group:artifact, the artifactId alone, an npm name
-        (@scope/name too). An exact name wins over a part of one; several exact matches are refused by name."""
+        (@scope/name too). Several exact matches are refused by name. A part of a name is never taken as the
+        component: "log4j:log4j" is inside "org.apache.logging.log4j:log4j-api", and answering with that would
+        hand over another library's findings, so the names containing it are offered instead."""
         components = result["components"]
         exact = [c for c in components if c["purl"] == wanted]
         if exact:
@@ -629,14 +634,20 @@ class Service:
             return [c for c in found if not version or c["version"] == version]
 
         stages = (of_version([c for c in components if c["name"] == name]),
-                  of_version([c for c in components if c["ecosystem"] == "maven" and c["name"].split(":", 1)[1] == name]),
-                  [c for c in components if wanted.lower() in c["purl"].lower() or wanted.lower() in c["name"].lower()])
+                  of_version([c for c in components if c["ecosystem"] == "maven" and c["name"].split(":", 1)[1] == name]))
         for found in stages:
             if len(found) == 1:
                 return found[0]
             if found:
                 raise Refused(f"{wanted} matches {len(found)} components: "
                               + ", ".join(c["purl"] for c in found[:10]) + "; give the version or the full purl")
+        part = name.lower()
+        containing = [c["purl"] for c in components if part in c["name"].lower()]
+        if containing:
+            raise Refused(f"no component {wanted} in this scan; {len(containing)} name{'s' if len(containing) > 1 else ''} "
+                          f"contain{'' if len(containing) > 1 else 's'} it, which may be other libraries: "
+                          + ", ".join(containing[:10]) + ("" if len(containing) <= 10 else ", ...")
+                          + "; ask for one of them by its full name")
         raise Refused(f"no component {wanted} in this scan; list_components finds it by part of its name")
 
     def _local_db(self) -> LocalDb | None:
@@ -817,8 +828,9 @@ def build_server(service: Service):
                              "the upgrade advice. Sends nothing.")
     async def get_component(
             scan_id: ScanId,
-            purl: Annotated[str, Field(description="the component's purl, or group:artifact@version, or a part "
-                                                   "of the purl that names one component")],
+            purl: Annotated[str, Field(description="the component's purl, its name (group:artifact, the artifactId "
+                                                   "alone, an npm name) with or without @version; a part of a name "
+                                                   "is answered with the names that contain it")],
             include_locations: Annotated[bool, Field(description=f"list where it was found (up to "
                                                                  f"{LOCATIONS_SHOWN})")] = False) -> dict[str, Any]:
         return await call(service.get_component, scan_id, purl, include_locations)

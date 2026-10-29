@@ -786,6 +786,15 @@ def test_upgrade_advice_names_the_nearest_release_outside_the_advisories(tmp_pat
     assert rows["name"].endswith(",upgrade,upgrade family") and rows["org.example:lib"].endswith(",upgrade 1.1,")
     assert {"name": "binwitness:upgrade", "value": "upgrade 1.1"} in next(
         c for c in cyclonedx(result)["components"] if c["name"] == "lib")["properties"]
+    # A member of a release family: the family's advice leads, so the column alone does not split the family.
+    named["org.example:lib"]["upgrade_family"] = "org.example@1.0"
+    result["upgrade_families"] = [{"family": "org.example@1.0", "group": "org.example", "version": "1.0",
+                                   "members": [named["org.example:lib"]["purl"], "pkg:maven/org.example/b@1.0"],
+                                   "verdict": "upgrade", "target": "1.2", "remaining": ["CVE-2023-0009"]}]
+    write_all(result, out)
+    rows = {r.split(",")[1]: r for r in (out / "components.csv").read_text("utf-8-sig").splitlines()}
+    assert rows["org.example:lib"].endswith(",upgrade 1.2 (1 remain) with its family (alone: upgrade 1.1),"
+                                            "org.example@1.0 (2 artifacts): upgrade 1.2 (1 remain)")
 
 
 def test_without_upgrade_advice_no_version_list_or_package_query_is_fetched(tmp_path, delivery):

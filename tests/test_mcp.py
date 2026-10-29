@@ -112,7 +112,7 @@ def test_a_component_by_purl_or_name_with_its_findings_and_advice(tmp_path, resu
         ["delivery.zip!/lib/lib-1.0.jar"]
     patched = served.get_component(scan_id, "org.example:patched@2.0")["component"]
     assert patched["findings"] == [] and patched["findings_note"].startswith("OSV has no advisory")
-    with pytest.raises(Refused, match="matches 3 components"):
+    with pytest.raises(Refused, match="no component netty in this scan; 3 names contain it"):
         served.get_component(scan_id, "netty")
     with pytest.raises(Refused, match="no component"):
         served.get_component(scan_id, "org.example:absent")
@@ -350,12 +350,25 @@ def test_an_exact_name_wins_over_a_part_of_one():
     assert Service._find(found, "org.springframework:spring-web")["version"] == "5.3.4"
     assert Service._find(found, "@babel/core")["version"] == "7.0.0"
     assert Service._find(found, "@babel/core@7.0.0")["name"] == "@babel/core"
-    assert Service._find(found, "webmvc")["name"] == "org.springframework:spring-webmvc"
     two = named_components(("maven", "org.springframework:spring-web", "5.3.4"),
                            ("maven", "org.springframework:spring-web", "5.3.20"))
     assert Service._find(two, "spring-web@5.3.20")["version"] == "5.3.20"
     with pytest.raises(Refused, match="matches 2 components.*give the version"):
         Service._find(two, "spring-web")
+
+
+def test_a_part_of_a_name_is_offered_never_taken():
+    # log4j 1.x asked for, log4j-api 2.x in the scan: answering with it would be another library's findings.
+    found = named_components(("maven", "com.alibaba.fastjson2:fastjson2", "2.0.43"),
+                             ("maven", "org.apache.logging.log4j:log4j-api", "2.17.1"),
+                             ("maven", "org.springframework:spring-webmvc", "5.3.4"))
+    for wanted, offered in (("log4j:log4j", "log4j-api@2.17.1"), ("com.alibaba:fastjson", None),
+                            ("fastjson", "fastjson2@2.0.43"), ("webmvc", "spring-webmvc@5.3.4")):
+        with pytest.raises(Refused) as refused:
+            Service._find(found, wanted)
+        message = str(refused.value)
+        assert message.startswith(f"no component {wanted} in this scan")
+        assert (offered in message) if offered else "contain" not in message
 
 
 def test_a_release_family_is_one_step_with_what_each_member_would_need_alone(tmp_path, result_dir):
@@ -380,3 +393,23 @@ def test_a_release_family_is_one_step_with_what_each_member_would_need_alone(tmp
     shown = served.get_component(scan_id, "org.example:lib@1.0")["component"]
     assert shown["upgrade_family"]["target"] == "1.2" and shown["upgrade"]["target"] == "1.1"
     assert shown["findings"][0]["advice"] == "upgrade to 1.2 with the other 1 org.example artifact"
+
+
+def test_a_family_step_lists_only_the_members_with_something_to_say(tmp_path, result_dir):
+    result = json.loads((result_dir / "binwitness.json").read_text())
+    lib = next(c for c in result["components"] if c["name"] == "org.example:lib")
+    lib["upgrade_family"] = "org.example@1.0"
+    quiet = {"component": "pkg:maven/org.example/quiet@1.0", "own_target": None, "remaining": [], "introduced": []}
+    left = {"component": "pkg:maven/org.example/left@1.0", "own_target": None, "remaining": ["CVE-2023-0009"],
+            "introduced": []}
+    result["upgrade_families"] = [{
+        "family": "org.example@1.0", "group": "org.example", "version": "1.0",
+        "members": [lib["purl"], quiet["component"], left["component"]], "verdict": "upgrade", "target": "1.2",
+        "clears": ["CVE-2023-0001"], "remaining": [], "introduced": [], "caveats": [],
+        "per_member": [{"component": lib["purl"], "own_target": "1.1", "remaining": [], "introduced": []}, quiet,
+                       left]}]
+    (result_dir / "binwitness.json").write_text(json.dumps(result))
+    served = service(tmp_path)
+    step = served.upgrade_plan(served.open_result(str(result_dir))["scan_id"])["plan"][0]
+    assert len(step["members"]) == 3
+    assert [m["component"] for m in step["per_member"]] == [lib["purl"], left["component"]]

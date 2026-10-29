@@ -108,7 +108,7 @@ binwitness scan INPUT... -o OUTDIR [options]
 |---|---|
 | `binwitness.json` | 全部信息：组件及其证据、位置、文件哈希、与发布件的比对、同一文件的其他坐标、许可证、漏洞、升级建议；自有文件和未识别文件；警告；各数据源及获取时间 |
 | `sbom.cdx.json` | CycloneDX 1.5 SBOM，含漏洞、识别证据和出现位置。同一组件出现在几个不同文件里的，每个文件一条，各带哈希；自有 jar 和未识别 jar 作为 `file` 组件列出，带哈希。有 SPDX 编号的许可证写在 `license.id` 中。`metadata.component` 描述被扫描的对象 |
-| `components.csv`、`vulnerabilities.csv` | 同样的内容，表格形式，UTF-8 带字节顺序标记，Excel 打开非 ASCII 路径不会乱码。`components.csv` 的最后一列是升级建议 |
+| `components.csv`、`vulnerabilities.csv` | 同样的内容，表格形式，UTF-8 带字节顺序标记，Excel 打开非 ASCII 路径不会乱码。`components.csv` 的最后两列是升级建议和发布族；发布族成员的升级建议写族的目标，自己单独升级的目标放在括号里 |
 
 查询失败时（服务宕机，或 `--offline` 时缓存里没有），摘要中会有一行 `INCOMPLETE` 说明哪些没查，`binwitness.json` 的 `summary.incomplete` 给出计数，没查漏洞的组件标有 `vulnerabilities_checked: false`。这些组件漏洞为零的意思是「没查」，不是「没有」。
 
@@ -118,7 +118,7 @@ binwitness scan INPUT... -o OUTDIR [options]
 
 ### 升级建议
 
-对每个有漏洞的组件，binwitness 读取该包的全部公告和实际发布过的版本列表，算出哪个版本能离开这些发现。结果写在 `binwitness.json` 中该组件的 `upgrade` 块里，也是 `components.csv` 的最后一列和 SBOM 中的 `binwitness:upgrade` 属性；摘要里的最严重发现同样带上它。
+对每个有漏洞的组件，binwitness 读取该包的全部公告和实际发布过的版本列表，算出哪个版本能离开这些发现。结果写在 `binwitness.json` 中该组件的 `upgrade` 块里，也是 `components.csv` 的 `upgrade` 列和 SBOM 中的 `binwitness:upgrade` 属性；摘要里的最严重发现同样带上它。
 
 | 结论 | 含义 |
 |---|---|
@@ -255,9 +255,9 @@ Claude Desktop、Cursor 等用 `mcpServers` JSON 文件配置的客户端填同�
 | `overview` | 计数、带建议的最严重发现、升级结论、许可证分类 | 无 |
 | `list_components` | 每个组件一行，可按文本、严重度、生态、许可证分类或升级结论筛选；每页 20 条，最多 100 条 | 无 |
 | `list_unidentified` | 未能识别的 jar 及原因 | 无 |
-| `get_component` | 证据、文件、带修复版本和建议的发现、升级建议；出现位置按需给出 | 无 |
+| `get_component` | 按 purl 或完整名称查一个组件：证据、文件、带修复版本和建议的发现、升级建议；出现位置按需给出。只给名称的一部分时，列出包含它的名称，不会把其中某个当作答案 | 无 |
 | `get_vulnerability` | 一条发现及其 OSV 记录：详情、受影响范围、参考链接 | 本地数据集没有该记录且允许联网时，向 OSV 发送公告编号 |
-| `upgrade_plan` | 按严重程度排列的步骤：移除、升级、替换，或为内嵌组件更换宿主；每一步写明能消除什么、还剩什么及注意事项 | 无 |
+| `upgrade_plan` | 按严重程度排列的步骤：移除、升级、替换，或为内嵌组件更换宿主；每一步写明能消除什么、还剩什么及注意事项。一个发布族是一步，`per_member` 只列有自己的目标或还剩发现的成员 | 无 |
 | `crosscheck` | 拿另一个扫描工具的导出结果与某次扫描核对归类，完整报告存盘 | 与 `crosscheck` 相同；`--lookup local` 时不提供 |
 
 每个关于结果的回答都以 `coverage` 开头：是否每次查询都成功、哪些没识别或没查、哪些查询被关闭、各数据源及其日期、做扫描的和提供服务的 binwitness 版本。它还写明结果说明不了什么：没有发现的组件，只表示截至数据日期所用数据中没有针对它的公告，不能证明它没有缺陷；也不做可达性分析。升级计划另外写明：不检查与应用的兼容性；Maven 依赖的版本常由 BOM 或父 POM 决定；npm 包可能是依赖的依赖。列表分页，文件位置只给计数，要求时才列出，以免撑满助手的上下文。

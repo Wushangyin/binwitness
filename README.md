@@ -165,7 +165,7 @@ coordinate they name.
 |---|---|
 | `binwitness.json` | everything: components with evidence, locations, file hashes, published-artifact comparison, other coordinates of the same file, licenses, vulnerabilities, upgrade advice; first-party and unidentified files; warnings; data sources with fetch times |
 | `sbom.cdx.json` | CycloneDX 1.5 SBOM with vulnerabilities, identity evidence and occurrences. A component found in several different files has one entry per file, each with its hashes; first-party and unidentified jars are `file` components with their hashes. Licenses with an SPDX id are given as `license.id`. `metadata.component` describes what was scanned |
-| `components.csv`, `vulnerabilities.csv` | the same in spreadsheet form, UTF-8 with a byte order mark so that Excel reads non-ASCII paths correctly. The last column of `components.csv` is the upgrade advice |
+| `components.csv`, `vulnerabilities.csv` | the same in spreadsheet form, UTF-8 with a byte order mark so that Excel reads non-ASCII paths correctly. The last two columns of `components.csv` are the upgrade advice and the release family; for a family member the advice is the family's, with its own in parentheses |
 
 When a lookup fails (a service is down, or `--offline` finds nothing cached), the summary has an
 `INCOMPLETE` line saying what was not checked, `summary.incomplete` in `binwitness.json` counts it, and
@@ -191,7 +191,7 @@ claims no more than the text does.
 
 For each vulnerable component, binwitness reads every advisory of its package and the list of versions
 actually published, and works out which release leaves the findings behind. The result is the `upgrade`
-block of the component in `binwitness.json`, the last column of `components.csv` and the
+block of the component in `binwitness.json`, the `upgrade` column of `components.csv` and the
 `binwitness:upgrade` property in the SBOM; the summary's worst findings show it too.
 
 | Verdict | Meaning |
@@ -394,9 +394,9 @@ Claude Desktop, Cursor and other clients configured with an `mcpServers` JSON fi
 | `overview` | counts, the worst findings with advice, upgrade verdicts, license families | nothing |
 | `list_components` | one line per component, filtered by text, severity, ecosystem, license family or verdict; 20 per page, at most 100 | nothing |
 | `list_unidentified` | jars the scan could not name, with the reason | nothing |
-| `get_component` | evidence, files, findings with fixed versions and advice, upgrade advice; locations on request | nothing |
+| `get_component` | one component by purl or by its full name: evidence, files, findings with fixed versions and advice, upgrade advice; locations on request. A part of a name gets the names that contain it, never one of them as the answer | nothing |
 | `get_vulnerability` | one finding with its OSV record: details, ranges, references | the advisory id to OSV, when the local datasets lack the record and lookups are allowed |
-| `upgrade_plan` | steps, worst first: remove, upgrade, replace, or change the host of bundled components; each says what it clears, what remains and its caveats | nothing |
+| `upgrade_plan` | steps, worst first: remove, upgrade, replace, or change the host of bundled components; each says what it clears, what remains and its caveats. A release family is one step; its `per_member` lists the members with a target of their own or findings left | nothing |
 | `crosscheck` | classifies another scanner's export against a scan and saves the full report | what `crosscheck` sends; not offered with `--lookup local` |
 
 Every answer about a result starts with `coverage`: whether every lookup succeeded, what was not
