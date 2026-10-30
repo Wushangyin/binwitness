@@ -34,20 +34,20 @@ vulns        133 distinct: critical 12, high 73, medium 46, low 2, known exploit
 upgrades     upgrade on the same line 22; 2 advisories name a fixed version that is not published
 candidates   2 NVD records not attributed to a package in the local OSV data, not counted above; leads for manual review: high 1, medium 1, disputed 1 (candidates.csv)
              looked for in 22 components whose CPE could be learned; 12 without one were not checked; NVD has given no CPE yet to 74,887 records (local nvd of 2026-10-29, osv-maven of 2026-10-28, osv-npm of 2026-10-29)
+             3 component pairs, flagged for review: none; 16 pairs left out: the record names another module; 2 CPE links refused: NVD's versions never meet OSV's
 licenses     permissive 34
 ```
 
 `release.zip` here holds five jars downloaded from Maven Central: log4j-core 2.14.1, jackson-databind 2.9.10,
 commons-collections 3.2.1, mybatis 3.4.6 and netty-all 4.1.54.Final. The scan finds 34 components in them:
-the 27 modules bundled in netty-all, plus ognl and javassist, which are shaded into mybatis. No advisory is
-filed against `netty-all` itself; its modules carry 71. The summary names the worst findings first
-(malicious, known exploited, critical, high); `vulnerabilities.csv` has all of them. Each comes with the
-nearest published release outside every advisory of its package: jackson-databind 2.18.11, not the
-2.9.10.1 that fixes the first of its findings, since dozens of later advisories cover 2.9.10.1 too (see
+the 27 modules bundled in netty-all, plus ognl and javassist, which are shaded into mybatis. None of the
+advisories filed against `netty-all` itself affects 4.1.54; its modules carry 71. The summary names the worst
+findings first (malicious, known exploited, critical, high); `vulnerabilities.csv` has all of them. Each
+comes with the nearest published release outside every advisory of its package: jackson-databind 2.18.11, not
+the 2.9.10.1 that fixes the first of its findings, since dozens of later advisories cover 2.9.10.1 too (see
 [Upgrade advice](#upgrade-advice)). The two candidates are NVD records that no advisory attributes to a
-package; they need the local `nvd` dataset, and without it the summary says they were not checked (see
-[NVD candidates](#nvd-candidates)). (Counts are from October 2026 data; they grow as advisories are
-published.)
+package; they need the local `nvd` dataset, and without it the summary says they were not checked (see [NVD
+candidates](#nvd-candidates)). (Counts are from October 2026 data; they grow as advisories are published.)
 
 ## Why another SCA tool
 
@@ -77,8 +77,8 @@ the reviewer who receives a delivery from someone else and has to sign off on th
 - **Unattributed CVEs are leads, not findings.** Some CVEs are never attributed to a package: GitHub
   leaves them unreviewed, or has no record. NVD names them by product (CPE). binwitness learns which CPE
   stands for a package from the CVEs OSV does attribute to it, never from names, and lists NVD's other
-  records for that CPE as [candidates](#nvd-candidates). They are kept out of the findings and their
-  counts.
+  records for that CPE as [candidates](#nvd-candidates), kept to the module a record names. They are kept
+  out of the findings and their counts.
 - **Upgrade targets are checked, not copied.** An advisory's "fixed in" names the first fix of one
   flaw. binwitness reads every advisory of the package and the versions actually published, and proposes
   the nearest release outside all of them. A fixed version that an advisory names but nobody published
@@ -210,20 +210,29 @@ example at the top, 22 of the 34 components have a learned CPE, and two records 
 - CVE-2023-35116 on jackson-databind 2.9.10, through the CPE `fasterxml:jackson-databind`. 77 of the
   package's 77 CVEs with a CPE carry it. NVD marks the record as disputed: the vendor does not accept it
   as a vulnerability.
-- CVE-2026-62380, through `netty:netty`, the one CPE NVD uses for every netty module, on netty-all and 16
-  of its modules. The record's text names `netty-codec-socks`, which netty-all bundles too. That module
-  has no CVE of its own to learn a CPE from, so it is among the 12 components that were not checked.
+- CVE-2026-62380, through `netty:netty`, the one CPE NVD uses for every netty module. The record's text
+  names the module, `io.netty:netty-codec-socks`, so the 16 other netty modules are left out. It stays on
+  netty-all, whose jar holds the two classes the record names, and reaches the netty-codec-socks inside
+  netty-all by name: that module has no CVE of its own to learn a CPE from.
 
 A CPE is linked with a package when all of these hold:
 
 1. it is on at least 30% of the package's CVEs that NVD gives a CPE, and on at least half as many as the
    package's most frequent CPE (one product can go by several names);
-2. at least half of its CVEs that OSV attributes to any package belong to the package's project (the
-   Maven groupId, or the npm scope): a product that bundles libraries collects the CVEs of many projects;
-3. it is on at least a quarter of the project's CVEs that NVD gives a CPE.
+2. at least half of its CVEs that OSV attributes to any package belong to the package's project or a
+   subproject of it (for Maven, the groupId cut to its first three parts, so that `org.apache.tomcat.embed`
+   counts as Tomcat's; for npm, the scope): a product that bundles libraries collects the CVEs of many
+   projects;
+3. it is on at least a quarter of the project's CVEs that NVD gives a CPE;
+4. of the package's CVEs that carry it and give versions on both sides, on at least half NVD's versions
+   for the CPE meet OSV's for the package: the same fix, or a version either side names (a bound, a listed
+   version) that both cover. A product that bundles the package numbers its own releases (a suite at 10.x
+   shipping a library at 2.x), and no version of the package falls in them. The summary counts the links
+   refused this way.
 
-Names are never compared. A package with no such history gets no candidates, and the summary counts it as
-not checked. A link learned from a single CVE is marked as resting on one CVE, the weakest kind.
+Package names are never compared with product names. A package with no such history gets no candidates,
+and the summary counts it as not checked. A link learned from a single CVE is marked as resting on one
+CVE, the weakest kind.
 
 A record is left out when NVD rejected it, when an advisory in any installed OSV dataset attributes the
 CVE to a package (withdrawn advisories included), when the scan already reports it, under its own id or
@@ -231,14 +240,39 @@ an alias, or when its CPE is for another language runtime (`target_sw` such as `
 package). Records NVD marks as disputed are kept and flagged. A CPE that NVD lists only together with
 another product (a platform) is marked as conditional.
 
+The record's text is read for what it names. When it names Maven modules (`groupId:artifactId`) of the
+package's project, the candidate is kept to them: it reaches those modules even where no CPE could be
+learned for them, and leaves out the project's other modules, except a jar that holds a class the record
+names (an all-in-one jar). The summary counts the pairs left out. Three more things are flagged, never
+acted on:
+
+- same flaw as a finding: the record cites a CVE of one of the component's findings, or that finding's
+  record cites the candidate (a copy of a flaw in another product gets a CVE of its own);
+- names only another language: the record names a binding in another language (the Go client, the C
+  library) and none in the package's own;
+- named classes not in this jar: the record names classes (`org.example.Foo`, or a name of three or more
+  words such as `UrlFilenameViewController`) and the jar holds none of them. Case is ignored and relocated
+  (shaded) copies count. A two-word name counts as a class only when some jar of the scan has a class by
+  that name, and its absence is never flagged: `BigInteger` is the JDK's. A class can also be missing
+  because the record names one of another library (a gadget in a deserialization flaw), or one that came
+  in a later version than the one in use; then the flaw is not in this version either.
+
 Candidates are leads for manual review. A CPE names a product, and a product can be wider than the
 component: one CPE may stand for every module of a framework, as with netty above, or for a vendor's
 drivers in several languages. They are not counted with the findings, do not take part in `--fail-on`,
 and are left out of `sbom.cdx.json` and `vulnerabilities.csv`. They are written to `binwitness.json`
 (`candidates`, and the evidence of each link in `candidate_links`) and to `candidates.csv`. There the
-learned-link column reads like `3/6 / 3/4 / 3/6`: the package's CVEs with the CPE out of those with any
-CPE, the CPE's attributed CVEs of the same project out of all its attributed ones, and the same as the
-first for the whole project. The next column lists the CVEs the link was learned from.
+learned-link column reads like `3/6 / 3/4 / 3/6; versions meet on 3 of 3`: the package's CVEs with the
+CPE out of those with any CPE, the CPE's attributed CVEs of the same project out of all its attributed
+ones, the same as the first for the whole project, and on how many of the CVEs it was learned from that
+give versions on both sides the versions meet. The next column lists the CVEs the link was learned from.
+Further columns say how the pair was reached (a learned link, or named in the record) and give the three
+flags.
+
+Candidates are also where a new CVE shows up first. A CVE is often published with a CPE weeks or months
+before an advisory names its package. In the candidates of one delivery of about 1,100 jars, scanned in
+late October 2026, 37 records were judged real or plausible on review for at least one component; 30 of
+them were published from June 2026 on, and 36 had only an unreviewed GitHub advisory.
 
 Candidates come from local copies only, in every lookup mode: the `nvd` dataset and the OSV dataset of
 each ecosystem (`binwitness db sync nvd vulns`). An online scan takes its findings from the online
@@ -468,8 +502,8 @@ Claude Desktop, Cursor and other clients configured with an `mcpServers` JSON fi
 | `get_component` | one component by purl or by its full name: evidence, files, findings with fixed versions and advice, upgrade advice; locations on request. A part of a name gets the names that contain it, never one of them as the answer | nothing |
 | `get_vulnerability` | one finding with its OSV record: details, ranges, references | the advisory id to OSV, when the local datasets lack the record and lookups are allowed |
 | `upgrade_plan` | steps, worst first: remove, upgrade, replace, or change the host of bundled components; each says what it clears, what remains and its caveats. A release family is one step; its `per_member` lists the members with a target of their own or findings left | nothing |
-| `list_candidates` | the scan's [NVD candidates](#nvd-candidates), worst first, filtered by text (component or CPE), severity, or without the disputed ones | nothing |
-| `get_candidate` | one candidate: the NVD record as of the last sync (status, description, CVSS, CWE, references), the components it reaches with NVD's version range, how each CPE was learned, and what to check before taking it as a finding | nothing |
+| `list_candidates` | the scan's [NVD candidates](#nvd-candidates), those with an unflagged component first, then worst first, filtered by text (component or CPE), severity, or without the disputed ones | nothing |
+| `get_candidate` | one candidate: the NVD record as of the last sync (status, description, CVSS, CWE, references), the components it reaches with NVD's version range and each one's flags, how each CPE was learned, and what to check before taking it as a finding | nothing |
 | `crosscheck` | classifies another scanner's export against a scan and saves the full report | what `crosscheck` sends; not offered with `--lookup local` |
 
 Every answer about a result starts with `coverage`: whether every lookup succeeded, what was not

@@ -223,8 +223,10 @@ def vulnerabilities_csv(result: dict, path: Path):
 CANDIDATE_COLUMNS = ["id", "severity", "cvss score", "cvss vector", "cvss source", "nvd status", "disputed",
                      "known exploited (CISA KEV)", "published", "component", "cpe", "affected versions (NVD)",
                      "only together with another product", "learned link (package / product / project)",
-                     "link learned from", "link rests on one CVE", "packages linked with this cpe", "cwe", "description", "url",
-                     "data as of"]
+                     "link learned from", "link rests on one CVE", "packages linked with this cpe", "reached by",
+                     "same flaw as finding", "names only another language", "named classes in this jar",
+                     "named classes not in this jar", "cwe", "description", "url", "data as of"]
+REACHED_BY = {"learned": "learned link", "named": "named in the record"}
 
 
 def candidates_csv(result: dict, path: Path):
@@ -237,7 +239,8 @@ def candidates_csv(result: dict, path: Path):
         writer = csv.writer(handle)
         writer.writerow(CANDIDATE_COLUMNS)
         if not summary.get("checked"):
-            writer.writerow(["not checked", *[""] * 17, summary.get("not_checked") or "candidates were not looked for",
+            pad = CANDIDATE_COLUMNS.index("description") - 1
+            writer.writerow(["not checked", *[""] * pad, summary.get("not_checked") or "candidates were not looked for",
                              "", dates])
             return
         rows = []
@@ -247,8 +250,11 @@ def candidates_csv(result: dict, path: Path):
                 rows.append([c["id"], c["severity"], c["cvss_score"], c["cvss_vector"], c["cvss_source"], c["status"],
                              "yes" if c["disputed"] else "", c["kev_date_added"] or "", (c["published"] or "")[:10],
                              ref, a["cpe"], a["versions"], "yes" if a["conditional"] else "", _link_text(link),
-                             " ".join(link.get("learned_from") or []), "yes" if a["single_cve_link"] else "", link.get("packages", ""), " ".join(c["cwe"]),
-                             c["description"], c["url"], dates])
+                             " ".join(link.get("learned_from") or []), "yes" if a["single_cve_link"] else "",
+                             link.get("packages", ""), REACHED_BY.get(a.get("basis", "learned"), ""),
+                             " ".join(a.get("related_findings") or []), "yes" if a.get("other_language_only") else "",
+                             _classes_text(a.get("classes_in_jar"), c), _classes_text(a.get("classes_not_in_jar"), c),
+                             " ".join(c["cwe"]), c["description"], c["url"], dates])
         rows.sort(key=lambda r: (SEVERITIES.index(r[1]), r[0], r[9]))
         writer.writerows(rows)
 
@@ -256,8 +262,17 @@ def candidates_csv(result: dict, path: Path):
 def _link_text(link: dict) -> str:
     if not link:
         return ""
-    return (f"{link['shared']}/{link['package_cves']} / {link['product_same_project']}/{link['product_attributed']}"
+    text = (f"{link['shared']}/{link['package_cves']} / {link['product_same_project']}/{link['product_attributed']}"
             f" / {link['project_shared']}/{link['project_cves']}")
+    if "ranges_meet" in link:
+        text += f"; versions meet on {link['ranges_meet']} of {link['ranges_meet'] + link['ranges_apart']}"
+    return text
+
+
+def _classes_text(names: list[str] | None, candidate: dict) -> str:
+    if names is None:
+        return "jar contents unknown" if candidate.get("classes_named") else ""
+    return " ".join(names)
 
 
 def render_summary(result: dict) -> str:
@@ -345,6 +360,15 @@ def _candidate_lines(summary: dict | None) -> list[str]:
              + (f"; NVD has given no CPE yet to {sum(summary['nvd_records_without_cpe'].values()):,} records"
                 if summary.get("nvd_records_without_cpe") else "")
              + (f" (local {dates})" if dates else "")]
+    flagged, left_out = summary.get("pairs_flagged"), sum((summary.get("pairs_left_out") or {}).values())
+    refused = sum((summary.get("links_refused") or {}).values())
+    if flagged is not None:
+        lines.append(f"             {summary['pairs']} component pairs, flagged for review: " + _listing(
+            [("same flaw as a finding", flagged["same_flaw_as_a_finding"]),
+             ("record names only another language", flagged["other_language_only"]),
+             ("named classes not in the jar", flagged["named_classes_not_in_jar"])])
+            + (f"; {left_out} pairs left out: the record names another module" if left_out else "")
+            + (f"; {refused} CPE links refused: NVD's versions never meet OSV's" if refused else ""))
     return lines
 
 

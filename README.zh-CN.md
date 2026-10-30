@@ -28,10 +28,11 @@ vulns        133 distinct: critical 12, high 73, medium 46, low 2, known exploit
 upgrades     upgrade on the same line 22; 2 advisories name a fixed version that is not published
 candidates   2 NVD records not attributed to a package in the local OSV data, not counted above; leads for manual review: high 1, medium 1, disputed 1 (candidates.csv)
              looked for in 22 components whose CPE could be learned; 12 without one were not checked; NVD has given no CPE yet to 74,887 records (local nvd of 2026-10-29, osv-maven of 2026-10-28, osv-npm of 2026-10-29)
+             3 component pairs, flagged for review: none; 16 pairs left out: the record names another module; 2 CPE links refused: NVD's versions never meet OSV's
 licenses     permissive 34
 ```
 
-示例中的 `release.zip` 装有从 Maven Central 下载的五个 jar：log4j-core 2.14.1、jackson-databind 2.9.10、commons-collections 3.2.1、mybatis 3.4.6 和 netty-all 4.1.54.Final。扫描从中识别出 34 个组件：netty-all 内含的 27 个模块，以及 shade 进 mybatis 的 ognl 和 javassist。`netty-all` 本身名下没有任何漏洞公告，它的模块名下有 71 条。摘要先列最严重的发现（恶意包、已知被利用、严重、高危），全部发现见 `vulnerabilities.csv`。每条都附上离开该包全部公告的最近已发布版本：jackson-databind 给的是 2.18.11，而不是修复其第一条发现的 2.9.10.1，因为此后几十条公告同样覆盖 2.9.10.1（见[升级建议](#升级建议)）。两条候选是没有任何公告归到具体包名下的 NVD 记录；它们需要本地的 `nvd` 数据集，没装时摘要会写明候选未检查（见 [NVD 候选](#nvd-候选)）。（数字基于 2026 年 10 月的数据，会随新公告的发布而增长。）
+示例中的 `release.zip` 装有从 Maven Central 下载的五个 jar：log4j-core 2.14.1、jackson-databind 2.9.10、commons-collections 3.2.1、mybatis 3.4.6 和 netty-all 4.1.54.Final。扫描从中识别出 34 个组件：netty-all 内含的 27 个模块，以及 shade 进 mybatis 的 ognl 和 javassist。`netty-all` 本身名下的公告都不影响 4.1.54，它的模块名下有 71 条。摘要先列最严重的发现（恶意包、已知被利用、严重、高危），全部发现见 `vulnerabilities.csv`。每条都附上离开该包全部公告的最近已发布版本：jackson-databind 给的是 2.18.11，而不是修复其第一条发现的 2.9.10.1，因为此后几十条公告同样覆盖 2.9.10.1（见[升级建议](#升级建议)）。两条候选是没有任何公告归到具体包名下的 NVD 记录；它们需要本地的 `nvd` 数据集，没装时摘要会写明候选未检查（见 [NVD 候选](#nvd-候选)）。（数字基于 2026 年 10 月的数据，会随新公告的发布而增长。）
 
 ## 为什么还要一个 SCA 工具
 
@@ -41,7 +42,7 @@ Trivy、Syft/Grype 和 OSV-Scanner 在识别 jar、报告漏洞方面都做得�
 - **区分重新打包与被修改**。fat jar 构建常把依赖重新压缩：删掉目录条目、改写 manifest、时间戳也变了。文件哈希因此对不上，但代码并没有变。binwitness 读取已发布 jar 的中央目录（用 Range 请求只取文件末尾几 KB），逐条比较每个条目的 CRC-32 和大小。只有 manifest、jar 索引、签名或 `META-INF/maven` 下的 Maven 构建元数据不同的，判为 `repackaged`；类或资源文件不同的，判为 `differs`，并列出改动、新增和缺少的条目。打在另一个 jar 里、而外层 jar 与其发布件完全相同的，判为 `inside-published`：那是上游自己放进去的。
 - **拆开捆绑在一起的代码**。fat jar（`BOOT-INF/lib`、`WEB-INF/lib`）、shade 过的 jar（内嵌 `pom.properties`）以及 `netty-all` 这类合集构件，都会展开成各自的模块。漏洞公告登记在模块名下，只按 `netty-all` 自己的名字查会全部漏掉。
 - **能核对其他扫描工具的结论**。`binwitness crosscheck` 读入另一个工具的结果，对其中 binwitness 没有复现的每条发现，到 GitHub 已审核的漏洞库里查原始公告，再归入以下一类：确属漏报、属于同一项目的另一个模块、属于另一个包、版本不在受影响范围内、上游登记时未指明任何包。按产品名（CPE）匹配的工具会把一条公告挂到同一产品的所有模块上，这个命令能看出一份报告里有多少是这类噪声。
-- **未归属的 CVE 是线索，不是发现**。有些 CVE 始终没有归到任何包名下：GitHub 没审核，或者根本没有记录，NVD 只按产品（CPE）描述它们。binwitness 从 OSV 已归属到某个包的那些 CVE 学出哪个 CPE 代表这个包，从不按名称猜，再把 NVD 中该 CPE 的其他记录列为[候选](#nvd-候选)。候选与发现分开，不计入发现及其计数。
+- **未归属的 CVE 是线索，不是发现**。有些 CVE 始终没有归到任何包名下：GitHub 没审核，或者根本没有记录，NVD 只按产品（CPE）描述它们。binwitness 从 OSV 已归属到某个包的那些 CVE 学出哪个 CPE 代表这个包，从不按名称猜，再把 NVD 中该 CPE 的其他记录列为[候选](#nvd-候选)；记录点名了模块的，只落在该模块上。候选与发现分开，不计入发现及其计数。
 - **升级目标经过核实，不照抄公告**。公告里的「修复版本」只是某一个缺陷的首个修复。binwitness 读取该包的全部公告和实际发布过的版本，给出离开所有公告的最近版本。公告写了、但从未发布的修复版本会如实列出，从不作为建议。
 - **结果注明数据时效**。每个响应都连同获取时间一起缓存，结果中记录每个数据源用到的最旧和最新数据。`--offline` 可以在不联网的机器上用缓存重放一次扫描。
 - **联网、本地，或两者结合**。漏洞库和 Maven Central 的哈希索引可以保存在本地并增量更新，这样识别 jar、匹配漏洞时不必向外发送任何内容。保留多少由你决定，见[本地数据集](#本地数据集)。
@@ -126,19 +127,28 @@ binwitness scan INPUT... -o OUTDIR [options]
 发现是指名到组件所属包的公告。有些 CVE 始终没有这样的公告：GitHub 没审核，或者根本没有记录，NVD 只按产品描述它，即一个 CPE（`vendor:product`）加一个版本范围。当 OSV 归到某个包名下的 CVE 显示出某个 CPE 时，binwitness 就把这个包与该 CPE 关联起来，再把 NVD 中该 CPE 覆盖组件版本的其他记录列为候选。开头的示例里，34 个组件中有 22 个学到了 CPE，出来两条记录：
 
 - CVE-2023-35116，在 jackson-databind 2.9.10 上，经由 CPE `fasterxml:jackson-databind`。该包带 CPE 的 77 个 CVE 全部带有它。NVD 把这条记录标为有争议：厂商不承认它是漏洞。
-- CVE-2026-62380，经由 `netty:netty`（NVD 给 netty 所有模块用的同一个 CPE），落在 netty-all 及其 16 个模块上。记录正文点名的是 `netty-codec-socks`，netty-all 里同样打包了这个模块。但它自己没有任何 CVE 可以用来学 CPE，所以属于那 12 个没检查的组件。
+- CVE-2026-62380，经由 `netty:netty`（NVD 给 netty 所有模块用的同一个 CPE）。记录正文点名了模块 `io.netty:netty-codec-socks`，所以 netty 的其他 16 个模块不列入。它留在 netty-all 上，因为 netty-all 的 jar 里有记录点名的两个类；并按点名落到 netty-all 内含的 netty-codec-socks 上：这个模块自己没有任何 CVE 可以用来学 CPE。
 
 一个 CPE 要同时满足以下几条才与包关联：
 
 1. 在该包带 CPE 的 CVE 中至少占 30%，且数量至少是该包最常见 CPE 的一半（同一产品可能有好几个名字）；
-2. 在 OSV 归到任意包名下的该 CPE 的 CVE 中，至少一半属于该包所在的项目（Maven 的 groupId，或 npm 的 scope）：捆绑了多个库的产品会收集许多项目的 CVE；
-3. 在该项目带 CPE 的 CVE 中至少占四分之一。
+2. 在 OSV 归到任意包名下的该 CPE 的 CVE 中，至少一半属于该包所在的项目或其子项目（Maven 取 groupId 的前三段，`org.apache.tomcat.embed` 因而算作 Tomcat 的；npm 取 scope）：捆绑了多个库的产品会收集许多项目的 CVE；
+3. 在该项目带 CPE 的 CVE 中至少占四分之一；
+4. 在该包带此 CPE、且两边都给出版本的 CVE 中，至少一半的 NVD 对该 CPE 给出的版本与 OSV 对该包给出的版本相交。相交指修复版本相同，或某一方写出的版本（范围边界、列出的版本）同时落在两边的范围内。捆绑该包的产品按自己的版本号发版（10.x 的套件里装着 2.x 的库），该包没有哪个版本落在其中。摘要给出因此被拒的关联数。
 
-从不比较名称。没有这类历史的包不出候选，摘要把它计为未检查。只从一个 CVE 学到的关联标为「只依据一个 CVE」，是最弱的一种。
+从不拿包名去比产品名。没有这类历史的包不出候选，摘要把它计为未检查。只从一个 CVE 学到的关联标为「只依据一个 CVE」，是最弱的一种。
 
 以下记录不列入：NVD 已驳回（Rejected）的；任何一个已安装的 OSV 数据集把该 CVE 归到某个包名下的（含已撤回的公告）；本次扫描已经报告的，不论用的是它自己的编号还是别名；CPE 属于其他语言运行时的（Maven 包上的 `target_sw` 为 `node.js` 之类）。NVD 标为有争议的记录保留并标出。NVD 只在与另一产品（平台）同时出现时才列出的 CPE，标为有条件。
 
-候选是供人工复核的线索。CPE 指的是产品，产品可能比组件宽：一个 CPE 可能代表一个框架的所有模块（如上面的 netty），也可能代表某厂商多种语言的驱动。候选不计入发现，不参与 `--fail-on`，也不写进 `sbom.cdx.json` 和 `vulnerabilities.csv`。它们写在 `binwitness.json`（`candidates`，每条关联的依据在 `candidate_links`）和 `candidates.csv` 中。`candidates.csv` 的「学到的关联」列形如 `3/6 / 3/4 / 3/6`：该包带此 CPE 的 CVE 数 / 带任意 CPE 的 CVE 数，该 CPE 已归属 CVE 中同一项目的数量 / 已归属 CVE 总数，以及按整个项目算的第一组数。下一列列出学到这条关联所依据的 CVE。
+记录正文点名了什么，也会读出来。正文点名了该包所在项目的 Maven 模块（`groupId:artifactId`）时，候选只落在这些模块上：这些模块即使学不到 CPE 也会落到，项目的其他模块则不列入，除非其 jar 里有记录点名的类（合集 jar）。摘要给出因此不列入的组件对数。另有三项只做标记，不据此取舍：
+
+- 与发现同一缺陷：记录引用了该组件某条发现的 CVE，或那条发现的记录引用了这条候选（同一缺陷复制到别的产品里会另编一个 CVE）；
+- 只点名其他语言：记录点名的是其他语言的绑定（Go 客户端、C 库），没有点名该包自己语言的；
+- 点名的类不在此 jar 中：记录点名了类（`org.example.Foo`，或由三个及以上单词组成的名字，如 `UrlFilenameViewController`），而该 jar 一个都没有。比对不分大小写，重定位（shade）后的副本也算。两个单词的名字只有在本次扫描的某个 jar 里确有同名类时才算类名，而且缺了也从不标记：`BigInteger` 是 JDK 的。类缺失也可能另有原因：记录点名的是别的库的类（反序列化漏洞里的 gadget），或者该类在比当前更晚的版本才加入，这时当前版本里也就没有这个缺陷。
+
+候选是供人工复核的线索。CPE 指的是产品，产品可能比组件宽：一个 CPE 可能代表一个框架的所有模块（如上面的 netty），也可能代表某厂商多种语言的驱动。候选不计入发现，不参与 `--fail-on`，也不写进 `sbom.cdx.json` 和 `vulnerabilities.csv`。它们写在 `binwitness.json`（`candidates`，每条关联的依据在 `candidate_links`）和 `candidates.csv` 中。`candidates.csv` 的「学到的关联」列形如 `3/6 / 3/4 / 3/6; versions meet on 3 of 3`：该包带此 CPE 的 CVE 数 / 带任意 CPE 的 CVE 数，该 CPE 已归属 CVE 中同一项目的数量 / 已归属 CVE 总数，按整个项目算的第一组数，以及学习所依据、两边都给出版本的 CVE 中有几个版本相交。下一列列出学到这条关联所依据的 CVE。后面几列给出该组件对是怎么来的（学到的关联，或记录点名）以及上述三项标记。
+
+新 CVE 也往往先出现在候选里。CVE 带着 CPE 发布后，常常要过几周甚至几个月才有公告指名到包。在一份约 1,100 个 jar 的交付物（2026 年 10 月下旬扫描）的候选中，复核判为对至少一个组件成立或可能成立的记录有 37 条，其中 30 条发布于 2026 年 6 月以后，36 条只有 GitHub 未审核的公告。
 
 不论哪种查询方式，候选都只来自本地副本：`nvd` 数据集和各生态的 OSV 数据集（`binwitness db sync nvd vulns`）。联网扫描的发现来自在线服务，候选仍来自这些副本。副本的日期写在摘要里，也写在 `candidates.csv` 的每一行。没有这些副本时，摘要写明候选未检查，从不说没有候选。NVD 尚在等待分析的记录还没有 CPE，摘要按状态给出其数量。
 
@@ -289,8 +299,8 @@ Claude Desktop、Cursor 等用 `mcpServers` JSON 文件配置的客户端填同�
 | `get_component` | 按 purl 或完整名称查一个组件：证据、文件、带修复版本和建议的发现、升级建议；出现位置按需给出。只给名称的一部分时，列出包含它的名称，不会把其中某个当作答案 | 无 |
 | `get_vulnerability` | 一条发现及其 OSV 记录：详情、受影响范围、参考链接 | 本地数据集没有该记录且允许联网时，向 OSV 发送公告编号 |
 | `upgrade_plan` | 按严重程度排列的步骤：移除、升级、替换，或为内嵌组件更换宿主；每一步写明能消除什么、还剩什么及注意事项。一个发布族是一步，`per_member` 只列有自己的目标或还剩发现的成员 | 无 |
-| `list_candidates` | 本次扫描的 [NVD 候选](#nvd-候选)，按严重程度排列，可按文本（组件或 CPE）、严重度筛选，或去掉有争议的 | 无 |
-| `get_candidate` | 一条候选：截至上次同步的 NVD 记录（状态、描述、CVSS、CWE、参考链接）、它落到的组件及 NVD 的版本范围、每个 CPE 是怎么学到的，以及把它当作发现之前要核对什么 | 无 |
+| `list_candidates` | 本次扫描的 [NVD 候选](#nvd-候选)，有未标记组件的排在前面，再按严重程度排列，可按文本（组件或 CPE）、严重度筛选，或去掉有争议的 | 无 |
+| `get_candidate` | 一条候选：截至上次同步的 NVD 记录（状态、描述、CVSS、CWE、参考链接）、它落到的组件及 NVD 的版本范围、每个组件的标记、每个 CPE 是怎么学到的，以及把它当作发现之前要核对什么 | 无 |
 | `crosscheck` | 拿另一个扫描工具的导出结果与某次扫描核对归类，完整报告存盘 | 与 `crosscheck` 相同；`--lookup local` 时不提供 |
 
 每个关于结果的回答都以 `coverage` 开头：是否每次查询都成功、哪些没识别或没查、哪些查询被关闭、各数据源及其日期、做扫描的和提供服务的 binwitness 版本。它还写明结果说明不了什么：没有发现的组件，只表示截至数据日期所用数据中没有针对它的公告，不能证明它没有缺陷；也不做可达性分析。升级计划另外写明：不检查与应用的兼容性；Maven 依赖的版本常由 BOM 或父 POM 决定；npm 包可能是依赖的依赖。候选作为待复核的线索给出，不计入发现，并附上助手对其做初步判断时要核对的要点。列表分页，文件位置只给计数，要求时才列出，以免撑满助手的上下文。

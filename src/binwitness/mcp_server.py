@@ -52,8 +52,16 @@ CANDIDATE_JUDGING = [
     "binding for another language, or software that only bundles it?",
     "versions is NVD's range for the CPE; conditional means NVD lists the CPE only together with another product "
     "(a platform), and the record applies only there.",
-    "link shows how the CPE was learned. single_cve means one CVE of the project carries it: a weak link. packages "
-    "above 1 means the CPE stands for several packages, so the record may concern another of them.",
+    "links show how each CPE was learned. single_cve means one CVE of the package carries it: a weak link. "
+    "packages above 1 means the CPE stands for several packages, so the record may concern another of them. "
+    "basis named means the record names this module (groupId:artifactId), and the CPE was learned for others of "
+    "its project.",
+    "flags are facts for the reviewer, not verdicts: same_flaw_as lists findings of the component whose record "
+    "refers to this CVE or the other way round (a copy of a flaw in another product gets its own CVE); "
+    "other_language_only means the record names bindings for other languages and not the component's; "
+    "classes_in_jar and classes_not_in_jar compare the classes the record names with the component's jar (a "
+    "deserialization record names other libraries' classes, and a class added in a later version is missing from "
+    "an earlier one).",
     "status is NVD's analysis state; disputed means the record says the CVE is disputed.",
     "Say which way you judged and why, that it is a first pass from the record's text, and that candidates are "
     "not counted in the findings.",
@@ -357,8 +365,9 @@ class Service:
             mine = sorted((c for c in result["candidates"].values() if ref in c["affects"]),
                           key=lambda c: (_rank(c["severity"]), c["id"]))
             out["candidates"] = [{"id": c["id"], "severity": c["severity"], "disputed": c["disputed"],
-                                  **{k: c["affects"][ref][k] for k in ("cpe", "versions", "conditional",
-                                                                       "single_cve_link")}} for c in mine]
+                                  **{k: c["affects"][ref].get(k) for k in ("cpe", "versions", "conditional", "basis",
+                                                                           "single_cve_link")},
+                                  "flags": _flags(c["affects"][ref])} for c in mine]
             out["candidates_note"] = (
                 "NVD leads, not findings; get_candidate shows one" if mine else
                 "no candidate: " + ("no CPE could be learned for this package, so NVD was not checked"
@@ -397,13 +406,16 @@ class Service:
             return {"coverage": self._coverage(result, path), "candidates": state, "note": CANDIDATE_NOTE}
         threshold, wanted = _threshold(min_severity), (text or "").lower()
         chosen = []
-        for c in sorted(result["candidates"].values(), key=lambda c: (_rank(c["severity"]), c["id"])):
+        for c in result["candidates"].values():
             if (c["disputed"] and not include_disputed) or (min_severity and _rank(c["severity"]) > threshold):
                 continue
             refs = [ref for ref, a in c["affects"].items()
                     if wanted in ref.lower() or wanted in a["cpe"].lower()]
             if refs:
                 chosen.append((c, refs))
+        # Leads without a flag first: a flag is a reason to look twice before spending time on one.
+        chosen.sort(key=lambda x: (all(_flags(x[0]["affects"][ref]) for ref in x[1]), _rank(x[0]["severity"]),
+                                   x[0]["id"]))
         shown, paging = _page(chosen, offset, limit)
         listed = []
         for c, refs in shown:
@@ -415,6 +427,8 @@ class Service:
                 "published": (c["published"] or "")[:10], "cpes": sorted({a["cpe"] for a in affects}),
                 "components": refs[:5], "other_components": len(refs) - 5 if len(refs) > 5 else 0,
                 "only_single_cve_links": all(a["single_cve_link"] for a in affects),
+                "flags": sorted({f for a in affects for f in _flags(a)}),
+                "flagged_components": sum(1 for a in affects if _flags(a)),
                 "description": description if len(description) <= DESCRIPTION_BRIEF
                 else description[:DESCRIPTION_BRIEF].rsplit(" ", 1)[0] + " ..."})
         return {"coverage": self._coverage(result, path), "note": CANDIDATE_NOTE, **paging, "candidates": listed,
@@ -434,16 +448,25 @@ class Service:
             raise Refused(f"{cve_id} is not among this scan's candidates; list_candidates shows them")
         links = result.get("candidate_links") or {}
         named = {c["purl"]: c for c in result["components"]}
-        affects = []
+        affects, learned = [], {}
         for ref, a in entry["affects"].items():
             link = (links.get(ref) or {}).get(a["cpe"]) or {}
             component = named.get(ref) or {}
+            # A link is the package's, whatever its version: given once, not once per component.
+            key = f"{component.get('name', ref)} -> {a['cpe']}"
+            if link and key not in learned:
+                learned[key] = {"package": component.get("name"), **link,
+                                "meaning": self._link_meaning(component, link)}
             affects.append({"component": ref, "scope": component.get("scope"),
                             "findings_of_the_component": len(component.get("vulnerabilities") or []),
-                            **a, "link": {**link, "meaning": self._link_meaning(component, link)} if link else None})
+                            **{k: v for k, v in a.items() if k not in ("related_findings", "other_language_only")},
+                            "same_flaw_as": a.get("related_findings") or [],
+                            "other_language_only": bool(a.get("other_language_only")),
+                            "link": key if link else None, "flags": _flags(a)})
+        affects.sort(key=lambda a: (bool(a["flags"]), a["component"]))
         return {"coverage": self._coverage(result, path), "note": CANDIDATE_NOTE,
                 "candidate": {k: v for k, v in entry.items() if k != "affects"}, "affects": affects,
-                "judging": CANDIDATE_JUDGING, "data_as_of": state.get("data_as_of")}
+                "links": list(learned.values()), "judging": CANDIDATE_JUDGING, "data_as_of": state.get("data_as_of")}
 
     def upgrade_plan(self, scan_id: str, min_severity: str | None = None, offset: int = 0,
                      limit: int = PAGE) -> dict:
@@ -699,7 +722,8 @@ class Service:
         if not summary.get("checked"):
             return {"checked": False, "not_checked": summary.get("not_checked")}
         keep = ("total", "pairs", "by_severity", "disputed", "known_exploited", "only_from_single_cve_links",
-                "components", "components_not_checked_because", "nvd_records_without_cpe", "data_as_of")
+                "pairs_flagged", "pairs_reached_by_name", "pairs_left_out", "links_refused", "components",
+                "components_not_checked_because", "nvd_records_without_cpe", "data_as_of")
         return {"checked": True, **{k: summary.get(k) for k in keep}}
 
     @staticmethod
@@ -707,9 +731,13 @@ class Service:
         name = component.get("name", "the package")
         return (f"{link['shared']} of the {link['package_cves']} CVEs OSV attributes to {name} that NVD gives a CPE "
                 f"carry {link['cpe']}; of that CPE's CVEs OSV attributes to any package, {link['product_same_project']}"
-                f" of {link['product_attributed']} are of the same project; {link['project_shared']} of the "
+                f" of {link['product_attributed']} are of the same project or a subproject of it; "
+                f"{link['project_shared']} of the "
                 f"project's {link['project_cves']} such CVEs carry it; {link['packages']} package"
-                f"{'' if link['packages'] == 1 else 's'} linked with it")
+                f"{'' if link['packages'] == 1 else 's'} linked with it"
+                + (f"; NVD's versions overlap OSV's on {link['ranges_meet']} of the "
+                   f"{link['ranges_meet'] + link['ranges_apart']} CVEs it was learned from that give versions"
+                   if "ranges_meet" in link else ""))
 
     @staticmethod
     def _no_upgrades(result: dict) -> str:
@@ -839,6 +867,18 @@ uses the affected code.
 - Candidates are leads, not findings: keep them out of finding counts, and when you judge one, say it is a \
 first pass from the NVD record and why (get_candidate lists what to check).
 """
+
+
+def _flags(affected: dict) -> list[str]:
+    """The flags of a candidate's component pair (see CANDIDATE_JUDGING)."""
+    flags = []
+    if affected.get("related_findings"):
+        flags.append("same_flaw_as_a_finding")
+    if affected.get("other_language_only"):
+        flags.append("other_language_only")
+    if affected.get("classes_not_in_jar") and not affected.get("classes_in_jar"):
+        flags.append("named_classes_not_in_jar")
+    return flags
 
 
 def build_server(service: Service):

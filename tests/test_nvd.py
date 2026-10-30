@@ -123,6 +123,60 @@ def item(name, version="1.0", vulnerabilities=()):
             "vulnerabilities": list(vulnerabilities)}
 
 
+# A project (org.acme.web) with a subproject (org.acme.web.embed), an all-in-one jar (web-all), a module without
+# CVEs of its own (web-socks), and a product that bundles it under its own release numbers (bundler:suite).
+FAMILY_OSV = [osv("GHSA-w1", "CVE-2024-1001", "org.acme.web:web-core"), osv("GHSA-w2", "CVE-2024-1002", "org.acme.web:web-core"),
+              osv("GHSA-w3", "CVE-2024-1003", "org.acme.web:web-core"),
+              osv("GHSA-a1", "CVE-2024-1001", "org.acme.web:web-all"), osv("GHSA-a2", "CVE-2024-1002", "org.acme.web:web-all"),
+              osv("GHSA-e3", "CVE-2024-1003", "org.acme.web.embed:web-embed")]
+SUITE = cpe("bundler", "suite", versionStartIncluding="10.0", versionEndExcluding="10.5")
+FAMILY_NVD = [
+    *[record(f"CVE-2024-100{n}", cpe("acme", "web", versionEndExcluding="0.5"), SUITE) for n in (1, 2, 3)],
+    record("CVE-2023-1201", cpe("acme", "proxy"), description="Acme Proxy mishandles headers, a variant of CVE-2025-1305."),
+    record("CVE-2025-1301", cpe("acme", "web", versionEndExcluding="2.0"),
+           description="In org.acme.web:web-socks before 2.0, SocksHandshakeDecoder reads past the buffer."),
+    record("CVE-2025-1302", cpe("acme", "web", versionEndExcluding="2.0"), description="A copy of CVE-2023-1201 in Acme Web."),
+    record("CVE-2025-1303", cpe("acme", "web", versionEndExcluding="2.0"), description="The Go client of Acme Web leaks tokens."),
+    record("CVE-2025-1304", cpe("acme", "web", versionEndExcluding="2.0"),
+           description="UrlFileNameViewController and CertPinner in Acme Web resolve any path."),
+    record("CVE-2025-1305", cpe("acme", "web", versionEndExcluding="2.0"), description="Acme Web before 2.0 drops a header."),
+]
+FAMILY_ITEMS = [item("org.acme.web:web-core", vulnerabilities=["GHSA-f"]), item("org.acme.web:web-all"),
+                item("org.acme.web.embed:web-embed"), item("org.acme.web:web-socks")]
+FAMILY_FINDINGS = {"GHSA-f": {"aliases": ["CVE-2023-1201"]}}
+
+
+class Listings:
+    """The class entries of each package's jar; a package without any stands for a jar whose entries are unknown."""
+
+    def __init__(self, entries):
+        self.entries = entries
+
+    def of(self, found):
+        return self.entries.get(found["name"])
+
+    def has_class(self, name):
+        return any(e.rsplit("/", 1)[-1] == f"{name}.class" for entries in self.entries.values() for e in entries)
+
+
+FAMILY_LISTINGS = Listings({
+    "org.acme.web:web-core": {"org/acme/web/core/Server.class"},
+    "org.acme.web:web-all": {"org/acme/web/core/Server.class", "org/acme/web/socks/SocksHandshakeDecoder.class",
+                             "org/acme/web/servlet/UrlFilenameViewController.class", "org/acme/web/tls/CertPinner.class"},
+    "org.acme.web:web-socks": {"org/acme/web/socks/SocksHandshakeDecoder.class"},
+})
+
+
+@pytest.fixture
+def family_world(tmp_path, monkeypatch):
+    monkeypatch.setattr(nvd, "FIRST_YEAR", YEAR)
+    db = LocalDb(tmp_path / "family")
+    transport = ScriptedTransport({"/Maven/all.zip": osv_zip(*FAMILY_OSV),
+                                   **feed_routes(f"nvdcve-2.0-{YEAR}", *FAMILY_NVD)})
+    db.sync(["osv-maven", "nvd"], fetcher=fetcher(transport), log=lambda m: None)
+    return LocalDb.open(tmp_path / "family")
+
+
 # ---- feed and CPE ---------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("chunk", [1, 7, 64, 1 << 20])
@@ -174,6 +228,66 @@ def test_project_of_a_package():
     assert nvd.project("maven", "org.example:lib") == "org.example:"
     assert nvd.project("npm", "@scope/name") == "@scope/"
     assert nvd.project("npm", "left-pad") == "left-pad"
+    assert nvd.family("maven", "org.acme.web.embed:web-embed") == nvd.family("maven", "org.acme.web:web-core") == \
+        "org.acme.web:"
+    assert nvd.family("maven", "org.example:lib") == "org.example:" and nvd.family("npm", "@scope/name") == "@scope/"
+
+
+def interval(end, start="0"):
+    return [(start, end, False)]
+
+
+@pytest.mark.parametrize("intervals, listed, found, meet", [
+    # The same fix, however each side spells it.
+    (interval("4.1.125.Final"), set(), [Match("v", "p", "*", "*", "*", end_excluding="4.1.125")], True),
+    (interval("2.0"), set(), [Match("v", "p", "*", "*", "*", start_including="1.5", end_excluding="2.5")], True),
+    ([], {"1.2", "1.3"}, [Match("v", "p", "1.3", "*", "*")], True),
+    (interval("1.4", start="1.0"), set(), [Match("v", "p", "*", "*", "*")], True),  # NVD gives every version
+    # A product that bundles the package numbers its own releases.
+    (interval("2.0"), set(), [Match("v", "p", "*", "*", "*", start_including="10.0", end_excluding="10.5")], False),
+    (interval("2.0"), set(), [Match("v", "p", "*", "*", "*", end_excluding="12.2.0.1.22")], False),
+    # Two ranges open at the bottom with different fixes share only the early versions every range covers.
+    (interval("2.0"), set(), [Match("v", "p", "*", "*", "*", end_excluding="3.1")], False),
+    (interval("2.0"), set(), [Match("v", "p", "-", "*", "*")], None),
+    ([], set(), [Match("v", "p", "*", "*", "*", end_excluding="2.0")], None),
+])
+def test_ranges_meet(intervals, listed, found, meet):
+    assert nvd.ranges_meet("maven", intervals, listed, found) is meet
+
+
+def test_naming_reads_the_modules_classes_languages_and_cves_a_record_names():
+    text = ("In org.acme.web:web-socks before 2.0, SocksHandshakeDecoder and org.acme.web.socks.Frame let a peer read "
+            "memory; CertPinner and WebFlux are not affected. The C client is affected as well, as in CVE-2024-9999.")
+    facts = nvd.Naming.of({"id": "CVE-2025-0001", "description": text}, is_class={"CertPinner"}.__contains__)
+    assert facts.modules == ("org.acme.web:web-socks",)
+    # A two-word name is a class only when some jar at hand has one by that name: WebFlux could be a product.
+    assert facts.classes == ("org.acme.web.socks.Frame", "SocksHandshakeDecoder", "CertPinner")
+    assert "CertPinner" not in nvd.Naming.of({"description": text}).classes
+    assert facts.languages == ("C",) and facts.cves == {"CVE-2024-9999"}
+    assert facts.modules_of("maven", "org.acme.web:") == {"org.acme.web:web-socks"}
+    assert facts.modules_of("maven", "org.example:") == set()
+
+
+@pytest.mark.parametrize("text, ecosystem, other", [
+    ("The Go client leaks tokens.", "maven", True),
+    ("The Go and Java clients leak tokens.", "maven", False),
+    ("Cross-site scripting: injected JavaScript runs in the console.", "maven", False),
+    ("The Java client leaks tokens.", "npm", True),
+    ("A flaw.", "maven", False),
+])
+def test_a_record_that_names_only_another_language(text, ecosystem, other):
+    assert nvd.Naming.of({"description": text}).other_language_only(ecosystem) is other
+
+
+def test_named_classes_are_found_in_a_jar_whatever_their_case_or_relocation():
+    facts = nvd.Naming.of({"description": "UrlFileNameViewController, org.acme.web.socks.Frame, CertPinner and "
+                                          "PathPatternParserHelper resolve any path."}, is_class=lambda word: True)
+    entries = {"org/acme/web/servlet/UrlFilenameViewController.class", "shaded/org/acme/web/socks/Frame.class",
+               "org/acme/web/Server$Inner.class"}
+    # A two-word name missing from the jar says little (BigInteger is the JDK's), so it is not listed missing.
+    assert facts.placed(entries) == (["org.acme.web.socks.Frame", "UrlFileNameViewController"],
+                                     ["PathPatternParserHelper"])
+    assert facts.placed(None) == (None, None)
 
 
 # ---- syncing ------------------------------------------------------------------------------------------
@@ -269,8 +383,9 @@ def test_candidates_are_the_unattributed_records_of_a_linked_cpe_that_cover_the_
     # attributes CVE-2024-0401, which is no candidate either.
     assert list(table) == ["CVE-2025-0004", "CVE-2025-0007", "CVE-2025-0008", "CVE-2025-0302", "CVE-2025-0402"]
     lib = "pkg:maven/org.example/lib@1.0"
-    assert table["CVE-2025-0004"]["affects"] == {lib: {"cpe": "example:lib", "versions": "< 2.0",
-                                                       "conditional": False, "single_cve_link": False}}
+    assert table["CVE-2025-0004"]["affects"] == {lib: {
+        "cpe": "example:lib", "versions": "< 2.0", "conditional": False, "basis": "learned", "single_cve_link": False,
+        "related_findings": [], "other_language_only": False, "classes_in_jar": [], "classes_not_in_jar": []}}
     assert table["CVE-2025-0004"]["kev_date_added"] == "2025-07-01"
     assert table["CVE-2025-0007"]["affects"][lib]["conditional"] is True
     assert table["CVE-2025-0008"]["disputed"] is True and table["CVE-2025-0008"]["severity"] == "LOW"
@@ -288,6 +403,44 @@ def test_no_candidates_without_the_datasets(world, tmp_path):
     assert table == {} and summary["checked"] is False
     assert summary["not_checked"] == "the local OSV dataset is not installed (binwitness db sync vulns)"
     assert nvd.attach(world, [], {}, {}, {}, "turned off")[2] == {"checked": False, "not_checked": "turned off"}
+
+
+def test_a_subproject_learns_its_projects_cpe_and_a_product_numbered_otherwise_is_refused(family_world):
+    linker = nvd.Linker(family_world)
+    # None of acme:web's attributed CVEs is of web-embed's own groupId; all of them are of its family.
+    embed = linker.links("maven", "org.acme.web.embed:web-embed")
+    assert list(embed) == ["acme:web"] and embed["acme:web"].single
+    core = linker.links("maven", "org.acme.web:web-core")
+    assert list(core) == ["acme:web"] and (core["acme:web"].ranges_meet, core["acme:web"].ranges_apart) == (3, 0)
+    # bundler:suite is on every CVE of the project, but no version of the package is in its 10.x releases.
+    assert linker.apart("maven", "org.acme.web:web-core") == ["bundler:suite"]
+
+
+def test_candidates_carry_what_their_records_name(family_world):
+    table, links, summary = nvd.attach(family_world, FAMILY_ITEMS, FAMILY_FINDINGS, {}, {"maven": "osv-maven"}, None,
+                                       FAMILY_LISTINGS)
+    core, everything, embed, socks = (i["purl"] for i in FAMILY_ITEMS)
+    assert list(table) == ["CVE-2025-1301", "CVE-2025-1302", "CVE-2025-1303", "CVE-2025-1304", "CVE-2025-1305"]
+    # Named for web-socks, which has no CVEs to learn a CPE from: it reaches web-socks by name, and of the others
+    # only the all-in-one jar that holds the named class.
+    named = table["CVE-2025-1301"]
+    assert named["modules_named"] == ["org.acme.web:web-socks"] and named["classes_named"] == ["SocksHandshakeDecoder"]
+    assert {ref: (a["basis"], a["classes_in_jar"]) for ref, a in named["affects"].items()} == {
+        everything: ("learned", ["SocksHandshakeDecoder"]), socks: ("named", ["SocksHandshakeDecoder"])}
+    assert table["CVE-2025-1302"]["affects"][core]["related_findings"] == ["GHSA-f"]  # its text names the finding
+    assert table["CVE-2025-1305"]["affects"][core]["related_findings"] == ["GHSA-f"]  # the finding's names it
+    assert table["CVE-2025-1302"]["affects"][everything]["related_findings"] == []
+    assert table["CVE-2025-1303"]["languages_named"] == ["Go"]
+    assert all(a["other_language_only"] for a in table["CVE-2025-1303"]["affects"].values())
+    classes = {ref: (a["classes_in_jar"], a["classes_not_in_jar"]) for ref, a in table["CVE-2025-1304"]["affects"].items()}
+    assert classes == {core: ([], ["UrlFileNameViewController"]),
+                       everything: (["UrlFileNameViewController", "CertPinner"], []), embed: (None, None)}
+    assert summary["pairs"] == 14 and summary["components"]["with_link"] == 3
+    assert summary["pairs_flagged"] == {"same_flaw_as_a_finding": 2, "other_language_only": 3,
+                                        "named_classes_not_in_jar": 1}
+    assert summary["pairs_reached_by_name"] == 1 and summary["pairs_left_out"] == {"names_another_module": 2}
+    assert summary["links_refused"] == {"version_ranges_apart": 3}
+    assert "bundler:suite" not in links[core]
 
 
 # ---- scans, files, MCP ------------------------------------------------------------------------------------
@@ -331,7 +484,8 @@ def test_a_scan_says_when_candidates_were_not_looked_for(tmp_path, delivery, why
     out = tmp_path / "out"
     write_all(result, out)
     rows = list(csv.reader((out / "candidates.csv").open(encoding="utf-8-sig")))
-    assert rows[1][0] == "not checked" and expected in rows[1][18]  # never an empty table, which reads as none
+    # Never an empty table, which reads as none.
+    assert rows[1][0] == "not checked" and expected in rows[1][rows[0].index("description")]
     if options.get("vulnerabilities", True):
         assert f"candidates   not checked: " in render_summary(result)
 
@@ -367,8 +521,11 @@ def test_mcp_lists_candidates_and_gives_what_to_check(tmp_path, delivery, world)
     detail = service.get_candidate(scan_id, "cve-2025-0004")
     affected = detail["affects"][0]
     assert affected["versions"] == "< 2.0" and affected["findings_of_the_component"] == 1
-    assert affected["link"]["learned_from"] == ["CVE-2024-0013", "CVE-2024-0012", "CVE-2024-0011"]
-    assert "3 of the 3 CVEs OSV attributes to org.example:lib" in affected["link"]["meaning"]
+    assert affected["link"] == "org.example:lib -> example:lib" and affected["flags"] == []
+    [link] = detail["links"]
+    assert link["learned_from"] == ["CVE-2024-0013", "CVE-2024-0012", "CVE-2024-0011"]
+    assert "3 of the 3 CVEs OSV attributes to org.example:lib" in link["meaning"]
+    assert "NVD's versions overlap OSV's on 3 of the 3 CVEs" in link["meaning"]
     assert detail["candidate"]["references"] == ["https://example.org/CVE-2025-0004"]
     assert any("first pass" in line for line in detail["judging"])
     component = service.get_component(scan_id, "org.example:lib")["component"]
@@ -397,3 +554,37 @@ def test_mcp_on_a_result_from_before_candidates(tmp_path, delivery, world):  # n
         service.get_candidate(scan_id, "CVE-2025-0004")
     assert "candidates" not in service.get_component(scan_id, "org.example:lib")["component"]
     assert render_summary(result).count("candidates") == 0
+
+
+def test_flags_reach_the_files_and_the_mcp_tools(tmp_path, delivery, world, family_world):  # noqa: F811
+    result = online_scan(tmp_path, delivery, world)
+    table, links, summary = nvd.attach(family_world, FAMILY_ITEMS, FAMILY_FINDINGS, {}, {"maven": "osv-maven"}, None,
+                                       FAMILY_LISTINGS)
+    result["candidates"], result["candidate_links"], result["summary"]["candidates"] = table, links, summary
+    out = tmp_path / "out"
+    write_all(result, out)
+    rows = {(r["id"], r["component"].split("/")[-1]): r
+            for r in csv.DictReader((out / "candidates.csv").open(encoding="utf-8-sig"))}
+    assert rows[("CVE-2025-1301", "web-socks@1.0")]["reached by"] == "named in the record"
+    assert rows[("CVE-2025-1301", "web-all@1.0")]["reached by"] == "learned link"
+    assert rows[("CVE-2025-1302", "web-core@1.0")]["same flaw as finding"] == "GHSA-f"
+    assert rows[("CVE-2025-1303", "web-core@1.0")]["names only another language"] == "yes"
+    assert rows[("CVE-2025-1304", "web-core@1.0")]["named classes not in this jar"] == "UrlFileNameViewController"
+    assert rows[("CVE-2025-1304", "web-embed@1.0")]["named classes in this jar"] == "jar contents unknown"
+    assert rows[("CVE-2025-1305", "web-core@1.0")]["learned link (package / product / project)"] == \
+        "3/3 / 3/3 / 3/3; versions meet on 3 of 3"
+    assert ("14 component pairs, flagged for review: same flaw as a finding 2, record names only another language 3, "
+            "named classes not in the jar 1; 2 pairs left out: the record names another module; 3 CPE links refused: "
+            "NVD's versions never meet OSV's") in render_summary(result)
+    service = Service(Config(results=tmp_path / "results", lookup="local"),
+                      net=Net(cache_dir=tmp_path / "c", offline=True, transport=ScriptedTransport({"": never})))
+    scan_id = service.open_result(str(out))["scan_id"]
+    listed = service.list_candidates(scan_id)["candidates"]
+    # A candidate whose every pair is flagged comes last.
+    assert [c["id"] for c in listed] == ["CVE-2025-1301", "CVE-2025-1302", "CVE-2025-1304", "CVE-2025-1305",
+                                         "CVE-2025-1303"]
+    assert listed[-1]["flags"] == ["other_language_only"] and listed[-1]["flagged_components"] == 3
+    detail = service.get_candidate(scan_id, "CVE-2025-1302")
+    assert [(a["component"].split("/")[-1], a["flags"]) for a in detail["affects"]] == [
+        ("web-embed@1.0", []), ("web-all@1.0", []), ("web-core@1.0", ["same_flaw_as_a_finding"])]
+    assert detail["affects"][-1]["same_flaw_as"] == ["GHSA-f"] and len(detail["links"]) == 3

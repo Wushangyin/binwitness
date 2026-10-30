@@ -552,7 +552,8 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None, cand
                                                                             options.workers, warnings, log)
     store = candidates_db or db
     candidates, candidate_links, candidate_summary = nvd.attach(
-        store, items, vulnerabilities, kev_dates, OSV_DATASET, _candidates_unavailable(options, store))
+        store, items, vulnerabilities, kev_dates, OSV_DATASET, _candidates_unavailable(options, store),
+        _Listings(jars))
     if candidate_summary["checked"]:
         log(f"candidates: {candidate_summary['total']} NVD records not attributed to a package, for "
             f"{candidate_summary['components']['with_link']} components with a learned CPE")
@@ -642,6 +643,34 @@ def _candidates_unavailable(options: Options, store) -> str | None:
         return ("candidates come from the local nvd dataset and the OSV dataset of each ecosystem, and the nvd "
                 "dataset is not installed (binwitness db sync nvd vulns)")
     return None
+
+
+class _Listings:
+    """The class entries of the jars at hand, for the classes an NVD record names."""
+
+    def __init__(self, jars: dict):
+        self.jars = jars
+        self._simple: set[str] | None = None
+
+    def _classes(self, sha1: str) -> list[str] | None:
+        listing = entries(self.jars[sha1].facts) if sha1 in self.jars else None
+        return None if listing is None else [name for name in listing if name.endswith(".class")]
+
+    def of(self, item: dict) -> set[str] | None:
+        """The class entries of an item's own jar files. A library shaded into another jar has none: its host
+        holds the classes of every library inside, which tells nothing about this one."""
+        found = None
+        for sha1 in dict.fromkeys(f["sha1"] for f in item["files"]):
+            classes = self._classes(sha1)
+            if classes is not None:
+                found = (found or set()) | set(classes)
+        return found
+
+    def has_class(self, name: str) -> bool:
+        if self._simple is None:
+            self._simple = {part for sha1 in self.jars for entry in self._classes(sha1) or []
+                            for part in entry.rsplit("/", 1)[-1][:-len(".class")].split("$")}
+        return name in self._simple
 
 
 def _own_entries(facts: JarFacts) -> list[tuple[str, int, int]] | None:
