@@ -264,7 +264,14 @@ def crosscheck(result: dict, other: dict[tuple[str, str, str], set[str]], net: N
                         [(n, v) for _, n, v in same_file.get((ecosystem, name, version), [])], group_advisories)
 
     verdicts = map_parallel(run, pending, workers)
-    only_theirs = [{"component": f"{key[1]}@{key[2]}", "id": vuln, "class": verdict, "detail": detail}
+    candidates = result.get("candidates") or {}
+
+    def candidate_cpe(key, vuln):
+        affected = (candidates.get(vuln.upper()) or {}).get("affects", {}).get(purls[key])
+        return affected["cpe"] if affected else None
+
+    only_theirs = [{"component": f"{key[1]}@{key[2]}", "id": vuln, "class": verdict, "detail": detail,
+                    "candidate_cpe": candidate_cpe(key, vuln)}
                    for (key, vuln, _), (verdict, detail) in zip(pending, verdicts)]
 
     ours_versions = {(e, n) for e, n, _ in ours}
@@ -276,6 +283,10 @@ def crosscheck(result: dict, other: dict[tuple[str, str, str], set[str]], net: N
             "only_ours": len(only_ours),
             "only_theirs": len(only_theirs),
             "only_theirs_by_class": dict(Counter(x["class"] for x in only_theirs).most_common()),
+            # Findings this scan also has, as an NVD candidate for the component: leads, not findings.
+            "only_theirs_among_candidates": dict(Counter(x["class"] for x in only_theirs
+                                                         if x["candidate_cpe"]).most_common()),
+            "candidates_checked": bool(((result.get("summary") or {}).get("candidates") or {}).get("checked")),
             "distinct_ids": {"ours": len({x["id"] for x in both + only_ours}),
                              "theirs": len({v for k in common for v in other[k]}),
                              "only_theirs": len({x["id"] for x in only_theirs})},

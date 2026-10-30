@@ -34,6 +34,7 @@ MAX_PAGE = 100
 LOCATIONS_SHOWN = 200
 DETAILS_SHOWN = 4000
 REFERENCES_SHOWN = 20
+DESCRIPTION_BRIEF = 300
 SCAN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
 
 STATEMENT = ("Findings are the advisories OSV attributes to the components that were identified, as of the dates "
@@ -41,6 +42,22 @@ STATEMENT = ("Findings are the advisories OSV attributes to the components that 
              "that it has no flaws. Jars and scripts counted under not_identified are not covered, and first-party "
              "jars are not looked up. There is no reachability analysis: nothing here says whether the application "
              "uses the affected code.")
+CANDIDATE_NOTE = ("Candidates are NVD records that no advisory in the local OSV data attributes to a package. Each "
+                  "reaches a component through a CPE (an NVD product name) learned from the CVEs OSV does attribute "
+                  "to it, and NVD's version range for that CPE. They are leads for manual review: they are not "
+                  "findings, are not counted with them, and a CPE can name a product (a server, a driver for "
+                  "another language) wider than the component. Components without a learned CPE were not checked.")
+CANDIDATE_JUDGING = [
+    "Read the description: does it name this library or a module of it, or another product of the vendor, a "
+    "binding for another language, or software that only bundles it?",
+    "versions is NVD's range for the CPE; conditional means NVD lists the CPE only together with another product "
+    "(a platform), and the record applies only there.",
+    "link shows how the CPE was learned. single_cve means one CVE of the project carries it: a weak link. packages "
+    "above 1 means the CPE stands for several packages, so the record may concern another of them.",
+    "status is NVD's analysis state; disputed means the record says the CVE is disputed.",
+    "Say which way you judged and why, that it is a first pass from the record's text, and that candidates are "
+    "not counted in the findings.",
+]
 PLAN_NOTES = {
     "compatibility": "Each target is the nearest published version outside the package's advisories. Whether the "
                      "application builds and works with it is not checked, and there is no reachability analysis.",
@@ -258,8 +275,10 @@ class Service:
             "worst_findings_total": len(worst_findings(result)),
             "upgrades": upgrades_block if options.get("upgrades") else self._no_upgrades(result),
             "licenses": s["licenses"] if options.get("licenses", True) else "not looked up",
+            "candidates": self._candidate_state(result),
             "warnings": {"total": len(result["warnings"]), "first": result["warnings"][:10]},
-            "next": "list_components (min_severity, text), get_component, get_vulnerability, upgrade_plan",
+            "next": "list_components (min_severity, text), get_component, get_vulnerability, upgrade_plan; "
+                    "list_candidates and get_candidate for the NVD leads",
         }
 
     def list_components(self, scan_id: str, text: str | None = None, min_severity: str | None = None,
@@ -332,6 +351,19 @@ class Service:
                               "meaning": upgrades.VERDICT_TEXT[component["upgrade"]["verdict"]]}
         if family:
             out["upgrade_family"] = {**family, "meaning": PLAN_NOTES["family"]}
+        state = self._candidate_state(result)
+        if state.get("checked"):
+            ref = component["purl"]
+            mine = sorted((c for c in result["candidates"].values() if ref in c["affects"]),
+                          key=lambda c: (_rank(c["severity"]), c["id"]))
+            out["candidates"] = [{"id": c["id"], "severity": c["severity"], "disputed": c["disputed"],
+                                  **{k: c["affects"][ref][k] for k in ("cpe", "versions", "conditional",
+                                                                       "single_cve_link")}} for c in mine]
+            out["candidates_note"] = (
+                "NVD leads, not findings; get_candidate shows one" if mine else
+                "no candidate: " + ("no CPE could be learned for this package, so NVD was not checked"
+                                    if ref not in (result.get("candidate_links") or {}) else
+                                    "NVD has no unattributed record for its CPE at this version"))
         return {"coverage": self._coverage(result, path), "component": out}
 
     def get_vulnerability(self, scan_id: str, vuln_id: str) -> dict:
@@ -341,6 +373,8 @@ class Service:
         key = next((k for k, v in table.items() if wanted in {k.upper(), *map(str.upper, v["aliases"]),
                                                               *map(str.upper, v.get("osv_ids", []))}), None)
         if key is None:
+            if wanted in (result.get("candidates") or {}):
+                raise Refused(f"{vuln_id} is not a finding but an NVD candidate of this scan; get_candidate shows it")
             raise Refused(f"{vuln_id} is not among this scan's findings; list_components or get_component shows "
                           f"the ids found")
         entry = table[key]
@@ -354,6 +388,62 @@ class Service:
         return {"coverage": self._coverage(result, path),
                 "vulnerability": {k: v for k, v in entry.items() if k != "affects"}, "affects": affects,
                 "advisories": [self._advisory(osv_id, packages) for osv_id in entry.get("osv_ids") or [key]]}
+
+    def list_candidates(self, scan_id: str, text: str | None = None, min_severity: str | None = None,
+                        include_disputed: bool = True, offset: int = 0, limit: int = PAGE) -> dict:
+        path, result = self._result(scan_id)
+        state = self._candidate_state(result)
+        if not state.get("checked"):
+            return {"coverage": self._coverage(result, path), "candidates": state, "note": CANDIDATE_NOTE}
+        threshold, wanted = _threshold(min_severity), (text or "").lower()
+        chosen = []
+        for c in sorted(result["candidates"].values(), key=lambda c: (_rank(c["severity"]), c["id"])):
+            if (c["disputed"] and not include_disputed) or (min_severity and _rank(c["severity"]) > threshold):
+                continue
+            refs = [ref for ref, a in c["affects"].items()
+                    if wanted in ref.lower() or wanted in a["cpe"].lower()]
+            if refs:
+                chosen.append((c, refs))
+        shown, paging = _page(chosen, offset, limit)
+        listed = []
+        for c, refs in shown:
+            affects = [c["affects"][ref] for ref in refs]
+            description = c["description"]
+            listed.append({
+                "id": c["id"], "severity": c["severity"], "cvss_score": c["cvss_score"], "status": c["status"],
+                "disputed": c["disputed"], "known_exploited_since": c["kev_date_added"],
+                "published": (c["published"] or "")[:10], "cpes": sorted({a["cpe"] for a in affects}),
+                "components": refs[:5], "other_components": len(refs) - 5 if len(refs) > 5 else 0,
+                "only_single_cve_links": all(a["single_cve_link"] for a in affects),
+                "description": description if len(description) <= DESCRIPTION_BRIEF
+                else description[:DESCRIPTION_BRIEF].rsplit(" ", 1)[0] + " ..."})
+        return {"coverage": self._coverage(result, path), "note": CANDIDATE_NOTE, **paging, "candidates": listed,
+                "next": "get_candidate gives the record, the CPE range and how the CPE was learned"}
+
+    def get_candidate(self, scan_id: str, cve_id: str) -> dict:
+        path, result = self._result(scan_id)
+        state = self._candidate_state(result)
+        if not state.get("checked"):
+            raise Refused(f"candidates were not looked for in this scan: {state['not_checked']}")
+        wanted = cve_id.strip().upper()
+        entry = result["candidates"].get(wanted)
+        if entry is None:
+            table = result["vulnerabilities"]
+            if any(wanted in {k.upper(), *map(str.upper, v["aliases"])} for k, v in table.items()):
+                raise Refused(f"{cve_id} is a finding of this scan, not a candidate; get_vulnerability shows it")
+            raise Refused(f"{cve_id} is not among this scan's candidates; list_candidates shows them")
+        links = result.get("candidate_links") or {}
+        named = {c["purl"]: c for c in result["components"]}
+        affects = []
+        for ref, a in entry["affects"].items():
+            link = (links.get(ref) or {}).get(a["cpe"]) or {}
+            component = named.get(ref) or {}
+            affects.append({"component": ref, "scope": component.get("scope"),
+                            "findings_of_the_component": len(component.get("vulnerabilities") or []),
+                            **a, "link": {**link, "meaning": self._link_meaning(component, link)} if link else None})
+        return {"coverage": self._coverage(result, path), "note": CANDIDATE_NOTE,
+                "candidate": {k: v for k, v in entry.items() if k != "affects"}, "affects": affects,
+                "judging": CANDIDATE_JUDGING, "data_as_of": state.get("data_as_of")}
 
     def upgrade_plan(self, scan_id: str, min_severity: str | None = None, offset: int = 0,
                      limit: int = PAGE) -> dict:
@@ -580,6 +670,7 @@ class Service:
             # Ecosystems binwitness does not read, by the dependency files found: their dependencies are absent.
             "not_covered": {k: len(v) for k, v in (result.get("not_covered") or {}).items()},
             "turned_off": off,
+            "candidates": self._candidate_brief(result),
             "statement": STATEMENT,
             "lookup": options.get("lookup"),
             "data_sources": result.get("data_sources"),
@@ -588,6 +679,37 @@ class Service:
             "scan_finished": result.get("finished"),
             "result": str(path),
         }
+
+    @classmethod
+    def _candidate_brief(cls, result: dict) -> str:
+        state = cls._candidate_state(result)
+        if not state["checked"]:
+            return f"not checked: {state['not_checked']}"
+        counts = state["components"]
+        return (f"{state['total']} NVD candidates (leads, not findings; list_candidates), looked for in "
+                f"{counts['with_link']} components; {counts['without_link'] + counts['not_checked']} not checked")
+
+    @staticmethod
+    def _candidate_state(result: dict) -> dict:
+        summary = (result.get("summary") or {}).get("candidates")
+        if summary is None:
+            return {"checked": False, "not_checked": f"this result was made by binwitness "
+                                                     f"{result['tool']['version']}, before candidates existed; "
+                                                     f"scan again for them"}
+        if not summary.get("checked"):
+            return {"checked": False, "not_checked": summary.get("not_checked")}
+        keep = ("total", "pairs", "by_severity", "disputed", "known_exploited", "only_from_single_cve_links",
+                "components", "components_not_checked_because", "nvd_records_without_cpe", "data_as_of")
+        return {"checked": True, **{k: summary.get(k) for k in keep}}
+
+    @staticmethod
+    def _link_meaning(component: dict, link: dict) -> str:
+        name = component.get("name", "the package")
+        return (f"{link['shared']} of the {link['package_cves']} CVEs OSV attributes to {name} that NVD gives a CPE "
+                f"carry {link['cpe']}; of that CPE's CVEs OSV attributes to any package, {link['product_same_project']}"
+                f" of {link['product_attributed']} are of the same project; {link['project_shared']} of the "
+                f"project's {link['project_cves']} such CVEs carry it; {link['packages']} package"
+                f"{'' if link['packages'] == 1 else 's'} linked with it")
 
     @staticmethod
     def _no_upgrades(result: dict) -> str:
@@ -705,7 +827,8 @@ front-end builds) with the evidence for each, and reports the advisories OSV rec
 
 Typical use: start_scan, then scan_status until finished, then overview; drill down with list_components, \
 get_component and get_vulnerability; upgrade_plan says which published version leaves each finding behind. \
-open_result reads a binwitness.json made earlier on the command line.
+list_candidates and get_candidate show NVD records no advisory attributes to a package, matched to components \
+through a learned CPE. open_result reads a binwitness.json made earlier on the command line.
 
 When reporting to the user:
 - Lead with coverage: name what was not identified or not checked. A component without findings has no \
@@ -713,6 +836,8 @@ advisory in the data used, as of its date; do not present that as proof of absen
 - There is no reachability analysis: a finding means the version is affected, not that the application \
 uses the affected code.
 - An upgrade target's compatibility with the application is not checked; say so when recommending it.
+- Candidates are leads, not findings: keep them out of finding counts, and when you judge one, say it is a \
+first pass from the NVD record and why (get_candidate lists what to check).
 """
 
 
@@ -845,6 +970,29 @@ def build_server(service: Service):
     async def get_vulnerability(scan_id: ScanId,
                                 vuln_id: Annotated[str, Field(description="CVE, GHSA or OSV id")]) -> dict[str, Any]:
         return await call(service.get_vulnerability, scan_id, vuln_id)
+
+    @server.tool(title="NVD candidates", structured_output=True, annotations=reading,
+                 description="NVD records that no advisory in the local OSV data attributes to a package, matched to "
+                             "components through a CPE learned from the CVEs OSV does attribute to them: leads for "
+                             "manual review, not findings. Worst first. Sends nothing.")
+    async def list_candidates(scan_id: ScanId,
+                              text: Annotated[str | None, Field(description="part of a component's purl or of the "
+                                                                            "CPE (vendor:product)")] = None,
+                              min_severity: Annotated[Literal["critical", "high", "medium", "low"] | None,
+                                                      Field(description="only candidates at or above this NVD "
+                                                                        "severity")] = None,
+                              include_disputed: Annotated[bool, Field(description="include records NVD marks "
+                                                                                  "disputed")] = True,
+                              offset: Offset = 0, limit: Limit = PAGE) -> dict[str, Any]:
+        return await call(service.list_candidates, scan_id, text, min_severity, include_disputed, offset, limit)
+
+    @server.tool(title="Candidate details", structured_output=True, annotations=reading,
+                 description="One NVD candidate: the record as stored at the last sync (status, description, CVSS, "
+                             "CWE, references), the components it reaches with NVD's version range, how each CPE was "
+                             "learned, and what to check before taking it as a finding. Sends nothing.")
+    async def get_candidate(scan_id: ScanId,
+                            cve_id: Annotated[str, Field(description="CVE id of the candidate")]) -> dict[str, Any]:
+        return await call(service.get_candidate, scan_id, cve_id)
 
     @server.tool(title="Upgrade plan", structured_output=True, annotations=reading,
                  description="What to change, worst first: remove malicious packages, upgrade to the nearest "

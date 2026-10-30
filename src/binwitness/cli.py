@@ -285,7 +285,9 @@ def _main(argv: list[str] | None) -> int:
                           lookup="local" if args.offline and args.lookup == "auto" else args.lookup)
         local = args.offline or args.lookup == "local"
         db = None if args.lookup == "online" else LocalDb.open(args.db_dir)
-        result = scan(args.inputs, _net(args, offline=local), options, db=db)
+        # Candidates exist only locally; an online scan takes them from the datasets that are installed.
+        result = scan(args.inputs, _net(args, offline=local), options, db=db,
+                      candidates_db=LocalDb.open(args.db_dir) if args.lookup == "online" else None)
         for path in write_all(result, args.out):
             print(f"wrote {path}", file=sys.stderr)
         print(render_summary(result))
@@ -311,8 +313,12 @@ def _main(argv: list[str] | None) -> int:
     print(f"components identified at the same version by both: {s['components_in_both']}")
     print(f"findings in both {s['findings_in_both']}, only binwitness {s['only_ours']}, "
           f"only the other tool {s['only_theirs']}")
+    among = s["only_theirs_among_candidates"]
     for name, count in s["only_theirs_by_class"].items():
-        print(f"  {count:5d}  {name}: {CLASSES[name]}")
+        print(f"  {count:5d}  {name}: {CLASSES[name]}"
+              + (f" ({among[name]} of them NVD candidates of this scan)" if among.get(name) else ""))
+    if s["only_theirs"] and not s["candidates_checked"]:
+        print("  (NVD candidates were not looked for in this scan)")
     if not s["github_token"]:
         print("note: no GitHub token (GITHUB_TOKEN or `gh auth login`); unauthenticated API allows 60 lookups/hour",
               file=sys.stderr)

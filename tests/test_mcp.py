@@ -20,7 +20,8 @@ from test_scan import delivery, routes, run  # noqa: F401 (delivery is a fixture
 # Our own wording must never vouch for a component; advisory texts quoted from OSV are not ours.
 FORBIDDEN = re.compile(r"\b(safe|safely|clean|secure)\b|no (known )?vulnerabilit", re.I)
 TOOLS = {"start_scan", "scan_status", "open_result", "list_scans", "overview", "list_components",
-         "list_unidentified", "get_component", "get_vulnerability", "upgrade_plan", "crosscheck"}
+         "list_unidentified", "get_component", "get_vulnerability", "upgrade_plan", "crosscheck", "list_candidates",
+         "get_candidate"}
 
 
 @pytest.fixture

@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from binwitness import __version__, maven, staticjs, upgrades, vulns
+from binwitness import __version__, maven, nvd, staticjs, upgrades, vulns
 from binwitness.archive import Walker
 from binwitness.jar import (JarFacts, entries, file_digests, jar_facts, name_hints, representative_class,
                            split_name, version_hints)
@@ -121,8 +121,10 @@ class _Components:
         return item
 
 
-def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None) -> dict:
-    """``db``: a :class:`binwitness.localdb.LocalDb`; installed datasets answer before the network."""
+def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None, candidates_db=None) -> dict:
+    """``db``: a :class:`binwitness.localdb.LocalDb`; installed datasets answer before the network.
+    ``candidates_db``: the store NVD candidates come from when it is not ``db`` (an online scan, whose
+    findings come from the online services, can still have its candidates from local datasets)."""
     log = log or (lambda message: print(message, file=sys.stderr, flush=True))
     started = datetime.now(timezone.utc)
     walker = Walker(scan_js=options.scan_js, exclude=options.exclude, unpacker=options.unpacker)
@@ -548,6 +550,12 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None) -> d
     if options.vulnerabilities:
         vulnerabilities, kev_dates, kev_available = _attach_vulnerabilities(net, db, items, also_published,
                                                                             options.workers, warnings, log)
+    store = candidates_db or db
+    candidates, candidate_links, candidate_summary = nvd.attach(
+        store, items, vulnerabilities, kev_dates, OSV_DATASET, _candidates_unavailable(options, store))
+    if candidate_summary["checked"]:
+        log(f"candidates: {candidate_summary['total']} NVD records not attributed to a package, for "
+            f"{candidate_summary['components']['with_link']} components with a learned CPE")
     upgrades_not_checked = 0
     families: list[dict] = []
     if options.vulnerabilities and options.upgrades:
@@ -595,10 +603,13 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None) -> d
         "not_covered": {ecosystem: sorted(found_at) for ecosystem, found_at in sorted(walker.not_covered.items())},
         "skipped_build_caches": walker.skipped_caches,
         "vulnerabilities": dict(sorted(vulnerabilities.items())),
+        "candidates": candidates,
+        "candidate_links": candidate_links,
         "upgrade_families": families,
         "warnings": warnings + ([f"offline: {net.offline_misses} lookups were not in the cache ("
                                  + ", ".join(f"{host} {n}" for host, n in net.offline_missed_hosts.most_common())
-                                 + ")"] if net.offline_misses else []) + (db.stale() if db else []),
+                                 + ")"] if net.offline_misses else []) + (db.stale() if db else [])
+                    + (store.stale() if store is not None and store is not db else []),
     }
     result["summary"] = summarize(result, len(jars), walker.skipped_runtime_jars, kev_dates,
                                   resources_of_third_party)
@@ -620,7 +631,17 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None) -> d
         "upgrade_versions_not_checked": upgrades_not_checked,
     }
     result["summary"]["incomplete"] = {k: v for k, v in incomplete.items() if v}
+    result["summary"]["candidates"] = candidate_summary
     return result
+
+
+def _candidates_unavailable(options: Options, store) -> str | None:
+    if not options.vulnerabilities:
+        return "the vulnerability lookup was turned off (--no-vulns)"
+    if store is None or not store.has("nvd"):
+        return ("candidates come from the local nvd dataset and the OSV dataset of each ecosystem, and the nvd "
+                "dataset is not installed (binwitness db sync nvd vulns)")
+    return None
 
 
 def _own_entries(facts: JarFacts) -> list[tuple[str, int, int]] | None:

@@ -21,11 +21,12 @@ _SCOPE = {"runtime": "required", "dev": "excluded"}
 def write_all(result: dict, out_dir: Path) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     paths = [out_dir / "binwitness.json", out_dir / "sbom.cdx.json", out_dir / "components.csv",
-             out_dir / "vulnerabilities.csv"]
+             out_dir / "vulnerabilities.csv", out_dir / "candidates.csv"]
     paths[0].write_text(json.dumps(result, ensure_ascii=False, indent=1), "utf-8")
     paths[1].write_text(json.dumps(cyclonedx(result), ensure_ascii=False, indent=1), "utf-8")
     components_csv(result, paths[2])
     vulnerabilities_csv(result, paths[3])
+    candidates_csv(result, paths[4])
     return paths
 
 
@@ -219,6 +220,46 @@ def vulnerabilities_csv(result: dict, path: Path):
                              v["published"], affects, v["summary"]])
 
 
+CANDIDATE_COLUMNS = ["id", "severity", "cvss score", "cvss vector", "cvss source", "nvd status", "disputed",
+                     "known exploited (CISA KEV)", "published", "component", "cpe", "affected versions (NVD)",
+                     "only together with another product", "learned link (package / product / project)",
+                     "link learned from", "link rests on one CVE", "packages linked with this cpe", "cwe", "description", "url",
+                     "data as of"]
+
+
+def candidates_csv(result: dict, path: Path):
+    """One row per candidate and component. Written also when candidates were not looked for, with that
+    said in it: an empty table would read as "none found"."""
+    summary = (result.get("summary") or {}).get("candidates") or {}
+    links = result.get("candidate_links") or {}
+    dates = "; ".join(f"{name} {stamp[:10]}" for name, stamp in (summary.get("data_as_of") or {}).items() if stamp)
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(CANDIDATE_COLUMNS)
+        if not summary.get("checked"):
+            writer.writerow(["not checked", *[""] * 17, summary.get("not_checked") or "candidates were not looked for",
+                             "", dates])
+            return
+        rows = []
+        for c in (result.get("candidates") or {}).values():
+            for ref, a in c["affects"].items():
+                link = (links.get(ref) or {}).get(a["cpe"]) or {}
+                rows.append([c["id"], c["severity"], c["cvss_score"], c["cvss_vector"], c["cvss_source"], c["status"],
+                             "yes" if c["disputed"] else "", c["kev_date_added"] or "", (c["published"] or "")[:10],
+                             ref, a["cpe"], a["versions"], "yes" if a["conditional"] else "", _link_text(link),
+                             " ".join(link.get("learned_from") or []), "yes" if a["single_cve_link"] else "", link.get("packages", ""), " ".join(c["cwe"]),
+                             c["description"], c["url"], dates])
+        rows.sort(key=lambda r: (SEVERITIES.index(r[1]), r[0], r[9]))
+        writer.writerows(rows)
+
+
+def _link_text(link: dict) -> str:
+    if not link:
+        return ""
+    return (f"{link['shared']}/{link['package_cves']} / {link['product_same_project']}/{link['product_attributed']}"
+            f" / {link['project_shared']}/{link['project_cves']}")
+
+
 def render_summary(result: dict) -> str:
     s, options = result["summary"], result["options"]
     c, j, v = s["components"], s["jars"], s["vulnerabilities"]
@@ -262,6 +303,7 @@ def render_summary(result: dict) -> str:
                             "that is not published" if unpublished else "")
                          + (f"; {together} release famil{'y' if together == 1 else 'ies'} (artifacts of one group "
                             "and version) with one target each" if together else ""))
+        lines += _candidate_lines(s.get("candidates"))
     if not options.get("licenses", True):
         lines.append("licenses     not looked up (--no-licenses)")
     elif c["total"]:
@@ -281,6 +323,29 @@ def render_summary(result: dict) -> str:
     if result["warnings"]:
         lines.append(f"warnings     {len(result['warnings'])} (see binwitness.json)")
     return "\n".join(lines)
+
+
+def _candidate_lines(summary: dict | None) -> list[str]:
+    if summary is None:  # a result from before 0.4.0
+        return []
+    if not summary.get("checked"):
+        return [f"candidates   not checked: {summary.get('not_checked')}"]
+    counts = summary["components"]
+    dates = ", ".join(f"{name} of {stamp[:10]}" for name, stamp in summary.get("data_as_of", {}).items() if stamp)
+    lines = [f"candidates   {summary['total']} NVD records not attributed to a package in the local OSV data, not "
+             "counted above; leads for manual review" + (": " + _listing(
+                 [(k.lower(), n) for k, n in summary["by_severity"].items()]
+                 + [("disputed", summary["disputed"]), ("known exploited", summary["known_exploited"]),
+                    ("only from links that rest on one CVE", summary["only_from_single_cve_links"])])
+                 if summary["total"] else "") + " (candidates.csv)",
+             f"             looked for in {counts['with_link']} components whose CPE could be learned; "
+             f"{counts['without_link']} without one were not checked"
+             + (f", nor {counts['not_checked']} more: " + "; ".join(summary.get("components_not_checked_because", {}))
+                if counts["not_checked"] else "")
+             + (f"; NVD has given no CPE yet to {sum(summary['nvd_records_without_cpe'].values()):,} records"
+                if summary.get("nvd_records_without_cpe") else "")
+             + (f" (local {dates})" if dates else "")]
+    return lines
 
 
 INCOMPLETE = {

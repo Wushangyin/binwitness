@@ -2,13 +2,14 @@
 
 [English](README.md) · **简体中文**
 
-面向**实际交付物**的软件成分分析：jar、war、`docker save` 镜像、zip 包和前端构建产物，不论嵌套多少层都会逐层拆开。结果中的每个组件都附带识别它的证据，报告的每一行都经得起追问。对每个有漏洞的组件，它会指出离开该包全部公告的最近已发布版本。binwitness 还能用公开漏洞数据逐条核对其他扫描工具的结论，并为每一处分歧归类；[MCP 服务](#mcp-服务)让 AI 助手可以发起扫描、阅读结果。
+面向**实际交付物**的软件成分分析：jar、war、`docker save` 镜像、zip 包和前端构建产物，不论嵌套多少层都会逐层拆开。结果中的每个组件都附带识别它的证据，报告的每一行都经得起追问。对每个有漏洞的组件，它会指出离开该包全部公告的最近已发布版本。没有任何公告归到具体包名下的 CVE 单独列出，作为待复核的[候选](#nvd-候选)。binwitness 还能用公开漏洞数据逐条核对其他扫描工具的结论，并为每一处分歧归类；[MCP 服务](#mcp-服务)让 AI 助手可以发起扫描、阅读结果。
 
 ```
 $ binwitness scan release.zip -o out
 walked 1 input(s): 5 distinct jars, 0 npm package entries, 0 distinct scripts
 identified jars: 5 of 5
 vulnerabilities: 133 distinct across 22 components
+candidates: 2 NVD records not attributed to a package, for 22 components with a learned CPE
 upgrade advice: upgrade 22
 components   34  (maven 34; exact 5, declared 29)
 jars         5 distinct: third-party 5
@@ -23,12 +24,14 @@ vulns        133 distinct: critical 12, high 73, medium 46, low 2, known exploit
   critical CVE-2020-8840        com.fasterxml.jackson.core:jackson-databind 2.9.10, upgrade to 2.18.11
   critical CVE-2020-9546        com.fasterxml.jackson.core:jackson-databind 2.9.10, upgrade to 2.18.11
   critical CVE-2020-9547        com.fasterxml.jackson.core:jackson-databind 2.9.10, upgrade to 2.18.11
-  ... 75 more (vulnerabilities.csv)
+  ... 75 more, and medium 46, low 2 not listed here (vulnerabilities.csv)
 upgrades     upgrade on the same line 22; 2 advisories name a fixed version that is not published
+candidates   2 NVD records not attributed to a package in the local OSV data, not counted above; leads for manual review: high 1, medium 1, disputed 1 (candidates.csv)
+             looked for in 22 components whose CPE could be learned; 12 without one were not checked; NVD has given no CPE yet to 74,887 records (local nvd of 2026-10-29, osv-maven of 2026-10-28, osv-npm of 2026-10-29)
 licenses     permissive 34
 ```
 
-示例中的 `release.zip` 装有从 Maven Central 下载的五个 jar：log4j-core 2.14.1、jackson-databind 2.9.10、commons-collections 3.2.1、mybatis 3.4.6 和 netty-all 4.1.54.Final。扫描从中识别出 34 个组件：netty-all 内含的 27 个模块，以及 shade 进 mybatis 的 ognl 和 javassist。`netty-all` 本身名下没有任何漏洞公告，它的模块名下有 71 条。摘要先列最严重的发现（恶意包、已知被利用、严重、高危），全部发现见 `vulnerabilities.csv`。每条都附上离开该包全部公告的最近已发布版本：jackson-databind 给的是 2.18.11，而不是修复其第一条发现的 2.9.10.1，因为此后几十条公告同样覆盖 2.9.10.1（见[升级建议](#升级建议)）。（数字基于 2026 年 10 月的数据，会随新公告的发布而增长。）
+示例中的 `release.zip` 装有从 Maven Central 下载的五个 jar：log4j-core 2.14.1、jackson-databind 2.9.10、commons-collections 3.2.1、mybatis 3.4.6 和 netty-all 4.1.54.Final。扫描从中识别出 34 个组件：netty-all 内含的 27 个模块，以及 shade 进 mybatis 的 ognl 和 javassist。`netty-all` 本身名下没有任何漏洞公告，它的模块名下有 71 条。摘要先列最严重的发现（恶意包、已知被利用、严重、高危），全部发现见 `vulnerabilities.csv`。每条都附上离开该包全部公告的最近已发布版本：jackson-databind 给的是 2.18.11，而不是修复其第一条发现的 2.9.10.1，因为此后几十条公告同样覆盖 2.9.10.1（见[升级建议](#升级建议)）。两条候选是没有任何公告归到具体包名下的 NVD 记录；它们需要本地的 `nvd` 数据集，没装时摘要会写明候选未检查（见 [NVD 候选](#nvd-候选)）。（数字基于 2026 年 10 月的数据，会随新公告的发布而增长。）
 
 ## 为什么还要一个 SCA 工具
 
@@ -38,6 +41,7 @@ Trivy、Syft/Grype 和 OSV-Scanner 在识别 jar、报告漏洞方面都做得�
 - **区分重新打包与被修改**。fat jar 构建常把依赖重新压缩：删掉目录条目、改写 manifest、时间戳也变了。文件哈希因此对不上，但代码并没有变。binwitness 读取已发布 jar 的中央目录（用 Range 请求只取文件末尾几 KB），逐条比较每个条目的 CRC-32 和大小。只有 manifest、jar 索引、签名或 `META-INF/maven` 下的 Maven 构建元数据不同的，判为 `repackaged`；类或资源文件不同的，判为 `differs`，并列出改动、新增和缺少的条目。打在另一个 jar 里、而外层 jar 与其发布件完全相同的，判为 `inside-published`：那是上游自己放进去的。
 - **拆开捆绑在一起的代码**。fat jar（`BOOT-INF/lib`、`WEB-INF/lib`）、shade 过的 jar（内嵌 `pom.properties`）以及 `netty-all` 这类合集构件，都会展开成各自的模块。漏洞公告登记在模块名下，只按 `netty-all` 自己的名字查会全部漏掉。
 - **能核对其他扫描工具的结论**。`binwitness crosscheck` 读入另一个工具的结果，对其中 binwitness 没有复现的每条发现，到 GitHub 已审核的漏洞库里查原始公告，再归入以下一类：确属漏报、属于同一项目的另一个模块、属于另一个包、版本不在受影响范围内、上游登记时未指明任何包。按产品名（CPE）匹配的工具会把一条公告挂到同一产品的所有模块上，这个命令能看出一份报告里有多少是这类噪声。
+- **未归属的 CVE 是线索，不是发现**。有些 CVE 始终没有归到任何包名下：GitHub 没审核，或者根本没有记录，NVD 只按产品（CPE）描述它们。binwitness 从 OSV 已归属到某个包的那些 CVE 学出哪个 CPE 代表这个包，从不按名称猜，再把 NVD 中该 CPE 的其他记录列为[候选](#nvd-候选)。候选与发现分开，不计入发现及其计数。
 - **升级目标经过核实，不照抄公告**。公告里的「修复版本」只是某一个缺陷的首个修复。binwitness 读取该包的全部公告和实际发布过的版本，给出离开所有公告的最近版本。公告写了、但从未发布的修复版本会如实列出，从不作为建议。
 - **结果注明数据时效**。每个响应都连同获取时间一起缓存，结果中记录每个数据源用到的最旧和最新数据。`--offline` 可以在不联网的机器上用缓存重放一次扫描。
 - **联网、本地，或两者结合**。漏洞库和 Maven Central 的哈希索引可以保存在本地并增量更新，这样识别 jar、匹配漏洞时不必向外发送任何内容。保留多少由你决定，见[本地数据集](#本地数据集)。
@@ -109,12 +113,34 @@ binwitness scan INPUT... -o OUTDIR [options]
 | `binwitness.json` | 全部信息：组件及其证据、位置、文件哈希、与发布件的比对、同一文件的其他坐标、许可证、漏洞、升级建议；自有文件和未识别文件；警告；各数据源及获取时间 |
 | `sbom.cdx.json` | CycloneDX 1.5 SBOM，含漏洞、识别证据和出现位置。同一组件出现在几个不同文件里的，每个文件一条，各带哈希；自有 jar 和未识别 jar 作为 `file` 组件列出，带哈希。有 SPDX 编号的许可证写在 `license.id` 中。`metadata.component` 描述被扫描的对象 |
 | `components.csv`、`vulnerabilities.csv` | 同样的内容，表格形式，UTF-8 带字节顺序标记，Excel 打开非 ASCII 路径不会乱码。`components.csv` 的最后两列是升级建议和发布族；发布族成员的升级建议写族的目标，自己单独升级的目标放在括号里 |
+| `candidates.csv` | [NVD 候选](#nvd-候选)，每条记录、每个组件一行。没有查候选时，只有一行写明原因 |
 
 查询失败时（服务宕机，或 `--offline` 时缓存里没有），摘要中会有一行 `INCOMPLETE` 说明哪些没查，`binwitness.json` 的 `summary.incomplete` 给出计数，没查漏洞的组件标有 `vulnerabilities_checked: false`。这些组件漏洞为零的意思是「没查」，不是「没有」。
 
 严重等级优先取公告自己给出的等级（GitHub 的评级），没有时按 CVSS v3 向量计算。来自 OpenSSF 恶意包数据源的记录按严重（critical）计。发现按 CVE 合并，同一漏洞的 GHSA 与 CVE 只计一次。每条发现都列出各组件的修复版本；已列入 CISA 已知被利用漏洞目录（KEV）的，注明列入日期。
 
 许可证优先从构件本身取：内嵌的 `pom.xml`、`Bundle-License` 头或 LICENSE 文件。LICENSE 会完整读取，以免漏看附在 GPL 正文之后的例外条款。构件本身没有时，依次查 deps.dev 和已发布的 POM（包括其父 POM）。许可证分为以下几类：`permissive`、`weak-copyleft`、`copyleft-with-exception`、`strong-copyleft`、`source-available`、`unknown`。许可证名称写成 SPDX 编号，并带上原文写明的版本（`The Apache Software License, Version 2.0` 写作 `Apache-2.0`，`New BSD License` 写作 `BSD-3-Clause`）。原文没说明版本或变体的，例如单写一个 `BSD`，保持原样。GPL 原文既没写「only」也没写「or later」的，沿用 SPDX 的旧编号（`GPL-2.0`、`GPL-2.0-with-classpath-exception`），不替原文多说什么。
+
+### NVD 候选
+
+发现是指名到组件所属包的公告。有些 CVE 始终没有这样的公告：GitHub 没审核，或者根本没有记录，NVD 只按产品描述它，即一个 CPE（`vendor:product`）加一个版本范围。当 OSV 归到某个包名下的 CVE 显示出某个 CPE 时，binwitness 就把这个包与该 CPE 关联起来，再把 NVD 中该 CPE 覆盖组件版本的其他记录列为候选。开头的示例里，34 个组件中有 22 个学到了 CPE，出来两条记录：
+
+- CVE-2023-35116，在 jackson-databind 2.9.10 上，经由 CPE `fasterxml:jackson-databind`。该包带 CPE 的 77 个 CVE 全部带有它。NVD 把这条记录标为有争议：厂商不承认它是漏洞。
+- CVE-2026-62380，经由 `netty:netty`（NVD 给 netty 所有模块用的同一个 CPE），落在 netty-all 及其 16 个模块上。记录正文点名的是 `netty-codec-socks`，netty-all 里同样打包了这个模块。但它自己没有任何 CVE 可以用来学 CPE，所以属于那 12 个没检查的组件。
+
+一个 CPE 要同时满足以下几条才与包关联：
+
+1. 在该包带 CPE 的 CVE 中至少占 30%，且数量至少是该包最常见 CPE 的一半（同一产品可能有好几个名字）；
+2. 在 OSV 归到任意包名下的该 CPE 的 CVE 中，至少一半属于该包所在的项目（Maven 的 groupId，或 npm 的 scope）：捆绑了多个库的产品会收集许多项目的 CVE；
+3. 在该项目带 CPE 的 CVE 中至少占四分之一。
+
+从不比较名称。没有这类历史的包不出候选，摘要把它计为未检查。只从一个 CVE 学到的关联标为「只依据一个 CVE」，是最弱的一种。
+
+以下记录不列入：NVD 已驳回（Rejected）的；任何一个已安装的 OSV 数据集把该 CVE 归到某个包名下的（含已撤回的公告）；本次扫描已经报告的，不论用的是它自己的编号还是别名；CPE 属于其他语言运行时的（Maven 包上的 `target_sw` 为 `node.js` 之类）。NVD 标为有争议的记录保留并标出。NVD 只在与另一产品（平台）同时出现时才列出的 CPE，标为有条件。
+
+候选是供人工复核的线索。CPE 指的是产品，产品可能比组件宽：一个 CPE 可能代表一个框架的所有模块（如上面的 netty），也可能代表某厂商多种语言的驱动。候选不计入发现，不参与 `--fail-on`，也不写进 `sbom.cdx.json` 和 `vulnerabilities.csv`。它们写在 `binwitness.json`（`candidates`，每条关联的依据在 `candidate_links`）和 `candidates.csv` 中。`candidates.csv` 的「学到的关联」列形如 `3/6 / 3/4 / 3/6`：该包带此 CPE 的 CVE 数 / 带任意 CPE 的 CVE 数，该 CPE 已归属 CVE 中同一项目的数量 / 已归属 CVE 总数，以及按整个项目算的第一组数。下一列列出学到这条关联所依据的 CVE。
+
+不论哪种查询方式，候选都只来自本地副本：`nvd` 数据集和各生态的 OSV 数据集（`binwitness db sync nvd vulns`）。联网扫描的发现来自在线服务，候选仍来自这些副本。副本的日期写在摘要里，也写在 `candidates.csv` 的每一行。没有这些副本时，摘要写明候选未检查，从不说没有候选。NVD 尚在等待分析的记录还没有 CPE，摘要按状态给出其数量。
 
 ### 升级建议
 
@@ -160,10 +186,13 @@ binwitness db remove osv-npm
 | `osv-npm` | npm 包的 OSV 漏洞公告，含恶意包报告 | 下载 210 MB，占用 250 MB |
 | `kev` | CISA 已知被利用漏洞目录 | 2 MB |
 | `maven-hashes` | Maven Central 上每个 jar 的 SHA-1（以 [Trivy java-db](https://github.com/aquasecurity/trivy-java-db) 打底，再加上中央仓自身索引的新增部分） | 下载 1 GB，占用 1.5 GB；之后每一两周 10-50 MB |
+| `nvd` | 指名了应用（CPE）的 NVD CVE 记录，用于[候选](#nvd-候选) | 下载 235 MB，占用 225 MB；之后每天 15 MB |
 
-分组：`vulns`（两个 OSV 数据集和 `kev`）、`java`（`osv-maven`、`kev`、`maven-hashes`）、`all`。数据集保存在 `~/.cache/binwitness/datasets`（可用 `--db-dir` 或 `$BINWITNESS_DB` 指定）。
+分组：`vulns`（两个 OSV 数据集和 `kev`）、`java`（`osv-maven`、`kev`、`maven-hashes`）、`all`（以上全部再加 `nvd`）。数据集保存在 `~/.cache/binwitness/datasets`（可用 `--db-dir` 或 `$BINWITNESS_DB` 指定）。
 
 发布方允许的地方都做增量更新。OSV 维护一份按修改时间排列的记录清单，所以每次更新只取上次以来改动过的记录。改动超过 5,000 条，或距上次完整下载已满一个月时，改为重新下载整个压缩包，这样也会去掉上游已删除的记录。KEV 目录很小，每次整份获取。
+
+NVD 每年发布一份数据，另有一份最近八天改动过的记录。第一次同步读取每一年的数据；之后只要副本不超过七天，就只读改动记录，其摘要没变时连它也跳过。更旧的副本从各年的数据重新建。每份数据都用 NVD 在旁边公布的 SHA-256 校验。
 
 哈希索引以 Trivy 的 java-db 打底，它每天整体重建为一个 1 GB 的文件，没有增量形式。此后每次同步只应用 Maven Central 每一两周在自己的索引中发布的新增部分（每份 10-50 MB，中央仓会保留几个月的），这样不必重下 1 GB 也能保持最新。底库本身每 180 天重新下载一次（`--hashes-every DAYS`），或在指定 `--full` 时重下。如果中央仓重置了索引，或者本地副本比中央仓仍保留的新增部分还旧，同步会停下来提示使用 `--full`，不会自行开始 1 GB 的下载。
 
@@ -185,7 +214,7 @@ Maven Central 限制单个地址能下载的索引量。所以同步最多每周
 
 结果中记录了哪些数据集参与回答以及它们的时效（`data_sources.local`）。数据集超过七天未同步会产生警告。
 
-每个数据集都由你的机器直接从发布方下载，并遵守发布方的条款：OSV 来自 Google 的公共存储桶（每条记录带有其来源数据库的许可证），哈希索引来自 Aqua Security 在 ghcr.io 上的 `trivy-java-db` 镜像和 Maven Central 的索引，KEV 目录来自 CISA。
+每个数据集都由你的机器直接从发布方下载，并遵守发布方的条款：OSV 来自 Google 的公共存储桶（每条记录带有其来源数据库的许可证），哈希索引来自 Aqua Security 在 ghcr.io 上的 `trivy-java-db` 镜像和 Maven Central 的索引，KEV 目录来自 CISA，CVE 记录来自 NVD 的数据源。binwitness 使用 NVD 的数据，但未经 NVD 认可或认证。
 
 ## 核对其他扫描工具的结果
 
@@ -208,6 +237,8 @@ binwitness crosscheck out/binwitness.json other-tool.csv -o crosscheck.json
 | `no-github-record` / `tool-specific-id` | 没有可供核对的公开记录 |
 
 GitHub 按 CVE 搜索只能找到带有该 CVE 编号的公告，而项目自己发的公告有时只把它列为相关（netty 针对 HTTP/2 Rapid Reset 的公告，CVE-2023-44487）。所以对 GitHub 没有归到该组件名下的 Maven 发现，binwitness 还会读取该组件 groupId 下每个模块的 OSV 公告：有一条影响当前版本并引用了该 CVE 的，判 `confirmed`；引用它的是兄弟模块的，判 `same-project-other-module`。
+
+扫描结果带有[候选](#nvd-候选)时，另一个工具的发现如果同时是本次扫描在同一组件上的候选，会在 `candidate_cpe` 中注明该 CPE，摘要按类别给出数量。这类发现通常属于 `unattributed` 和 `no-github-record`。
 
 使用 GitHub 令牌可以把 API 限额从每小时 60 次提高到 5,000 次。binwitness 依次从 `GITHUB_TOKEN`、`GH_TOKEN` 或 `gh auth token` 读取令牌。
 
@@ -258,9 +289,11 @@ Claude Desktop、Cursor 等用 `mcpServers` JSON 文件配置的客户端填同�
 | `get_component` | 按 purl 或完整名称查一个组件：证据、文件、带修复版本和建议的发现、升级建议；出现位置按需给出。只给名称的一部分时，列出包含它的名称，不会把其中某个当作答案 | 无 |
 | `get_vulnerability` | 一条发现及其 OSV 记录：详情、受影响范围、参考链接 | 本地数据集没有该记录且允许联网时，向 OSV 发送公告编号 |
 | `upgrade_plan` | 按严重程度排列的步骤：移除、升级、替换，或为内嵌组件更换宿主；每一步写明能消除什么、还剩什么及注意事项。一个发布族是一步，`per_member` 只列有自己的目标或还剩发现的成员 | 无 |
+| `list_candidates` | 本次扫描的 [NVD 候选](#nvd-候选)，按严重程度排列，可按文本（组件或 CPE）、严重度筛选，或去掉有争议的 | 无 |
+| `get_candidate` | 一条候选：截至上次同步的 NVD 记录（状态、描述、CVSS、CWE、参考链接）、它落到的组件及 NVD 的版本范围、每个 CPE 是怎么学到的，以及把它当作发现之前要核对什么 | 无 |
 | `crosscheck` | 拿另一个扫描工具的导出结果与某次扫描核对归类，完整报告存盘 | 与 `crosscheck` 相同；`--lookup local` 时不提供 |
 
-每个关于结果的回答都以 `coverage` 开头：是否每次查询都成功、哪些没识别或没查、哪些查询被关闭、各数据源及其日期、做扫描的和提供服务的 binwitness 版本。它还写明结果说明不了什么：没有发现的组件，只表示截至数据日期所用数据中没有针对它的公告，不能证明它没有缺陷；也不做可达性分析。升级计划另外写明：不检查与应用的兼容性；Maven 依赖的版本常由 BOM 或父 POM 决定；npm 包可能是依赖的依赖。列表分页，文件位置只给计数，要求时才列出，以免撑满助手的上下文。
+每个关于结果的回答都以 `coverage` 开头：是否每次查询都成功、哪些没识别或没查、哪些查询被关闭、各数据源及其日期、做扫描的和提供服务的 binwitness 版本。它还写明结果说明不了什么：没有发现的组件，只表示截至数据日期所用数据中没有针对它的公告，不能证明它没有缺陷；也不做可达性分析。升级计划另外写明：不检查与应用的兼容性；Maven 依赖的版本常由 BOM 或父 POM 决定；npm 包可能是依赖的依赖。候选作为待复核的线索给出，不计入发现，并附上助手对其做初步判断时要核对的要点。列表分页，文件位置只给计数，要求时才列出，以免撑满助手的上下文。
 
 ## 哪些信息会离开你的机器
 
@@ -286,6 +319,7 @@ binwitness 会向公共服务发送以下内容：
 | [OSV 数据存储桶](https://google.github.io/osv.dev/data/) | OSV 数据集的 `db sync` |
 | [ghcr.io](https://github.com/aquasecurity/trivy-java-db) | Maven Central 哈希索引的 `db sync` |
 | [Maven Central 索引](https://repo1.maven.org/maven2/.index/) | `db sync`：哈希索引的每周新增 |
+| [NVD 数据源](https://nvd.nist.gov/vuln/data-feeds) | `nvd` 数据集的 `db sync` |
 | [GitHub 安全公告](https://github.com/advisories) | 仅 `crosscheck` |
 
 ## 局限
@@ -293,7 +327,7 @@ binwitness 会向公共服务发送以下内容：
 以下限制是有意为之，依赖结果之前请先读一遍：
 
 - **本地匹配使用 binwitness 自己的版本排序**。本地数据集中的公告版本范围由 binwitness 实现的 Maven 和 semver 排序判断，在线 API 用的是 OSV 自己的实现。常规版本号上两者一致，不常见的版本字符串可能比较结果不同。
-- **漏洞覆盖范围就是 OSV 的覆盖范围**。没有指明包的公告（GitHub "unreviewed"、只有 CPE 的 NVD 记录）无法匹配到组件。不查询厂商私有漏洞库和各国的国家漏洞库。漏洞数应视为下限。拿 `crosscheck` 去核对商业工具的输出，是了解这类数据库能补充多少的实用办法。
+- **漏洞覆盖范围就是 OSV 的覆盖范围**。没有指明包的公告（GitHub "unreviewed"、只有 CPE 的 NVD 记录）无法匹配到组件，至多成为能学到 CPE 的组件的[候选](#nvd-候选)。不查询厂商私有漏洞库和各国的国家漏洞库。漏洞数应视为下限。拿 `crosscheck` 去核对商业工具的输出，是了解这类数据库能补充多少的实用办法。
 - **识别需要已发布的构件或声明**。私有构建、分叉版本，以及不带 `pom.properties` 的改包名副本会保持未识别，除非同一交付物里还有一份已识别的副本（或者 `--class-search` 找到了它）。只在其他仓库发布的版本（里程碑版、厂商自己的构建）要用 `--maven-repo` 才认得出。每个未识别的 jar 都写明原因，并给出 manifest 或文件名提示的身份（`hint`，未经核实）。shade 时没带上 `pom.properties` 的类认不出；binwitness 不做字节码或源码指纹。内容比对比较的是 CRC-32，能发现重新构建和一般修改，防不了蓄意伪造的碰撞。只含 manifest、许可证和 notice 的 jar（Spring Boot starter）在不同构件之间看起来都一样，从不按内容匹配，报告为不含代码。分类器 jar（`-linux-x86_64`）只与主构件比较。
 - **升级建议只针对公告，不涉及兼容性**。它说明哪个已发布版本不在 OSV 中该包公告的影响范围内。应用换上它能否构建和运行、版本是否由 BOM、父 POM 或其他包决定、受影响的代码是否可达，都不做评估。读取版本列表之后才发布的版本不在考虑之内。
 - **前端打包产物是不透明的**。webpack 或 rollup 合并进 chunk 的代码无法按哈希匹配。请把锁文件，或构建时用的 `node_modules`，随打包产物一起交付。文件头注释只能覆盖一部分。认出的打包产物单独计数（`bundled_scripts`），不当作未知的库。

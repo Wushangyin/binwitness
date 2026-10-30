@@ -10,13 +10,15 @@ How much to keep locally is a per-machine choice:
 ``binwitness db sync`` with no names brings the installed datasets up to date. OSV lists every record by
 modification time, so an update fetches only the records changed since the previous one. The CISA
 catalog is small and fetched whole. The Maven Central hash index is published as a single file and is
-downloaded again only when its digest changes.
+downloaded again only when its digest changes. NVD publishes a feed per year and one of the last eight days'
+changes; a copy synced within a week is updated from the latter, an older one is downloaded again.
 """
 from __future__ import annotations
 
 import gzip
 import hashlib
 import http.client
+import io
 import json
 import os
 import posixpath
@@ -42,6 +44,7 @@ except ImportError:  # Windows
     fcntl = None
     import msvcrt
 
+from binwitness import nvd
 from binwitness.net import RETRY_STATUSES, USER_AGENT, default_cache_dir, map_parallel, open_url
 from binwitness.vulns import KEV, OSV_ECOSYSTEM
 
@@ -70,6 +73,10 @@ CHUNK_OVERLAP = 7 * 86400
 # Central limits index downloads per address and asks clients not to look more often than the index changes.
 CENTRAL_CHECK_DAYS = 7
 CSV_CHUNK = 64 * 1024
+# NVD's modified feed holds the changes of the last eight days; a day is kept spare.
+NVD_MODIFIED_DAYS = 7
+# Rows per SQL statement when looking up a list of ids: SQLite allows a few hundred parameters at most.
+ID_BATCH = 500
 
 
 @dataclass(frozen=True)
@@ -86,14 +93,18 @@ DATASETS = {
     "kev": Dataset("CISA Known Exploited Vulnerabilities catalog", "2 MB download", "kev.json"),
     "maven-hashes": Dataset("SHA-1 of every jar on Maven Central (Trivy java-db, then Central's weekly additions)",
                             "1 GB download, then 10-50 MB every week or two", "maven-hashes.db"),
+    "nvd": Dataset("NVD CVE records that name an application (CPE), for candidates",
+                   "235 MB download, then 15 MB a day", "nvd.sqlite"),
 }
 GROUPS = {"vulns": ("osv-maven", "osv-npm", "kev"), "java": ("osv-maven", "kev", "maven-hashes"),
           "all": tuple(DATASETS)}
 OSV_DATASET = {"maven": "osv-maven", "npm": "osv-npm"}
 OSV_FOLDER = {"osv-maven": OSV_ECOSYSTEM["maven"], "osv-npm": OSV_ECOSYSTEM["npm"]}
+ECOSYSTEM_OF = {dataset: ecosystem for ecosystem, dataset in OSV_DATASET.items()}
 SCHEMA = """
 CREATE TABLE records(id TEXT PRIMARY KEY, modified TEXT, withdrawn INTEGER, body BLOB);
 CREATE TABLE affected(name TEXT, id TEXT);
+CREATE TABLE cves(cve TEXT, id TEXT);
 """
 
 
@@ -317,6 +328,66 @@ class LocalDb:
                           "WHERE a.name = ? AND r.withdrawn = 0 ORDER BY r.id", (name,))
         return [json.loads(zlib.decompress(body)) for (body,) in rows]
 
+    def cve_index_missing(self, name: str | None) -> str | None:
+        """Why candidates cannot be looked for with this OSV dataset, if they cannot."""
+        if not name or not self.has(name):
+            return f"the local {name or 'OSV'} dataset is not installed (binwitness db sync {name or 'vulns'})"
+        if not self._rows(name, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cves'", ()):
+            return f"the local {name} dataset predates the CVE index candidates need (binwitness db sync {name})"
+        return None
+
+    def osv_cves(self, ecosystem: str, name: str) -> set[str]:
+        """CVE ids of the advisories OSV attributes to a package, withdrawn ones left out."""
+        return {c for (c,) in self._rows(OSV_DATASET[ecosystem], "SELECT DISTINCT c.cve FROM affected a "
+                                         "JOIN records r ON r.id = a.id JOIN cves c ON c.id = a.id "
+                                         "WHERE a.name = ? AND r.withdrawn = 0", (name,))}
+
+    def osv_project_cves(self, ecosystem: str, key: str) -> set[str]:
+        """Same as :meth:`osv_cves`, for every package of a project (see :func:`binwitness.nvd.project`)."""
+        if key[-1:] in (":", "/"):
+            # A range, not LIKE: LIKE ignores the index on names.
+            where, parameters = "a.name >= ? AND a.name < ?", (key, key[:-1] + chr(ord(key[-1]) + 1))
+        else:
+            where, parameters = "a.name = ?", (key,)
+        return {c for (c,) in self._rows(OSV_DATASET[ecosystem], "SELECT DISTINCT c.cve FROM affected a "
+                                         "JOIN records r ON r.id = a.id JOIN cves c ON c.id = a.id "
+                                         f"WHERE {where} AND r.withdrawn = 0", parameters)}
+
+    def osv_attribution(self, cves) -> dict[str, set[tuple[str, str]]]:
+        """CVE id -> the packages (ecosystem, name) any installed OSV dataset attributes it to, withdrawn
+        advisories included: a withdrawal is a judgement on that package, not a lead for another."""
+        out: dict[str, set] = {}
+        for name in self.installed():
+            if name not in ECOSYSTEM_OF or self.cve_index_missing(name):
+                continue
+            for batch in _batches(sorted(set(cves))):
+                for cve, package in self._rows(name, "SELECT c.cve, a.name FROM cves c JOIN affected a "
+                                               f"ON a.id = c.id WHERE c.cve IN ({_marks(batch)})", tuple(batch)):
+                    out.setdefault(cve, set()).add((ECOSYSTEM_OF[name], package))
+        return out
+
+    def nvd_ids(self, cpe: str) -> list[str]:
+        vendor, _, product = cpe.partition(":")
+        return [i for (i,) in self._rows("nvd", "SELECT DISTINCT id FROM cpes WHERE vendor = ? AND product = ? "
+                                         "ORDER BY id", (vendor, product))]
+
+    def nvd_cpes(self, cves) -> dict[str, set[str]]:
+        """CVE id -> its CPEs (``vendor:product``), for the ids NVD gives any."""
+        out: dict[str, set] = {}
+        for batch in _batches(sorted(set(cves))):
+            for ident, vendor, product in self._rows("nvd", "SELECT id, vendor, product FROM cpes "
+                                                     f"WHERE id IN ({_marks(batch)})", tuple(batch)):
+                out.setdefault(ident, set()).add(f"{vendor}:{product}")
+        return out
+
+    def nvd_record(self, ident: str) -> dict | None:
+        rows = self._rows("nvd", "SELECT body FROM records WHERE id = ?", (ident,))
+        return json.loads(zlib.decompress(rows[0][0])) if rows else None
+
+    def nvd_without_cpe(self) -> dict[str, int]:
+        """Records NVD has not given a CPE yet, by status: these cannot become candidates."""
+        return dict(self._rows("nvd", "SELECT status, count(*) FROM unanalyzed GROUP BY status ORDER BY status", ()))
+
     def maven_versions(self, group: str, artifact: str) -> list[str]:
         """Versions of an artifact that have a jar in the hash index: as of the index, not of today."""
         rows = self._rows("maven-hashes", "SELECT DISTINCT i.version FROM indices i JOIN artifacts a "
@@ -369,7 +440,8 @@ class LocalDb:
                          "bytes": sum(f.stat().st_size for f in self._files(name) if f.exists()) if entry else None,
                          "download": dataset.size,
                          **({key: entry.get(key) for key in ("base_as_of", "chunk", "checked", "recent_records")}
-                            if name == "maven-hashes" else {})})
+                            if name == "maven-hashes" else {}),
+                         **({"without_cpe": entry.get("without_cpe")} if name == "nvd" else {})})
         return rows
 
     def _files(self, name: str) -> list[Path]:
@@ -400,6 +472,8 @@ class LocalDb:
                     entry, outcome = self._sync_osv(name, full, fetcher, log, workers)
                 elif name == "kev":
                     entry, outcome = self._sync_kev(fetcher)
+                elif name == "nvd":
+                    entry, outcome = self._sync_nvd(full, fetcher, log)
                 else:
                     entry, outcome = self._sync_maven_hashes(full, hashes_every, fetcher, log)
             except (SyncError, OSError, ValueError, KeyError, sqlite3.Error, zipfile.BadZipFile,
@@ -467,6 +541,7 @@ class LocalDb:
         rebuilt = entry.get("full_download")
         due = not rebuilt or time.time() - datetime.fromisoformat(rebuilt).timestamp() > REBUILD_DAYS * 86400
         if not full and not due:
+            self._osv_cve_index(name, log)
             changes = self._osv_changes(name, fetcher, entry["data_as_of"])
             if changes is not None:
                 return self._osv_apply(name, changes, entry, fetcher, workers)
@@ -499,11 +574,27 @@ class LocalDb:
             # Built after the bulk insert: maintaining the indexes row by row would slow the load severalfold.
             connection.execute("CREATE INDEX affected_name ON affected(name)")
             connection.execute("CREATE INDEX affected_id ON affected(id)")
+            connection.execute("CREATE INDEX cves_cve ON cves(cve)")
+            connection.execute("CREATE INDEX cves_id ON cves(id)")
             connection.commit()
         self.close()
         os.replace(building, self.path(name))
         archive_path.unlink()
         return newest, count
+
+    def _osv_cve_index(self, name, log):
+        """Copies made before 0.4.0 lack the table of CVE ids; it is built from the records they hold."""
+        self.close()
+        with closing(sqlite3.connect(self.path(name))) as connection, connection:
+            if connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cves'").fetchone():
+                return
+            log(f"{name}: indexing the CVE ids of the records held")
+            connection.execute("CREATE TABLE cves(cve TEXT, id TEXT)")
+            for record_id, body in connection.execute("SELECT id, body FROM records").fetchall():
+                connection.executemany("INSERT INTO cves VALUES (?, ?)",
+                                       [(c, record_id) for c in sorted(nvd.cve_ids(json.loads(zlib.decompress(body))))])
+            connection.execute("CREATE INDEX cves_cve ON cves(cve)")
+            connection.execute("CREATE INDEX cves_id ON cves(id)")
 
     def _osv_changes(self, name, fetcher, since) -> dict[str, str] | None:
         """Records modified at or after ``since`` (id -> time), read from the newest end of OSV's change
@@ -580,6 +671,73 @@ class LocalDb:
         with self._lock:
             self._kev = None
         return entry, f"downloaded {count} entr{'y' if count == 1 else 'ies'}"
+
+    # ---- NVD ------------------------------------------------------------------------------------------
+
+    def _sync_nvd(self, full, fetcher, log):
+        entry = self.state.get("nvd", {}) if self.has("nvd") else {}
+        if not full and entry and time.time() - _epoch(entry["data_as_of"]) < NVD_MODIFIED_DAYS * 86400:
+            return self._nvd_update(entry, fetcher, log)
+        building = self.path("nvd").with_name(self.path("nvd").name + ".building")
+        building.unlink(missing_ok=True)
+        newest, stored = "", 0
+        with closing(sqlite3.connect(building)) as connection:
+            connection.executescript(nvd.SCHEMA)
+            for year in range(nvd.FIRST_YEAR, datetime.now(timezone.utc).year + 1):
+                (feed_newest, feed_stored, _), _ = self._nvd_feed(connection, f"nvdcve-2.0-{year}", fetcher, log)
+                newest, stored = max(newest, feed_newest), stored + feed_stored
+            # Built after the bulk insert, as for OSV.
+            connection.execute("CREATE INDEX cpes_product ON cpes(vendor, product)")
+            connection.execute("CREATE INDEX cpes_id ON cpes(id)")
+            connection.commit()
+            entry = self._nvd_entry(connection, newest)
+        self.close()
+        os.replace(building, self.path("nvd"))
+        return {**entry, "full_download": _now(), "modified_sha256": None}, f"downloaded {stored} records with a CPE"
+
+    def _nvd_update(self, entry, fetcher, log):
+        meta = self._nvd_meta("nvdcve-2.0-modified", fetcher)
+        if meta.get("sha256") and meta["sha256"] == entry.get("modified_sha256"):
+            return {}, "up to date"
+        self.close()
+        with closing(sqlite3.connect(self.path("nvd"))) as connection:
+            (newest, stored, removed), meta = self._nvd_feed(connection, "nvdcve-2.0-modified", fetcher, log, meta,
+                                                             replace=True)
+            entry = self._nvd_entry(connection, max(newest, entry["data_as_of"]))
+        return ({**entry, "modified_sha256": meta.get("sha256")},
+                f"updated: {stored} record{'' if stored == 1 else 's'} with a CPE written, {removed} replaced or removed")
+
+    @staticmethod
+    def _nvd_entry(connection, newest) -> dict:
+        return {"data_as_of": newest, "records": connection.execute("SELECT count(*) FROM records").fetchone()[0],
+                "without_cpe": dict(connection.execute("SELECT status, count(*) FROM unanalyzed GROUP BY status "
+                                                       "ORDER BY status").fetchall())}
+
+    @staticmethod
+    def _nvd_meta(name, fetcher) -> dict:
+        url = f"{nvd.NVD_FEEDS}/{name}.meta"
+        status, body = fetcher.read(url)
+        if status != 200:
+            raise HttpStatusError(url, status)
+        fields = dict(line.partition(":")[::2] for line in body.decode("utf-8").splitlines() if ":" in line)
+        return {k.strip(): v.strip() for k, v in fields.items()}
+
+    def _nvd_feed(self, connection, name, fetcher, log, meta=None, replace=False):
+        """Load one feed: ((newest modification, records stored, records dropped first), its .meta). The feed
+        is checked against the digest in the .meta while it is read. One that does not match (left by an
+        earlier attempt, or regenerated in between) is downloaded once more."""
+        target = self._scratch() / f"{name}.json.gz"
+        for attempt in (1, 2):
+            meta = meta or self._nvd_meta(name, fetcher)
+            fetcher.download(f"{nvd.NVD_FEEDS}/{name}.json.gz", target, progress=self._progress(log, name))
+            loaded, digest = _nvd_load(connection, target, replace)
+            if not meta.get("sha256") or digest.upper() == meta["sha256"].upper():
+                connection.commit()
+                return loaded, meta
+            connection.rollback()
+            target.unlink()
+            meta = None
+        raise SyncError(f"{name}: the feed does not match the digest in its .meta")
 
     # ---- Maven Central hash index ---------------------------------------------------------------------
 
@@ -803,6 +961,64 @@ def _index_jar(fields: dict[bytes, bytes]) -> tuple | None:
     return key, parts[0], parts[1], parts[2], "" if parts[3] == "NA" else parts[3]
 
 
+class _Digesting(io.RawIOBase):
+    """A stream that takes the SHA-256 of what is read through it."""
+
+    def __init__(self, stream):
+        self.stream, self.digest = stream, hashlib.sha256()
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        data = self.stream.read(len(buffer))
+        self.digest.update(data)
+        buffer[:len(data)] = data
+        return len(data)
+
+
+def _nvd_load(connection, path: Path, replace: bool) -> tuple[tuple[str, int, int], str]:
+    """Rejected records are left out, and so are records without a CPE of an application, which are counted
+    by status instead."""
+    newest, stored, removed = "", 0, 0
+    with gzip.open(path, "rb") as compressed:
+        digesting = _Digesting(compressed)
+        for cve in nvd.feed_items(io.BufferedReader(digesting)):
+            ident = cve.get("id")
+            if not ident:
+                continue
+            newest = max(newest, _stamp(cve.get("lastModified", "")))
+            if replace:
+                connection.execute("DELETE FROM cpes WHERE id = ?", (ident,))
+                connection.execute("DELETE FROM unanalyzed WHERE id = ?", (ident,))
+                removed += connection.execute("DELETE FROM records WHERE id = ?", (ident,)).rowcount
+            status = cve.get("vulnStatus") or ""
+            if status == "Rejected":
+                continue
+            if not cve.get("configurations"):
+                connection.execute("INSERT OR REPLACE INTO unanalyzed VALUES (?, ?)", (ident, status))
+                continue
+            record = nvd.compact(cve)
+            if not record["matches"]:
+                continue
+            connection.execute("INSERT OR REPLACE INTO records VALUES (?, ?, ?, ?)",
+                               (ident, cve.get("lastModified", ""), status,
+                                zlib.compress(json.dumps(record, separators=(",", ":")).encode("utf-8"))))
+            connection.executemany("INSERT INTO cpes VALUES (?, ?, ?)",
+                                   sorted({(m["vendor"], m["product"], ident) for m in record["matches"]}))
+            stored += 1
+    return (newest, stored, removed), digesting.digest.hexdigest()
+
+
+def _batches(items: list, size: int = ID_BATCH):
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
+
+
+def _marks(batch: list) -> str:
+    return ", ".join("?" * len(batch))
+
+
 def _put(connection, record: dict, raw: bytes, folder: str, replace: bool = False):
     record_id = record["id"]
     if replace:
@@ -813,8 +1029,10 @@ def _put(connection, record: dict, raw: bytes, folder: str, replace: bool = Fals
     names = {a["package"]["name"] for a in record.get("affected", [])
              if (a.get("package") or {}).get("ecosystem") == folder and a["package"].get("name")}
     connection.executemany("INSERT INTO affected VALUES (?, ?)", [(n, record_id) for n in sorted(names)])
+    connection.executemany("INSERT INTO cves VALUES (?, ?)", [(c, record_id) for c in sorted(nvd.cve_ids(record))])
 
 
 def _drop(connection, record_id: str) -> int:
     connection.execute("DELETE FROM affected WHERE id = ?", (record_id,))
+    connection.execute("DELETE FROM cves WHERE id = ?", (record_id,))
     return connection.execute("DELETE FROM records WHERE id = ?", (record_id,)).rowcount

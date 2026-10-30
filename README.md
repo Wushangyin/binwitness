@@ -5,7 +5,8 @@
 Software composition analysis for **what was actually delivered**: jars, wars, `docker save` images, zip
 bundles and front-end builds, nested to any depth. Every component in the result carries the evidence it
 was identified by, so each line of a report can be defended. For each vulnerable component it names the
-nearest published release outside the package's advisories. binwitness also checks another scanner's
+nearest published release outside the package's advisories. CVEs that no advisory attributes to a package
+are listed apart, as [candidates](#nvd-candidates) for review. binwitness also checks another scanner's
 findings against public advisory data and classifies each disagreement, and an [MCP server](#mcp-server)
 lets an AI assistant run scans and read their results.
 
@@ -14,6 +15,7 @@ $ binwitness scan release.zip -o out
 walked 1 input(s): 5 distinct jars, 0 npm package entries, 0 distinct scripts
 identified jars: 5 of 5
 vulnerabilities: 133 distinct across 22 components
+candidates: 2 NVD records not attributed to a package, for 22 components with a learned CPE
 upgrade advice: upgrade 22
 components   34  (maven 34; exact 5, declared 29)
 jars         5 distinct: third-party 5
@@ -28,8 +30,10 @@ vulns        133 distinct: critical 12, high 73, medium 46, low 2, known exploit
   critical CVE-2020-8840        com.fasterxml.jackson.core:jackson-databind 2.9.10, upgrade to 2.18.11
   critical CVE-2020-9546        com.fasterxml.jackson.core:jackson-databind 2.9.10, upgrade to 2.18.11
   critical CVE-2020-9547        com.fasterxml.jackson.core:jackson-databind 2.9.10, upgrade to 2.18.11
-  ... 75 more (vulnerabilities.csv)
+  ... 75 more, and medium 46, low 2 not listed here (vulnerabilities.csv)
 upgrades     upgrade on the same line 22; 2 advisories name a fixed version that is not published
+candidates   2 NVD records not attributed to a package in the local OSV data, not counted above; leads for manual review: high 1, medium 1, disputed 1 (candidates.csv)
+             looked for in 22 components whose CPE could be learned; 12 without one were not checked; NVD has given no CPE yet to 74,887 records (local nvd of 2026-10-29, osv-maven of 2026-10-28, osv-npm of 2026-10-29)
 licenses     permissive 34
 ```
 
@@ -40,7 +44,9 @@ filed against `netty-all` itself; its modules carry 71. The summary names the wo
 (malicious, known exploited, critical, high); `vulnerabilities.csv` has all of them. Each comes with the
 nearest published release outside every advisory of its package: jackson-databind 2.18.11, not the
 2.9.10.1 that fixes the first of its findings, since dozens of later advisories cover 2.9.10.1 too (see
-[Upgrade advice](#upgrade-advice)). (Counts are from October 2026 data; they grow as advisories are
+[Upgrade advice](#upgrade-advice)). The two candidates are NVD records that no advisory attributes to a
+package; they need the local `nvd` dataset, and without it the summary says they were not checked (see
+[NVD candidates](#nvd-candidates)). (Counts are from October 2026 data; they grow as advisories are
 published.)
 
 ## Why another SCA tool
@@ -68,6 +74,11 @@ the reviewer who receives a delivery from someone else and has to sign off on th
   to a different package, out of the affected version range, or recorded upstream without any package.
   Tools that match by product name (CPE) attach an advisory to every module of a product. This command
   shows how much of a report is noise of that kind.
+- **Unattributed CVEs are leads, not findings.** Some CVEs are never attributed to a package: GitHub
+  leaves them unreviewed, or has no record. NVD names them by product (CPE). binwitness learns which CPE
+  stands for a package from the CVEs OSV does attribute to it, never from names, and lists NVD's other
+  records for that CPE as [candidates](#nvd-candidates). They are kept out of the findings and their
+  counts.
 - **Upgrade targets are checked, not copied.** An advisory's "fixed in" names the first fix of one
   flaw. binwitness reads every advisory of the package and the versions actually published, and proposes
   the nearest release outside all of them. A fixed version that an advisory names but nobody published
@@ -166,6 +177,7 @@ coordinate they name.
 | `binwitness.json` | everything: components with evidence, locations, file hashes, published-artifact comparison, other coordinates of the same file, licenses, vulnerabilities, upgrade advice; first-party and unidentified files; warnings; data sources with fetch times |
 | `sbom.cdx.json` | CycloneDX 1.5 SBOM with vulnerabilities, identity evidence and occurrences. A component found in several different files has one entry per file, each with its hashes; first-party and unidentified jars are `file` components with their hashes. Licenses with an SPDX id are given as `license.id`. `metadata.component` describes what was scanned |
 | `components.csv`, `vulnerabilities.csv` | the same in spreadsheet form, UTF-8 with a byte order mark so that Excel reads non-ASCII paths correctly. The last two columns of `components.csv` are the upgrade advice and the release family; for a family member the advice is the family's, with its own in parentheses |
+| `candidates.csv` | the [NVD candidates](#nvd-candidates), one row per record and component. When candidates were not looked for, a single row says why |
 
 When a lookup fails (a service is down, or `--offline` finds nothing cached), the summary has an
 `INCOMPLETE` line saying what was not checked, `summary.incomplete` in `binwitness.json` counts it, and
@@ -186,6 +198,53 @@ are grouped into families: `permissive`, `weak-copyleft`, `copyleft-with-excepti
 that does not say which version or variant, such as a bare `BSD`, is kept as it is. A GPL text that says
 neither "only" nor "or later" keeps SPDX's older id (`GPL-2.0`, `GPL-2.0-with-classpath-exception`), which
 claims no more than the text does.
+
+### NVD candidates
+
+A finding is an advisory that names the component's package. Some CVEs never get one: GitHub leaves its
+advisory unreviewed, or has none, and NVD describes the CVE only by product, as a CPE (`vendor:product`)
+with a version range. binwitness links a package to a CPE when the CVEs OSV attributes to the package
+show it, and lists the CPE's other NVD records that cover the component's version as candidates. In the
+example at the top, 22 of the 34 components have a learned CPE, and two records come up:
+
+- CVE-2023-35116 on jackson-databind 2.9.10, through the CPE `fasterxml:jackson-databind`. 77 of the
+  package's 77 CVEs with a CPE carry it. NVD marks the record as disputed: the vendor does not accept it
+  as a vulnerability.
+- CVE-2026-62380, through `netty:netty`, the one CPE NVD uses for every netty module, on netty-all and 16
+  of its modules. The record's text names `netty-codec-socks`, which netty-all bundles too. That module
+  has no CVE of its own to learn a CPE from, so it is among the 12 components that were not checked.
+
+A CPE is linked with a package when all of these hold:
+
+1. it is on at least 30% of the package's CVEs that NVD gives a CPE, and on at least half as many as the
+   package's most frequent CPE (one product can go by several names);
+2. at least half of its CVEs that OSV attributes to any package belong to the package's project (the
+   Maven groupId, or the npm scope): a product that bundles libraries collects the CVEs of many projects;
+3. it is on at least a quarter of the project's CVEs that NVD gives a CPE.
+
+Names are never compared. A package with no such history gets no candidates, and the summary counts it as
+not checked. A link learned from a single CVE is marked as resting on one CVE, the weakest kind.
+
+A record is left out when NVD rejected it, when an advisory in any installed OSV dataset attributes the
+CVE to a package (withdrawn advisories included), when the scan already reports it, under its own id or
+an alias, or when its CPE is for another language runtime (`target_sw` such as `node.js` on a Maven
+package). Records NVD marks as disputed are kept and flagged. A CPE that NVD lists only together with
+another product (a platform) is marked as conditional.
+
+Candidates are leads for manual review. A CPE names a product, and a product can be wider than the
+component: one CPE may stand for every module of a framework, as with netty above, or for a vendor's
+drivers in several languages. They are not counted with the findings, do not take part in `--fail-on`,
+and are left out of `sbom.cdx.json` and `vulnerabilities.csv`. They are written to `binwitness.json`
+(`candidates`, and the evidence of each link in `candidate_links`) and to `candidates.csv`. There the
+learned-link column reads like `3/6 / 3/4 / 3/6`: the package's CVEs with the CPE out of those with any
+CPE, the CPE's attributed CVEs of the same project out of all its attributed ones, and the same as the
+first for the whole project. The next column lists the CVEs the link was learned from.
+
+Candidates come from local copies only, in every lookup mode: the `nvd` dataset and the OSV dataset of
+each ecosystem (`binwitness db sync nvd vulns`). An online scan takes its findings from the online
+services and its candidates from these copies. Their dates are given in the summary and in every row of
+`candidates.csv`. Without the copies, the summary says candidates were not checked, never that there are
+none. NVD records still awaiting analysis have no CPE yet; the summary counts them by status.
 
 ### Upgrade advice
 
@@ -260,14 +319,21 @@ binwitness db remove osv-npm
 | `osv-npm` | OSV advisories for npm packages, including malicious-package reports | 210 MB download, 250 MB on disk |
 | `kev` | CISA Known Exploited Vulnerabilities catalog | 2 MB |
 | `maven-hashes` | SHA-1 of every jar on Maven Central ([Trivy java-db](https://github.com/aquasecurity/trivy-java-db), then the additions to Central's own index) | 1 GB download, 1.5 GB on disk; then 10-50 MB every week or two |
+| `nvd` | NVD CVE records that name an application (CPE), for [candidates](#nvd-candidates) | 235 MB download, 225 MB on disk; then 15 MB a day |
 
-Groups: `vulns` (both OSV datasets and `kev`), `java` (`osv-maven`, `kev`, `maven-hashes`), `all`.
+Groups: `vulns` (both OSV datasets and `kev`), `java` (`osv-maven`, `kev`, `maven-hashes`), `all` (these
+and `nvd`).
 Datasets live in `~/.cache/binwitness/datasets` (`--db-dir`, or `$BINWITNESS_DB`).
 
 Updates are incremental where the publisher allows it. OSV keeps a list of records by modification time,
 so an update fetches only the records changed since the previous one. If more than 5,000 records have
 changed, or the last full download is a month old, the archive is downloaded again instead; that also
 drops records deleted upstream. The KEV catalog is small and fetched whole.
+
+NVD publishes one feed per year and a feed of the records modified in the last eight days. The first sync
+reads every yearly feed; later ones read only the modified feed, as long as the copy is less than seven
+days old, and skip it when its digest has not changed. An older copy is built again from the yearly
+feeds. Each feed is checked against the SHA-256 that NVD publishes next to it.
 
 The hash index starts from Trivy's java-db, which is rebuilt every day as one 1 GB file with no incremental
 form. After that, each sync applies the additions that Maven Central publishes to its own index every week
@@ -314,7 +380,8 @@ last synced more than seven days ago produces a warning.
 Each dataset is downloaded by your machine directly from its publisher, under the publisher's terms: OSV
 from Google's public bucket (each record carries the license of the database it comes from), the hash
 index from Aqua Security's `trivy-java-db` image on ghcr.io and from Maven Central's index, the KEV catalog
-from CISA.
+from CISA, the CVE records from NVD's data feeds. binwitness uses NVD data but is not endorsed or certified
+by the NVD.
 
 ## Cross-checking another scanner
 
@@ -344,6 +411,10 @@ lists it only as related (netty's for HTTP/2 Rapid Reset, CVE-2023-44487). For a
 not attribute to the component, binwitness therefore also reads the OSV advisories of every module of its
 groupId: one that affects this version and cites the CVE makes the finding `confirmed`, one for a sibling
 module makes it `same-project-other-module`.
+
+When the scan has [candidates](#nvd-candidates), a finding of the other tool that is also a candidate of
+this scan for the same component carries the CPE in `candidate_cpe`, and the summary counts them per
+class. These are typically the `unattributed` and `no-github-record` ones.
 
 A GitHub token raises the API limit from 60 to 5,000 lookups per hour. binwitness reads it from
 `GITHUB_TOKEN`, from `GH_TOKEN` or from `gh auth token`.
@@ -397,6 +468,8 @@ Claude Desktop, Cursor and other clients configured with an `mcpServers` JSON fi
 | `get_component` | one component by purl or by its full name: evidence, files, findings with fixed versions and advice, upgrade advice; locations on request. A part of a name gets the names that contain it, never one of them as the answer | nothing |
 | `get_vulnerability` | one finding with its OSV record: details, ranges, references | the advisory id to OSV, when the local datasets lack the record and lookups are allowed |
 | `upgrade_plan` | steps, worst first: remove, upgrade, replace, or change the host of bundled components; each says what it clears, what remains and its caveats. A release family is one step; its `per_member` lists the members with a target of their own or findings left | nothing |
+| `list_candidates` | the scan's [NVD candidates](#nvd-candidates), worst first, filtered by text (component or CPE), severity, or without the disputed ones | nothing |
+| `get_candidate` | one candidate: the NVD record as of the last sync (status, description, CVSS, CWE, references), the components it reaches with NVD's version range, how each CPE was learned, and what to check before taking it as a finding | nothing |
 | `crosscheck` | classifies another scanner's export against a scan and saves the full report | what `crosscheck` sends; not offered with `--lookup local` |
 
 Every answer about a result starts with `coverage`: whether every lookup succeeded, what was not
@@ -405,7 +478,8 @@ version that scanned and the one serving. It also states what the result cannot 
 findings has no advisory in the data used as of its date, which is not evidence that it has no flaws, and
 there is no reachability analysis. The upgrade plan adds that compatibility with the application is not
 checked, that a Maven dependency's version is often set by a BOM or parent POM, and that an npm package
-may be a dependency of a dependency. Lists are paged and file locations are counted, not listed, unless
+may be a dependency of a dependency. Candidates are presented as leads for review, kept out of finding
+counts, with the points to check when an assistant gives a first judgment of one. Lists are paged and file locations are counted, not listed, unless
 asked for, so that answers fit an assistant's context.
 
 ## What leaves your machine
@@ -441,6 +515,7 @@ scan a machine with no internet access, copy the dataset directory and, optional
 | [OSV data bucket](https://google.github.io/osv.dev/data/) | `db sync` of the OSV datasets |
 | [ghcr.io](https://github.com/aquasecurity/trivy-java-db) | `db sync` of the Maven Central hash index |
 | [Maven Central index](https://repo1.maven.org/maven2/.index/) | `db sync`: weekly additions to the hash index |
+| [NVD data feeds](https://nvd.nist.gov/vuln/data-feeds) | `db sync` of the `nvd` dataset |
 | [GitHub advisories](https://github.com/advisories) | `crosscheck` only |
 
 ## Limitations
@@ -451,9 +526,10 @@ These limits are deliberate, so read them before relying on a result:
   evaluated by binwitness's implementation of Maven and semver ordering, the online API by OSV's own.
   They agree on ordinary versions; unusual version strings can compare differently.
 - **Advisory coverage is that of OSV.** An advisory that names no package (GitHub "unreviewed",
-  NVD-only CPE records) cannot be matched to a component. Vendor-private and national vulnerability
-  databases are not consulted. Treat counts as a lower bound. `crosscheck` against a commercial tool's
-  output is the practical way to see what such a database adds.
+  NVD-only CPE records) cannot be matched to a component, and is at most a
+  [candidate](#nvd-candidates) for a component whose CPE could be learned. Vendor-private and national
+  vulnerability databases are not consulted. Treat counts as a lower bound. `crosscheck` against a
+  commercial tool's output is the practical way to see what such a database adds.
 - **Identification needs a published artifact or a declaration.** A private build, a fork or a relocated
   copy of a library with no `pom.properties` stays unidentified, unless the same delivery also carries a
   copy that was identified (or `--class-search` finds it). A release that only another repository
