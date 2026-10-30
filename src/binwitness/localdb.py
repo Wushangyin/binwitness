@@ -11,7 +11,9 @@ How much to keep locally is a per-machine choice:
 modification time, so an update fetches only the records changed since the previous one. The CISA
 catalog is small and fetched whole. The Maven Central hash index is published as a single file and is
 downloaded again only when its digest changes. NVD publishes a feed per year and one of the last eight days'
-changes; a copy synced within a week is updated from the latter, an older one is downloaded again.
+changes; a copy synced within a week is updated from the latter, an older one is downloaded again. The CVE
+Program publishes its list as a snapshot every midnight and the changes since every hour and at the end of each
+day; a copy is brought up to date from the changes of the days it lacks, and downloaded again past six weeks.
 """
 from __future__ import annotations
 
@@ -22,6 +24,7 @@ import io
 import json
 import os
 import posixpath
+import re
 import shutil
 import sqlite3
 import struct
@@ -32,10 +35,10 @@ import urllib.error
 import urllib.request
 import zipfile
 import zlib
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 try:
@@ -44,7 +47,7 @@ except ImportError:  # Windows
     fcntl = None
     import msvcrt
 
-from binwitness import fixes, nvd
+from binwitness import cna, fixes, nvd
 from binwitness.net import RETRY_STATUSES, USER_AGENT, default_cache_dir, map_parallel, open_url
 from binwitness.vulns import KEV, OSV_ECOSYSTEM
 
@@ -82,6 +85,26 @@ NVD_WORKERS = 4
 FIX_WORKERS = 4
 FIX_BATCH = 40
 FIX_FAILURES_TO_STOP = 8
+# cvelistV5 keeps each day's changes as a release for at least seven weeks (seen in October 2026); a copy further
+# behind is downloaded again.
+CVELIST_DELTA_DAYS = 40
+# Records stored without their text (see _cvelist_finish) whose text is needed since, fetched one by one: at most
+# this many per sync, a few at a time.
+CVELIST_FETCH_LIMIT = 1000
+CVELIST_WORKERS = 4
+CVELIST_FAILURES_TO_STOP = 8
+CVELIST_SCHEMA = """
+CREATE TABLE records(id TEXT PRIMARY KEY, cna TEXT, published TEXT, updated TEXT, body BLOB);
+CREATE TABLE keys(key TEXT, id TEXT, PRIMARY KEY (key, id)) WITHOUT ROWID;
+CREATE TABLE packages(name TEXT, module TEXT, id TEXT, how TEXT);
+CREATE TABLE cpes(vendor TEXT, product TEXT, id TEXT);
+CREATE TABLE links(key TEXT, name TEXT, cves INTEGER);
+"""
+CVELIST_INDEXES = ["CREATE INDEX keys_id ON keys(id)",
+                   "CREATE INDEX packages_module ON packages(module)", "CREATE INDEX packages_id ON packages(id)",
+                   "CREATE INDEX cpes_product ON cpes(vendor, product)", "CREATE INDEX cpes_id ON cpes(id)",
+                   "CREATE INDEX links_name ON links(name)"]
+CVE_FILE = re.compile(r"(?:^|/)CVE-\d{4}-\d{4,}\.json$")
 # The data behind spring.io/security: every advisory of the Spring projects, in one file.
 SPRING_ADVISORIES = "https://spring.io/page-data/security/page-data.json"
 MONTHS = {month: number for number, month in enumerate(
@@ -107,11 +130,15 @@ DATASETS = {
                             "1 GB download, then 10-50 MB every week or two", "maven-hashes.db"),
     "nvd": Dataset("NVD CVE records that name an application (CPE), for candidates",
                    "235 MB download, then 15 MB a day", "nvd.sqlite"),
-    "spring": Dataset("Spring security advisories (spring.io), for the modules each names, for candidates",
-                      "260 kB download, 50 kB on disk", "spring.json"),
-    # Last: it is read from the NVD records of the packages OSV knows.
-    "fixes": Dataset("Files changed by the GitHub commits NVD records cite as their fix, for candidates",
-                     "about 170 commits from github.com, 3 MB download; then those of new records", "fixes.json"),
+    "spring": Dataset("Spring security advisories (spring.io), for the modules and versions each names, for "
+                      "candidates", "260 kB download, 140 kB on disk", "spring.json"),
+    # After osv-maven: what it keeps and learns follows the CVEs OSV attributes.
+    "cvelist": Dataset("CVE records as their CNAs published them (cvelistV5), for candidates NVD has not given a "
+                       "CPE yet", "650 MB download, then about 5 MB a day", "cvelist.sqlite"),
+    # Last: it is read from the NVD and CNA records of the packages OSV knows.
+    "fixes": Dataset("Files changed by the GitHub commits CVE records or vendor pages cite as the fix, for "
+                     "candidates", "about 430 commits from github.com, 8 MB download; then those of new records",
+                     "fixes.json"),
 }
 GROUPS = {"vulns": ("osv-maven", "osv-npm", "kev"), "java": ("osv-maven", "kev", "maven-hashes"),
           "all": tuple(DATASETS)}
@@ -298,7 +325,9 @@ class LocalDb:
         self._connections: dict[str, sqlite3.Connection] = {}
         self._kev: dict[str, str] | None = None
         self._advisories: dict[str, dict] | None = None
+        self._advised: dict[str, list[str]] | None = None
         self._fixes: dict | None = None
+        self._known: dict[str, bool] = {}
         self.used: set[str] = set()
         self.state = self._read_state()
 
@@ -455,6 +484,101 @@ class LocalDb:
         entry = self._advisories.get(cve)
         return list(entry["modules"]) if entry else None
 
+    def advisory(self, cve: str) -> dict | None:
+        """The vendor's own advisory of a CVE (modules, versions), as :func:`spring_advisories` stores it; a copy
+        synced before versions were kept has none."""
+        if self.advisory_modules(cve) is None:
+            return None
+        return {"versions": [], **self._advisories[cve]}
+
+    def _advised_cves(self) -> list[str]:
+        if not self.has("spring"):
+            return []
+        self.advisory_modules("")
+        return sorted(c for c, entry in self._advisories.items() if entry["modules"])
+
+    def advised(self, module: str) -> list[str]:
+        """The CVEs whose advisory names a build of a module (see cna.module_key)."""
+        if not self.has("spring"):
+            return []
+        self.advisory_modules("")
+        with self._lock:
+            if self._advised is None:
+                by_module: dict[str, set[str]] = {}
+                for cve, entry in self._advisories.items():
+                    for name in entry["modules"]:
+                        by_module.setdefault(cna.module_key(name), set()).add(cve)
+                self._advised = {m: sorted(c) for m, c in by_module.items()}
+        return self._advised.get(module, [])
+
+    def cna_records(self, ids) -> dict[str, dict]:
+        """CVE id -> its CNA record as :func:`binwitness.cna.trim` keeps it, for the ids stored with their text."""
+        if not self.has("cvelist"):
+            return {}
+        out = {}
+        for batch in _batches(sorted(set(ids))):
+            for ident, body in self._rows("cvelist", f"SELECT id, body FROM records WHERE id IN ({_marks(batch)}) "
+                                          "AND body IS NOT NULL", tuple(batch)):
+                out[ident] = json.loads(zlib.decompress(body))
+        return out
+
+    def cna_meta(self, ids) -> dict[str, tuple[str, str, str]]:
+        """CVE id -> (CNA short name, published, updated) for every published record of the ids."""
+        if not self.has("cvelist"):
+            return {}
+        out = {}
+        for batch in _batches(sorted(set(ids))):
+            out.update((i, (c, p, u)) for i, c, p, u in self._rows(
+                "cvelist", f"SELECT id, cna, published, updated FROM records WHERE id IN ({_marks(batch)})",
+                tuple(batch)))
+        return out
+
+    def cna_packages(self, module: str) -> list[tuple[str, str, str]]:
+        """(package, CVE id, how) of the CNA records that name a build of a module (see cna.module_key)."""
+        return [tuple(r) for r in self._rows("cvelist", "SELECT name, id, how FROM packages WHERE module = ? "
+                                             "ORDER BY id, name", (module,))]
+
+    def cna_named_packages(self, ids) -> dict[str, list[tuple[str, str]]]:
+        """CVE id -> the packages (name, how) its CNA record names."""
+        out: dict[str, list] = {}
+        for batch in _batches(sorted(set(ids))):
+            for ident, name, how in self._rows("cvelist", "SELECT id, name, how FROM packages "
+                                               f"WHERE id IN ({_marks(batch)}) ORDER BY name", tuple(batch)):
+                out.setdefault(ident, []).append((name, how))
+        return out
+
+    def cna_cpe_ids(self, cpe: str) -> list[str]:
+        vendor, _, product = cpe.partition(":")
+        return [i for (i,) in self._rows("cvelist", "SELECT DISTINCT id FROM cpes WHERE vendor = ? AND product = ? "
+                                         "ORDER BY id", (vendor, product))]
+
+    def cna_links(self, name: str) -> dict[str, int]:
+        """Product key -> the CVEs it was learned from, for the CNA product names learned for a package."""
+        if not self.has("cvelist"):
+            return {}
+        return dict(self._rows("cvelist", "SELECT key, cves FROM links WHERE name = ? ORDER BY key", (name,)))
+
+    def cna_key_ids(self, key: str) -> list[str]:
+        return [i for (i,) in self._rows("cvelist", "SELECT DISTINCT id FROM keys WHERE key = ? ORDER BY id", (key,))]
+
+    def known_package(self, name: str) -> bool:
+        """Whether a Maven package exists as far as the datasets know: OSV has advisories for it, or the hash index
+        has a jar of it."""
+        if name not in self._known:
+            group, _, artifact = name.partition(":")
+            self._known[name] = bool(self.has("osv-maven") and self.osv_names("maven", name)[:1] == [name]) \
+                or group in self.maven_groups(artifact)
+        return self._known[name]
+
+    def nvd_status(self, ids) -> dict[str, str]:
+        """CVE id -> NVD's status, for the ids NVD holds: with a CPE or not yet given one."""
+        out = {}
+        for batch in _batches(sorted(set(ids))):
+            marks = _marks(batch)
+            out.update(self._rows("nvd", f"SELECT id, status FROM records WHERE id IN ({marks}) UNION ALL "
+                                  f"SELECT id, status FROM unanalyzed WHERE id IN ({marks})", tuple(batch) * 2))
+        return out
+
     def fix_of(self, cve: str) -> dict | None:
         """What the GitHub commits a record cites as its fix changed (see ``fixes.fix_of``); None when the dataset
         is not installed or the record cites no commit of its project."""
@@ -502,7 +626,9 @@ class LocalDb:
                          **({"without_cpe": entry.get("without_cpe"),
                              "layout_current": entry.get("layout") == nvd.LAYOUT} if name == "nvd" else {}),
                          **({key: entry.get(key) for key in ("commits", "commits_not_read")}
-                            if name == "fixes" else {})})
+                            if name == "fixes" else {}),
+                         **({key: entry.get(key) for key in ("tag", "kept", "links", "bodies_not_fetched")}
+                            if name == "cvelist" else {})})
         return rows
 
     def _files(self, name: str) -> list[Path]:
@@ -537,6 +663,8 @@ class LocalDb:
                     entry, outcome = self._sync_nvd(full, fetcher, log)
                 elif name == "spring":
                     entry, outcome = self._sync_spring(fetcher)
+                elif name == "cvelist":
+                    entry, outcome = self._sync_cvelist(full, fetcher, log)
                 elif name == "fixes":
                     entry, outcome = self._sync_fixes(fetcher, log)
                 else:
@@ -756,9 +884,177 @@ class LocalDb:
         temporary.write_text(text, "utf-8")
         os.replace(temporary, self.path("spring"))
         with self._lock:
-            self._advisories = None
+            self._advisories = self._advised = None
         named = sum(1 for a in advisories.values() if a["modules"])
         return entry, f"downloaded {len(advisories)} advisories, {named} of them naming modules"
+
+    # ---- CVE records of the CNAs ---------------------------------------------------------------------
+
+    def _sync_cvelist(self, full, fetcher, log):
+        if self.cve_index_missing("osv-maven"):
+            raise SyncError("what is kept of the CNAs' records follows the CVEs OSV attributes: install osv-maven "
+                            "first (binwitness db sync osv-maven cvelist)")
+        tag, day = self._cvelist_latest(fetcher)
+        entry = self.state.get("cvelist", {}) if self.has("cvelist") else {}
+        osv_as_of = self.data_as_of("osv-maven")
+        if not full and entry.get("tag") == tag and entry.get("osv_as_of") == osv_as_of:
+            return {}, "up to date"
+        behind = (date.fromisoformat(day) - date.fromisoformat(entry["day"])).days if entry.get("day") else None
+        self.close()
+        if full or behind is None or not 0 <= behind <= CVELIST_DELTA_DAYS:
+            return self._cvelist_install(tag, day, fetcher, log)
+        try:
+            with closing(sqlite3.connect(self.path("cvelist"))) as connection:
+                changed = 0
+                for offset in range(behind):
+                    passed = (date.fromisoformat(entry["day"]) + timedelta(days=offset)).isoformat()
+                    changed += self._cvelist_delta(connection, f"cve_{passed}_at_end_of_day",
+                                                   f"{passed}_delta_CVEs_at_end_of_day.zip", fetcher)
+                    connection.commit()
+                changed += self._cvelist_delta(connection, tag, _hourly(tag, day), fetcher)
+                finished = self._cvelist_finish(connection, fetcher, log)
+        except HttpStatusError as error:
+            if error.status != 404:
+                raise
+            log("cvelist: the changes of a day it lacks are no longer published; downloading the list again")
+            return self._cvelist_install(tag, day, fetcher, log)
+        return ({**finished, "tag": tag, "day": day, "data_as_of": _tag_time(tag), "osv_as_of": osv_as_of},
+                f"updated: {changed} record{'' if changed == 1 else 's'} changed; {finished['links']} product names "
+                f"learned{_fetch_note(finished)}")
+
+    def _cvelist_latest(self, fetcher) -> tuple[str, str]:
+        """The newest hourly release: its tag (cve_2026-10-30_1100Z) and day."""
+        status, body = fetcher.read(cna.RELEASES_FEED)
+        if status != 200:
+            raise HttpStatusError(cna.RELEASES_FEED, status)
+        tags = cna.TAG.findall(body.decode("utf-8", "replace"))
+        if not tags:
+            raise SyncError(f"{cna.RELEASES_FEED}: lists no release of the CVE list")
+        tag, day, _ = max(tags, key=lambda t: (t[1], t[2]))
+        return tag, day
+
+    def _cvelist_install(self, tag, day, fetcher, log):
+        name = f"{day}_all_CVEs_at_midnight.zip.zip"
+        target = self._scratch() / name
+        fetcher.download(f"{cna.CVELIST}/releases/download/{tag}/{name}", target, progress=self._progress(log, name))
+        building = self.path("cvelist").with_name(self.path("cvelist").name + ".building")
+        building.unlink(missing_ok=True)
+        stored = 0
+        with closing(sqlite3.connect(building)) as connection:
+            connection.executescript(CVELIST_SCHEMA)
+            for streamed in (True, False):
+                try:
+                    for raw in _snapshot_files(target, self._scratch(), streamed):
+                        stored += _cna_apply(connection, raw, replace=False)
+                        if stored % 100000 == 0:
+                            log(f"cvelist: {stored} records read")
+                    break
+                except _Unsized:
+                    connection.rollback()
+                    stored = 0
+            for statement in CVELIST_INDEXES:
+                connection.execute(statement)
+            connection.commit()
+            self._cvelist_delta(connection, tag, _hourly(tag, day), fetcher)
+            finished = self._cvelist_finish(connection, fetcher, log)
+            # Most records were stored with their text only to learn which ones to keep it of.
+            connection.execute("VACUUM")
+        os.replace(building, self.path("cvelist"))
+        target.unlink(missing_ok=True)
+        return ({**finished, "tag": tag, "day": day, "data_as_of": _tag_time(tag), "full_download": _now(),
+                 "osv_as_of": self.data_as_of("osv-maven")},
+                f"downloaded {finished['records']} records, {finished['kept']} kept with their text; "
+                f"{finished['links']} product names learned{_fetch_note(finished)}")
+
+    def _cvelist_delta(self, connection, tag: str, name: str, fetcher) -> int:
+        """Apply one release's changed records; how many."""
+        target = self._scratch() / name
+        fetcher.download(f"{cna.CVELIST}/releases/download/{tag}/{name}", target)
+        changed = 0
+        with zipfile.ZipFile(target) as archive:
+            for info in archive.infolist():
+                if CVE_FILE.search(info.filename):
+                    changed += 1
+                    _cna_apply(connection, archive.read(info))
+        target.unlink()
+        return changed
+
+    def _cvelist_finish(self, connection, fetcher, log) -> dict:
+        """Keep the text of the records a candidate may come from, fetch it for those that became so since, and
+        learn the product names of packages from the CVEs OSV attributes.
+
+        A record is kept with its text when OSV attributes its CVE to a Maven package (learning reads it), when it
+        names a Maven package or a CPE, when it names a product that a CVE OSV attributes names too, or when a
+        vendor's advisory names a module; of the others, a fifth of the list, only what tells whether they become
+        so."""
+        attributed: dict[str, set[str]] = {}
+        for cve, name in self._rows("osv-maven", "SELECT c.cve, a.name FROM cves c JOIN affected a ON a.id = c.id",
+                                    ()):
+            attributed.setdefault(cve, set()).add(name)
+        connection.execute("CREATE TEMP TABLE attributed(id TEXT PRIMARY KEY)")
+        connection.executemany("INSERT INTO attributed VALUES (?)", [(c,) for c in sorted(attributed)])
+        connection.execute("CREATE TEMP TABLE advised(id TEXT PRIMARY KEY)")
+        connection.executemany("INSERT INTO advised VALUES (?)", [(c,) for c in self._advised_cves()])
+        connection.executescript("""
+            CREATE TEMP TABLE known AS SELECT DISTINCT key FROM keys WHERE id IN (SELECT id FROM attributed);
+            CREATE TEMP TABLE kept(id TEXT PRIMARY KEY);
+            INSERT OR IGNORE INTO kept SELECT id FROM attributed;
+            INSERT OR IGNORE INTO kept SELECT id FROM packages;
+            INSERT OR IGNORE INTO kept SELECT id FROM cpes;
+            INSERT OR IGNORE INTO kept SELECT id FROM keys WHERE key IN (SELECT key FROM known);
+            INSERT OR IGNORE INTO kept SELECT id FROM advised WHERE id IN (SELECT id FROM records);
+            UPDATE records SET body = NULL WHERE body IS NOT NULL AND id NOT IN (SELECT id FROM kept);
+        """)
+        connection.commit()
+        wanted = [i for (i,) in connection.execute("SELECT id FROM records WHERE body IS NULL AND id IN "
+                                                   "(SELECT id FROM kept) ORDER BY id DESC")]
+        fetched = self._cvelist_fetch(connection, wanted[:CVELIST_FETCH_LIMIT], fetcher, log)
+        keys: dict[str, list[tuple[str, dict]]] = {}
+        for ident, body in connection.execute("SELECT r.id, r.body FROM records r JOIN attributed a ON a.id = r.id "
+                                              "WHERE r.body IS NOT NULL"):
+            record = json.loads(zlib.decompress(body))
+            found = [(key, e) for e in record["affected"] if cna.usable(e)
+                     for key in [cna.key_of(e["vendor"], e["product"])] if key]
+            if found:
+                keys[ident] = found
+        links = cna.learn({c: n for c, n in attributed.items()}, keys, lambda n: self.osv_records("maven", n))
+        connection.execute("DELETE FROM links")
+        connection.executemany("INSERT INTO links VALUES (?, ?, ?)",
+                               [(k, n, c) for k, found in sorted(links.items()) for n, c in sorted(found.items())])
+        for table in ("kept", "known", "attributed", "advised"):
+            connection.execute(f"DROP TABLE temp.{table}")
+        connection.commit()
+        count = lambda sql: connection.execute(sql).fetchone()[0]
+        return {"records": count("SELECT count(*) FROM records"),
+                "kept": count("SELECT count(*) FROM records WHERE body IS NOT NULL"),
+                "links": count("SELECT count(DISTINCT key) FROM links"),
+                "bodies_not_fetched": len(wanted) - fetched}
+
+    def _cvelist_fetch(self, connection, ids: list[str], fetcher, log) -> int:
+        """Fetch records one by one from the repository; how many were."""
+        failures, lock = [0], threading.Lock()
+
+        def read(ident):
+            if failures[0] >= CVELIST_FAILURES_TO_STOP:
+                return None
+            try:
+                status, body = fetcher.read(cna.raw_url(ident))
+            except SyncError:
+                status, body = None, None
+            with lock:
+                failures[0] = 0 if status == 200 else failures[0] + 1
+            return body if status == 200 else None
+        done = 0
+        for start in range(0, len(ids), FIX_BATCH * 5):
+            batch = ids[start:start + FIX_BATCH * 5]
+            for body in map_parallel(read, batch, CVELIST_WORKERS):
+                if body is not None:
+                    _cna_apply(connection, body)
+                    done += 1
+            connection.commit()
+            if len(ids) > len(batch):
+                log(f"cvelist: {min(start + len(batch), len(ids))} of {len(ids)} records fetched")
+        return done
 
     # ---- fix commits ----------------------------------------------------------------------------------
 
@@ -766,15 +1062,17 @@ class LocalDb:
         if not (self.has("nvd") and self.has("osv-maven")):
             raise SyncError("fixes are read from the NVD records of Maven packages: install nvd and osv-maven first "
                             "(binwitness db sync nvd osv-maven fixes)")
-        records = self._fix_records()
+        try:
+            stored = json.loads(self.path("fixes").read_text("utf-8"))
+        except (OSError, ValueError):
+            stored = {}
+        pages = self._vendor_pages(fetcher, stored.get("pages") or {}, log)
+        records = self._fix_records(pages)
         cited = {key for entry in records.values() for key in entry["commits"]}
         # A commit does not change once made: what was read stays, also from a sync that was interrupted, and only
-        # commits not read before are fetched.
-        try:
-            held = json.loads(self.path("fixes").read_text("utf-8")).get("commits") or {}
-        except (OSError, ValueError):
-            held = {}
-        commits = {key: value for key, value in held.items() if key in cited}
+        # commits not read before are fetched; and those an older reader may have read short.
+        held = stored.get("commits") or {}
+        commits = {key: value for key, value in held.items() if key in cited and not fixes.stale(value)}
         wanted = sorted(cited - commits.keys())
         failures, lock = [0], threading.Lock()
 
@@ -789,9 +1087,9 @@ class LocalDb:
         for start in range(0, len(wanted), FIX_BATCH):
             batch = wanted[start:start + FIX_BATCH]
             commits.update((k, v) for k, v in zip(batch, map_parallel(read, batch, FIX_WORKERS)) if v is not None)
-            self._write_fixes(records, commits)
+            self._write_fixes(records, commits, pages)
             log(f"fixes: {min(start + FIX_BATCH, len(wanted))} of {len(wanted)} commits fetched")
-        self._write_fixes(records, commits)
+        self._write_fixes(records, commits, pages)
         pending = len(cited - commits.keys())
         entry = {"data_as_of": self.state["nvd"].get("data_as_of", ""), "records": len(records),
                  "commits": len(commits), "commits_not_read": pending}
@@ -826,11 +1124,28 @@ class LocalDb:
             return {"unread": "not found"}
         return answer if status == 200 else None
 
-    def _fix_records(self) -> dict[str, dict]:
+    def _vendor_pages(self, fetcher, held: dict, log) -> dict[str, dict[str, list[str]]]:
+        """Page URL -> CVE id -> the commits a vendor's security page gives as its fix; a page that cannot be
+        fetched now keeps what was read of it before."""
+        pages = {}
+        for url in fixes.VENDOR_PAGES:
+            try:
+                status, body = fetcher.read(url)
+            except SyncError:
+                status, body = None, None
+            if status == 200:
+                pages[url] = fixes.page_commits(body.decode("utf-8", "replace"))
+            else:
+                log(f"fixes: {url} could not be fetched ({status or 'no answer'}); keeping what was read of it before")
+                pages[url] = held.get(url) or {}
+        return pages
+
+    def _fix_records(self, pages: dict | None = None) -> dict[str, dict]:
         """Record id -> the commits it cites, for the records that can become candidates of a Maven package: not
-        attributed by OSV, with a CPE that some CVE OSV does attribute carries. Only commits in a repository those
-        attributed CVEs refer to are read; the others are kept apart, since a record may cite the fix of another
-        product (one that bundles the library)."""
+        attributed by OSV, with a CPE that some CVE OSV does attribute carries, or (from the CNAs' records) a product
+        name or package that some such CVE names. Only commits in a repository those attributed CVEs refer to are
+        read; the others are kept apart, since a record may cite the fix of another product (one that bundles the
+        library). A vendor's security page gives the commits of its own product: they count as the patch."""
         attributed = {c for (c,) in self._rows("osv-maven", "SELECT DISTINCT cve FROM cves", ())}
         cpes_of: dict[str, set[str]] = {}
         for ident, vendor, product in self._rows("nvd", "SELECT id, vendor, product FROM cpes", ()):
@@ -860,11 +1175,46 @@ class LocalDb:
                 tagged = {f"{r}@{s}" for r, s in fixes.commits_cited([url for url, patch in refs if patch])}
                 entry["patch"] = [key for key in entry["commits"] if key in tagged]
             out[ident] = entry
+        if self.has("cvelist"):
+            self._cna_fix_records(attributed, cpes_of, out)
+        for found in (pages or {}).values():
+            for ident, keys in sorted(found.items()):
+                if ident in attributed:
+                    continue
+                entry = out.setdefault(ident, {"commits": [], "elsewhere": [], "patch": None})
+                entry["commits"] = list(dict.fromkeys([*entry["commits"], *keys]))
+                entry["patch"] = list(dict.fromkeys([*(entry["patch"] or []), *keys]))
         return out
 
-    def _write_fixes(self, records: dict, commits: dict):
+    def _cna_fix_records(self, attributed: set[str], cpes_of: dict[str, set[str]], out: dict):
+        """The commits the CNAs' records of CVEs NVD has given no CPE cite, in the repositories that the CVEs OSV
+        attributes and whose records name the same product or package refer to."""
+        repositories: dict[str, set[str]] = {}
+        backlog: list[dict] = []
+        for (body,) in self._rows("cvelist", "SELECT body FROM records WHERE body IS NOT NULL", ()):
+            record = json.loads(zlib.decompress(body))
+            keys, packages, _ = cna.facets(record)
+            names = keys | {cna.module_key(p) for p, _ in packages}
+            if record["id"] in attributed:
+                cited = fixes.repositories_cited(record["references"]) | fixes.repositories_cited(
+                    (self.nvd_record(record["id"]) or {}).get("references", []))
+                for name in names:
+                    repositories.setdefault(name, set()).update(cited)
+            elif record["id"] not in cpes_of and record["id"] not in out and record["commits"] and names:
+                backlog.append({"id": record["id"], "names": names, "commits": record["commits"]})
+        for record in backlog:
+            known = set().union(*(repositories.get(n, set()) for n in record["names"]))
+            if not known:
+                continue
+            cited = fixes.commits_cited(record["commits"])
+            out[record["id"]] = {"commits": [f"{r}@{s}" for r, s in cited if r in known],
+                                 "elsewhere": [fixes.commit_url(f"{r}@{s}") for r, s in cited if r not in known],
+                                 "patch": None}
+
+    def _write_fixes(self, records: dict, commits: dict, pages: dict | None = None):
         temporary = self.path("fixes").with_name("fixes.json.tmp")
-        temporary.write_text(json.dumps({"records": records, "commits": commits}, sort_keys=True), "utf-8")
+        temporary.write_text(json.dumps({"records": records, "commits": commits, "pages": pages or {}},
+                                        sort_keys=True), "utf-8")
         os.replace(temporary, self.path("fixes"))
         with self._lock:
             self._fixes = None
@@ -1107,8 +1457,8 @@ def _chunk_time(fetcher: Fetcher, number: int) -> float:
 class _Reader:
     """Exact-size reads over a decompressing stream; per-call overhead dominates with records this small."""
 
-    def __init__(self, stream):
-        self.stream, self.buffer, self.offset = stream, b"", 0
+    def __init__(self, stream, what: str = "Central index chunk"):
+        self.stream, self.buffer, self.offset, self.what = stream, b"", 0, what
 
     def take(self, size: int) -> bytes:
         end = self.offset + size
@@ -1117,7 +1467,7 @@ class _Reader:
             self.offset, end = 0, size
             if end > len(self.buffer):
                 if self.buffer:
-                    raise EOFError("Central index chunk ends inside a record")
+                    raise EOFError(f"{self.what} ends inside a record")
                 return b""
         data = self.buffer[self.offset:end]
         self.offset = end
@@ -1126,7 +1476,7 @@ class _Reader:
     def number(self, form: str) -> int:
         data = self.take(struct.calcsize(form))
         if not data:
-            raise EOFError("Central index chunk ends inside a record")
+            raise EOFError(f"{self.what} ends inside a record")
         return struct.unpack(form, data)[0]
 
 
@@ -1247,9 +1597,117 @@ def _drop(connection, record_id: str) -> int:
     return connection.execute("DELETE FROM records WHERE id = ?", (record_id,)).rowcount
 
 
+def _hourly(tag: str, day: str) -> str:
+    return f"{day}_delta_CVEs_at_{tag.rsplit('_', 1)[1]}.zip"
+
+
+def _tag_time(tag: str) -> str:
+    """cve_2026-10-30_1100Z as 2026-10-30T11:00:00Z."""
+    found = cna.TAG.search(f"releases/tag/{tag}")
+    return f"{found.group(2)}T{found.group(3)[:2]}:{found.group(3)[2:]}:00Z" if found else ""
+
+
+def _fetch_note(finished: dict) -> str:
+    pending = finished["bodies_not_fetched"]
+    return f"; {pending} records still to fetch: sync cvelist again later" if pending else ""
+
+
+def _cna_apply(connection, raw: bytes | dict, replace: bool = True) -> int:
+    """Store a CVE JSON 5 record, or drop it when it is no longer published; 1 when stored."""
+    try:
+        data = json.loads(raw) if isinstance(raw, (bytes, str)) else raw
+    except ValueError:
+        return 0
+    record = cna.trim(data) if isinstance(data, dict) else None
+    if record is None:
+        return 0
+    ident = record["id"]
+    if replace:
+        for table in ("keys", "packages", "cpes", "records"):
+            connection.execute(f"DELETE FROM {table} WHERE id = ?", (ident,))
+    if record["state"] != "PUBLISHED":
+        return 0
+    keys, packages, cpes = cna.facets(record)
+    connection.execute("INSERT INTO records VALUES (?, ?, ?, ?, ?)",
+                       (ident, record["cna"], record["published"], record["updated"],
+                        zlib.compress(json.dumps(record, separators=(",", ":")).encode("utf-8"))))
+    connection.executemany("INSERT INTO keys VALUES (?, ?)", [(k, ident) for k in sorted(keys)])
+    connection.executemany("INSERT INTO packages VALUES (?, ?, ?, ?)",
+                           [(n, cna.module_key(n), ident, how) for n, how in sorted(packages)])
+    connection.executemany("INSERT INTO cpes VALUES (?, ?, ?)", [(*c.split(":", 1), ident) for c in sorted(cpes)])
+    return 1
+
+
+class _Unsized(Exception):
+    """A zip entry whose sizes follow its data: it cannot be read as the zip streams past."""
+
+
+def _snapshot_files(path: Path, scratch: Path, streamed: bool = True) -> Iterator[bytes]:
+    """The record files of a cvelistV5 snapshot, a zip that holds one zip (cves.zip) of 400,000 records. The
+    inner zip is read as it is decompressed rather than unpacked to disk first (``streamed``); that raises
+    _Unsized at an entry whose sizes follow its data, and then it has to be unpacked."""
+    unpacked = scratch / "cves.zip"
+    with zipfile.ZipFile(path) as outer:
+        inner = next((i for i in outer.infolist() if i.filename.endswith(".zip")), None)
+        if inner is None:
+            raise SyncError(f"{path.name}: holds no zip of records")
+        if streamed:
+            with outer.open(inner) as stream:
+                yield from _local_entries(_Reader(stream, inner.filename))
+            return
+        with outer.open(inner) as stream, unpacked.open("wb") as out:
+            shutil.copyfileobj(stream, out, 1 << 20)
+    try:
+        with zipfile.ZipFile(unpacked) as archive:
+            for info in archive.infolist():
+                if CVE_FILE.search(info.filename):
+                    yield archive.read(info)
+    finally:
+        unpacked.unlink(missing_ok=True)
+
+
+def _local_entries(reader) -> Iterator[bytes]:
+    """The record files of a zip read front to back, by the header before each entry."""
+    while True:
+        head = reader.take(30)
+        if head[:4] != b"PK\x03\x04":
+            return  # the central directory
+        if len(head) < 30:
+            raise EOFError(f"{reader.what} ends inside an entry")
+        _, _, flags, method, _, _, _, size, _, name_size, extra_size = struct.unpack("<IHHHHHIIIHH", head)
+        name = reader.take(name_size).decode("utf-8", "replace")
+        extra = reader.take(extra_size)
+        if flags & 0x08:
+            raise _Unsized(name)
+        if flags & 0x01:
+            raise SyncError(f"{name}: encrypted")
+        if size == 0xFFFFFFFF:
+            size = _zip64_size(extra)
+        data = reader.take(size)
+        if len(data) < size:
+            raise EOFError(f"{reader.what} ends inside {name}")
+        if not CVE_FILE.search(name):
+            continue
+        if method == 8:
+            data = zlib.decompress(data, -15)
+        elif method != 0:
+            raise SyncError(f"{name}: compressed by method {method}")
+        yield data
+
+
+def _zip64_size(extra: bytes) -> int:
+    offset = 0
+    while offset + 4 <= len(extra):
+        tag, length = struct.unpack_from("<HH", extra, offset)
+        if tag == 1 and length >= 16:
+            return struct.unpack_from("<QQ", extra, offset + 4)[1]
+        offset += 4 + length
+    raise SyncError("a zip entry states its size in a form not known")
+
+
 def spring_advisories(page: dict) -> dict[str, dict]:
-    """CVE id -> the modules, project and publication date of its advisory, from the data behind spring.io's
-    security page. That data serves the site, not clients: a layout this does not know is refused rather than
+    """CVE id -> the modules, affected versions, project and publication date of its advisory, from the data
+    behind spring.io's security page. That data serves the site, not clients: a layout this does not know is refused rather than
     read as no advisories."""
     try:
         nodes = page["result"]["data"]["cves"]["nodes"]
@@ -1267,11 +1725,16 @@ def spring_advisories(page: dict) -> dict[str, dict]:
         except ValueError:
             affected = {}
         modules = [a for a in (affected.get("artifacts") or []) if isinstance(a, str) and a.count(":") == 1]
+        # A line without "introduced" is every version up to its last affected one.
+        versions = [{"introduced": v.get("introduced") or "", "last_affected": v["last-affected"],
+                     "fixes": [f["version"] for f in v.get("fixes") or [] if isinstance(f, dict) and f.get("version")]}
+                    for v in affected.get("versions") or [] if isinstance(v, dict) and v.get("last-affected")]
         month, _, rest = (fields.get("publishedAt") or "").partition(" ")
         day, _, year = rest.partition(", ")
         published = f"{year}-{MONTHS[month]:02d}-{int(day):02d}" if month in MONTHS and day.isdigit() \
             and year.isdigit() else ""
-        out[slug] = {"modules": modules, "project": fields.get("project") or "", "published": published}
+        out[slug] = {"modules": modules, "versions": versions, "project": fields.get("project") or "",
+                     "published": published}
     if not out:
         raise SyncError("spring.io: the security page's data lists no advisories")
     return out

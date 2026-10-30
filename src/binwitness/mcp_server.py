@@ -42,27 +42,39 @@ STATEMENT = ("Findings are the advisories OSV attributes to the components that 
              "that it has no flaws. Jars and scripts counted under not_identified are not covered, and first-party "
              "jars are not looked up. There is no reachability analysis: nothing here says whether the application "
              "uses the affected code.")
-CANDIDATE_NOTE = ("Candidates are NVD records that no advisory in the local OSV data attributes to a package. Each "
+CANDIDATE_NOTE = ("Candidates are CVE records that no advisory in the local OSV data attributes to a package. Each "
                   "reaches a component through a CPE (an NVD product name) learned from the CVEs OSV does attribute "
-                  "to it, and NVD's version range for that CPE. They are leads for manual review: they are not "
-                  "findings, are not counted with them, and a CPE can name a product (a server, a driver for "
-                  "another language) wider than the component. Components without a learned CPE were not checked.")
+                  "to it, and NVD's version range for that CPE; or, for a record NVD has given no CPE yet, through "
+                  "what its CNA's own record names (a package, a CPE, or a product name learned the same way) and "
+                  "the CNA's versions; or through a vendor's advisory that names the module, with its versions. "
+                  "They are leads for manual review: they are not findings, are not counted with them, and a "
+                  "product name can stand for something (a server, a driver for another language) wider than the "
+                  "component.")
 CANDIDATE_JUDGING = [
     "Read the description: does it name this library or a module of it, or another product of the vendor, a "
     "binding for another language, or software that only bundles it?",
-    "versions is NVD's range for the CPE; conditional means NVD lists the CPE only together with another product "
-    "(a platform), and the record applies only there.",
+    "versions is the affected range, and versions_from says whose it is: NVD's for the CPE, the CNA's record's, "
+    "or the vendor's advisory's. conditional means NVD lists the CPE only together with another product (a "
+    "platform), and the record applies only there. below_listed_lines means the version is affected only by a "
+    "range from the first version up, on a release line older than the lines the vendor lists: one it no longer "
+    "supports and did not look at, so the range may be wider than the flaw. A line a record does not list is not "
+    "thereby safe either.",
     "links show how each CPE was learned. single_cve means one CVE of the package carries it: a weak link. "
     "packages above 1 means the CPE stands for several packages, so the record may concern another of them. "
     "basis named means the record names this module (groupId:artifactId, or an artifactId with a build such as "
     "-fips or -jdk18on, in any build), and the CPE was learned for others of its project. basis advisory means "
-    "the vendor's own advisory of the CVE names this module (advisory_modules lists the modules it names).",
+    "the vendor's own advisory of the CVE names this module (advisory_modules lists the modules it names). "
+    "For a record NVD has given no CPE yet (record_from cna): basis cna_package means the CNA's record names the "
+    "package (or another build of its module), cna_cpe a CPE in it that is linked with the package, cna_learned "
+    "its product name (cna_product), linked with the package the way CPEs are; advisory_direct means the "
+    "vendor's advisory names the module, with versions of its own.",
     "flags are facts for the reviewer, not verdicts: same_flaw_as lists findings of the component whose record "
     "refers to this CVE or the other way round (a copy of a flaw in another product gets its own CVE); "
     "other_language_only means the record names bindings for other languages and not the component's; "
     "classes_in_jar and classes_not_in_jar compare the classes the record names with the component's jar (a "
     "deserialization record names other libraries' classes, and a class added in a later version is missing from "
-    "an earlier one); advisory_names_another_module means the vendor's advisory names other modules of the "
+    "an earlier one); classes_not_in_jar is empty when the jar holds, or may hold, any of them, since a record also "
+    "names the JDK's classes a flaw goes through; advisory_names_another_module means the vendor's advisory names other modules of the "
     "project and not this one. A vendor may name the module a feature is used through while the flaw is in a "
     "shared module it depends on, so the pair is kept: check which module holds the code the fix changed.",
     "fixed_classes are the classes changed by the GitHub commits the record cites as its fix (fix_commits; those "
@@ -73,7 +85,8 @@ CANDIDATE_JUDGING = [
     "change several modules, and a commit a record cites is not always the fix. fix_source_directories names "
     "where the changed sources were (java, or a build variant's own such as jdk1.4); fix_commits_elsewhere are "
     "commits of other projects the record cites, not read.",
-    "status is NVD's analysis state; disputed means the record says the CVE is disputed.",
+    "status is NVD's analysis state (Not in NVD when NVD does not have the record yet); cna is the organisation "
+    "that published the record; disputed means the record says the CVE is disputed.",
     "Say which way you judged and why, that it is a first pass from the record's text, and that candidates are "
     "not counted in the findings.",
 ]
@@ -297,7 +310,7 @@ class Service:
             "candidates": self._candidate_state(result),
             "warnings": {"total": len(result["warnings"]), "first": result["warnings"][:10]},
             "next": "list_components (min_severity, text), get_component, get_vulnerability, upgrade_plan; "
-                    "list_candidates and get_candidate for the NVD leads",
+                    "list_candidates and get_candidate for the candidates (leads, not findings)",
         }
 
     def list_components(self, scan_id: str, text: str | None = None, min_severity: str | None = None,
@@ -376,11 +389,12 @@ class Service:
             mine = sorted((c for c in result["candidates"].values() if ref in c["affects"]),
                           key=lambda c: (_rank(c["severity"]), c["id"]))
             out["candidates"] = [{"id": c["id"], "severity": c["severity"], "disputed": c["disputed"],
-                                  **{k: c["affects"][ref].get(k) for k in ("cpe", "versions", "conditional", "basis",
-                                                                           "single_cve_link")},
+                                  **{k: c["affects"][ref].get(k) for k in ("cpe", "versions", "versions_from",
+                                                                           "conditional", "basis", "single_cve_link",
+                                                                           "below_listed_lines")},
                                   "flags": _flags(c["affects"][ref])} for c in mine]
             out["candidates_note"] = (
-                "NVD leads, not findings; get_candidate shows one" if mine else
+                "leads, not findings; get_candidate shows one" if mine else
                 "no candidate: " + ("no CPE could be learned for this package, so NVD was not checked"
                                     if ref not in (result.get("candidate_links") or {}) else
                                     "NVD has no unattributed record for its CPE at this version"))
@@ -394,7 +408,7 @@ class Service:
                                                               *map(str.upper, v.get("osv_ids", []))}), None)
         if key is None:
             if wanted in (result.get("candidates") or {}):
-                raise Refused(f"{vuln_id} is not a finding but an NVD candidate of this scan; get_candidate shows it")
+                raise Refused(f"{vuln_id} is not a finding but a candidate of this scan; get_candidate shows it")
             raise Refused(f"{vuln_id} is not among this scan's findings; list_components or get_component shows "
                           f"the ids found")
         entry = table[key]
@@ -421,7 +435,8 @@ class Service:
             if (c["disputed"] and not include_disputed) or (min_severity and _rank(c["severity"]) > threshold):
                 continue
             refs = [ref for ref, a in c["affects"].items()
-                    if wanted in ref.lower() or wanted in a["cpe"].lower()]
+                    if wanted in ref.lower() or wanted in a["cpe"].lower()
+                    or wanted in (a.get("cna_product") or "").lower()]
             if refs:
                 chosen.append((c, refs))
         # Leads without a flag first: a flag is a reason to look twice before spending time on one.
@@ -435,7 +450,8 @@ class Service:
             listed.append({
                 "id": c["id"], "severity": c["severity"], "cvss_score": c["cvss_score"], "status": c["status"],
                 "disputed": c["disputed"], "known_exploited_since": c["kev_date_added"],
-                "published": (c["published"] or "")[:10], "cpes": sorted({a["cpe"] for a in affects}),
+                "published": (c["published"] or "")[:10], "cna": c.get("cna"),
+                "cpes": sorted({a["cpe"] for a in affects if a["cpe"]}),
                 "components": refs[:5], "other_components": len(refs) - 5 if len(refs) > 5 else 0,
                 "only_single_cve_links": all(a["single_cve_link"] for a in affects),
                 "flags": sorted({f for a in affects for f in _flags(a)}),
@@ -720,7 +736,7 @@ class Service:
         if not state["checked"]:
             return f"not checked: {state['not_checked']}"
         counts = state["components"]
-        return (f"{state['total']} NVD candidates (leads, not findings; list_candidates), looked for in "
+        return (f"{state['total']} candidates (leads, not findings; list_candidates), looked for in "
                 f"{counts['with_link']} components; {counts['without_link'] + counts['not_checked']} not checked")
 
     @staticmethod
@@ -893,6 +909,8 @@ def _flags(affected: dict) -> list[str]:
         flags.append("advisory_names_another_module")
     if affected.get("fixed_classes_not_in_jar"):
         flags.append("fixed_classes_not_in_jar")
+    if affected.get("below_listed_lines"):
+        flags.append("below_listed_lines")
     return flags
 
 
@@ -1026,13 +1044,16 @@ def build_server(service: Service):
                                 vuln_id: Annotated[str, Field(description="CVE, GHSA or OSV id")]) -> dict[str, Any]:
         return await call(service.get_vulnerability, scan_id, vuln_id)
 
-    @server.tool(title="NVD candidates", structured_output=True, annotations=reading,
-                 description="NVD records that no advisory in the local OSV data attributes to a package, matched to "
-                             "components through a CPE learned from the CVEs OSV does attribute to them: leads for "
-                             "manual review, not findings. Worst first. Sends nothing.")
+    @server.tool(title="Candidates", structured_output=True, annotations=reading,
+                 description="CVE records that no advisory in the local OSV data attributes to a package, matched to "
+                             "components through a CPE learned from the CVEs OSV does attribute to them, or, while "
+                             "NVD has given a record no CPE, through what its CNA's record names; and vendor "
+                             "advisories that name a module: leads for manual review, not findings. Worst first. "
+                             "Sends nothing.")
     async def list_candidates(scan_id: ScanId,
-                              text: Annotated[str | None, Field(description="part of a component's purl or of the "
-                                                                            "CPE (vendor:product)")] = None,
+                              text: Annotated[str | None, Field(description="part of a component's purl, of the "
+                                                                            "CPE (vendor:product) or of the product "
+                                                                            "the CNA's record names")] = None,
                               min_severity: Annotated[Literal["critical", "high", "medium", "low"] | None,
                                                       Field(description="only candidates at or above this NVD "
                                                                         "severity")] = None,
@@ -1042,9 +1063,10 @@ def build_server(service: Service):
         return await call(service.list_candidates, scan_id, text, min_severity, include_disputed, offset, limit)
 
     @server.tool(title="Candidate details", structured_output=True, annotations=reading,
-                 description="One NVD candidate: the record as stored at the last sync (status, description, CVSS, "
-                             "CWE, references), the components it reaches with NVD's version range, how each CPE was "
-                             "learned, and what to check before taking it as a finding. Sends nothing.")
+                 description="One candidate: the record as stored at the last sync (status, description, CVSS, "
+                             "CWE, references), the components it reaches with the version range and whose it is, "
+                             "how each CPE was learned, and what to check before taking it as a finding. Sends "
+                             "nothing.")
     async def get_candidate(scan_id: ScanId,
                             cve_id: Annotated[str, Field(description="CVE id of the candidate")]) -> dict[str, Any]:
         return await call(service.get_candidate, scan_id, cve_id)

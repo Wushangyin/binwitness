@@ -16,15 +16,19 @@ import io
 import json
 import re
 from collections import Counter
-from collections.abc import Callable, Iterator
-from dataclasses import asdict, dataclass
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import asdict, dataclass, replace
 
-from binwitness import fixes
+from binwitness import cna, fixes
 from binwitness.versions import compare
 from binwitness.vulns import SEVERITIES
 
 NVD_FEEDS = "https://nvd.nist.gov/feeds/json/cve/2.0"
 NVD_CVE = "https://nvd.nist.gov/vuln/detail"
+CVE_ORG = "https://www.cve.org/CVERecord?id="
+NOT_IN_NVD = "Not in NVD"
+# The ways a CNA's record or a vendor's advisory reaches a package, in the order they are tried.
+CNA_PATHS = ("cna_package", "cna_cpe", "cna_learned", "advisory_direct")
 FIRST_YEAR = 2002
 # The four conditions for linking a CPE with a package, set on the NVD and OSV data of October 2026 (see
 # Linker). Products that bundle a library (an appliance, a suite) are what they keep out.
@@ -502,21 +506,31 @@ _BUILD = re.compile(r"(?:-(?:fips|jdk\d+(?:on|to\d+)?|lts\d+on|jre\d+))+$")
 _ARTIFACT = re.compile(r"(?<![\w./:@-])([a-z][a-z0-9]*(?:[-_.][a-z0-9]+)+)(?![\w-])")
 _QUALIFIED_CLASS = re.compile(r"(?<![\w.$/])((?:[a-z_][a-z0-9_]*\.){2,}[A-Z][\w$]*)")
 _WORD = re.compile(r"(?<![\w.$])([A-Z][A-Za-z0-9]*[a-z][A-Za-z0-9]*)(?![\w$])")
+# A name followed by one of its members (HTTP2Flusher.terminated, Parser.parse()): a class, however short.
+_MEMBER = re.compile(r"(?<![\w.$])([A-Z][A-Za-z0-9]*[a-z][A-Za-z0-9]*)\.([A-Za-z_]\w*)(\()?")
 _HUMP = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+")
 _LANGUAGES = {
-    "Java": r"\bJava\b(?!\s*Script)|\bJVM\b|Connector/J\b",
+    "Java": r"\bJava\b(?!\s*Script|\s?ME\b)|\bJVM\b|Connector/J\b",
+    "Java ME": r"\bJava\s?ME\b",
     "Kotlin": r"\bKotlin\b", "Scala": r"\bScala\b", "Groovy": r"\bGroovy\b",
-    "JavaScript": r"\bJavaScript\b|\bTypeScript\b",
+    "JavaScript": r"\bJavaScript\b|\bTypeScript\b|\bJS\b",
     "Node.js": r"\bNode\.?js\b|Connector/Node\.js",
     "Go": r"\bGo\b|\bgolang\b", "C++": r"C\+\+", "C#": r"C#", ".NET": r"\.NET\b|Connector/NET\b",
     "C": r"\bc_glib\b|\bC/GLib\b|Connector/C\b(?!\+)|Connector/ODBC\b|\bC (?:client|cli|library|bindings?|API)\b",
+    "D": r"\bD (?:lang(?:uage)?|bindings?)\b",
     "Python": r"\bPython\b", "Ruby": r"\bRuby\b", "Rust": r"\bRust\b", "PHP": r"\bPHP\b", "Perl": r"\bPerl\b",
     "Haskell": r"\bHaskell\b", "Erlang": r"\bErlang\b", "Lua": r"\bLua\b", "Swift": r"\bSwift\b",
     "Dart": r"\bDart\b", "Delphi": r"\bDelphi\b",
 }
 _LANGUAGE_PATTERNS = {label: re.compile(pattern) for label, pattern in _LANGUAGES.items()}
+# Where bindings are named, a name in lower case is a language all the same (Apache Thrift's "go bindings").
+_LANGUAGE_PATTERNS_ANY_CASE = {label: re.compile(pattern, re.I) for label, pattern in _LANGUAGES.items()}
+_BINDINGS = re.compile(r"\bbindings\b", re.I)
+# What a list of bindings cannot reach back past: a sentence, or the "in" of "vulnerability in Apache Thrift ...".
+_CLAUSE = re.compile(r"\.\s|[;:\n]|\b(?:in|of|for|with|from|by)\s", re.I)
+BINDINGS_REACH = 120
 # A package's own languages, and the ones that say nothing about a binding when named (a cross-site scripting
-# record of a Java library speaks of JavaScript).
+# record of a Java library speaks of JavaScript): JavaScript named as bindings still does.
 OWN_LANGUAGES = {"maven": {"Java", "Kotlin", "Scala", "Groovy"}, "npm": {"JavaScript", "Node.js"}}
 NEUTRAL_LANGUAGES = {"maven": {"JavaScript", "Node.js"}, "npm": set()}
 CLASS_WORD_HUMPS = 3
@@ -540,6 +554,18 @@ def _humps(word: str) -> int:
     return sum(1 for part in _HUMP.findall(word) if not part.isdigit())
 
 
+def _bound_languages(text: str) -> list[str]:
+    """The languages a text names bindings of, in any case: "Thrift nodejs and D lang bindings"."""
+    found = []
+    for match in _BINDINGS.finditer(text):
+        reach = max(0, match.start() - BINDINGS_REACH)
+        start = max((c.end() for c in _CLAUSE.finditer(text, reach, match.start())), default=reach)
+        phrase = text[start:match.end()]
+        found += [label for label, pattern in _LANGUAGE_PATTERNS_ANY_CASE.items() if pattern.search(phrase)]
+    return list(dict.fromkeys(found))
+
+
+
 @dataclass(frozen=True)
 class Naming:
     """What a record's description names: Maven modules, languages, Java classes, other CVEs. ``builds`` are
@@ -549,23 +575,37 @@ class Naming:
     languages: tuple[str, ...]
     classes: tuple[str, ...]
     cves: frozenset
+    # Two-word names known to be classes, by a member named after them or by a fix that changed a class of
+    # that name: missing from a jar, they count.
+    confirmed: tuple[str, ...] = ()
+    # Languages named as bindings: never neutral (Apache Thrift's "all JS bindings").
+    bound: tuple[str, ...] = ()
 
     @classmethod
-    def of(cls, record: dict | None, is_class=None) -> "Naming":
+    def of(cls, record: dict | None, is_class=None, fixed: Iterable[str] = ()) -> "Naming":
         """``is_class``: whether a word is the simple name of a class in some jar at hand, which makes a
-        two-word name (CertificatePinner) count; without it only longer names do."""
+        two-word name (CertificatePinner) count; without it only longer names do. ``fixed``: the classes the
+        record's fix changed, which make a two-word name count too (MqttEncoder, when no jar at hand has it)."""
         text = (record or {}).get("description") or ""
         modules = tuple(dict.fromkeys(f"{g}:{a}" for g, a in _COORDINATE.findall(text)))
         builds = tuple(dict.fromkeys(a for a in _ARTIFACT.findall(text) if module_of(a) != a))
-        languages = tuple(label for label, pattern in _LANGUAGE_PATTERNS.items() if pattern.search(text))
+        bound = _bound_languages(text)
+        languages = tuple(dict.fromkeys(
+            [label for label, pattern in _LANGUAGE_PATTERNS.items() if pattern.search(text)] + bound))
         qualified = list(dict.fromkeys(_QUALIFIED_CLASS.findall(text)))
         tails = {q.rsplit(".", 1)[1] for q in qualified}
+        # A member of 2-4 letters is more often a domain or a file type (Node.js, Socket.IO) than a field.
+        referenced = {w for w, member, call in _MEMBER.findall(text)
+                      if call or len(member) >= 5 or any(c.isupper() for c in member)}
+        referenced |= {f.rsplit(".", 1)[-1] for f in fixed}
         # A bare word counts when it reads as a class name (UrlFilenameViewController), or when it is one in a
-        # jar at hand; WebFlux or GitHub could as well be a product or a concept.
+        # jar at hand, or is followed by a member; WebFlux or GitHub could as well be a product or a concept.
         words = [w for w in dict.fromkeys(_WORD.findall(text)) if w not in tails and (
-                 _humps(w) >= CLASS_WORD_HUMPS or _humps(w) == 2 and is_class is not None and is_class(w))]
+                 _humps(w) >= CLASS_WORD_HUMPS or _humps(w) == 2 and (
+                     w in referenced or is_class is not None and is_class(w)))]
         return cls(modules, builds, languages, tuple(qualified + words),
-                   frozenset(_CVE.findall(text)) - {(record or {}).get("id")})
+                   frozenset(_CVE.findall(text)) - {(record or {}).get("id")},
+                   tuple(w for w in words if w in referenced and _humps(w) < CLASS_WORD_HUMPS), tuple(bound))
 
     def modules_of(self, ecosystem: str, home: str, group_of=None) -> set[str]:
         """The modules named that belong to a family: the record is about those, not the family's others.
@@ -579,31 +619,47 @@ class Naming:
         return named
 
     def other_language_only(self, ecosystem: str) -> bool:
-        named = set(self.languages) - NEUTRAL_LANGUAGES.get(ecosystem, set())
+        named = set(self.languages) - NEUTRAL_LANGUAGES.get(ecosystem, set()) | set(self.bound)
         own = OWN_LANGUAGES.get(ecosystem, set())
         return bool(named) and not named & own
 
-    def placed(self, classes: set[str] | None) -> tuple[list[str] | None, list[str] | None]:
+    def placed(self, classes: set[str] | None, unsure: set[str] = frozenset()) -> tuple[list[str] | None,
+                                                                                      list[str] | None]:
         """(named classes the jar holds, named classes it does not); None for both when its entries are
-        unknown. A relocated (shaded) copy of a class counts as held, and the case of a name is not trusted."""
+        unknown. ``unsure``: entries it may or may not hold (a shaded library's, see scan._Listings). A relocated
+        (shaded) copy of a class counts as held, and the case of a name is not trusted. The classes it does not
+        hold are none when it holds, or may hold, any of them: a record names the classes a flaw goes through,
+        the JDK's (X509TrustManager) among them."""
         if classes is None:
             return None, None
-        # Records misspell the case now and then (UrlFileNameViewController).
-        lowered = {e.lower() for e in classes}
-        simple = {part for entry in lowered for part in entry.rsplit("/", 1)[-1][:-len(".class")].split("$")}
-        held, missing = [], []
+        own, maybe = _class_index(classes), _class_index(unsure)
+        held, missing, may_hold = [], [], False
         for name in self.classes:
-            if "." in name:
-                path = name.replace(".", "/").lower() + ".class"
-                inside = any(e == path or e.endswith("/" + path) for e in lowered)
-            else:
-                inside = name.lower() in simple
-            # A two-word name missing from the jar says little: BigInteger is the JDK's, not this library's.
-            if inside:
+            # A two-word name missing from the jar says little: BigInteger is the JDK's, not this library's;
+            # unless it is known to be a class (``confirmed``).
+            if _holds(own, name):
                 held.append(name)
-            elif "." in name or _humps(name) >= CLASS_WORD_HUMPS:
+            elif _holds(maybe, name):
+                may_hold = True
+            elif name.startswith("java."):
+                continue  # only the JDK may define classes in java.*
+            elif "." in name or _humps(name) >= CLASS_WORD_HUMPS or name in self.confirmed:
                 missing.append(name)
-        return held, missing
+        return held, [] if held or may_hold else missing
+
+
+def _class_index(entries: set[str]) -> tuple[set[str], set[str]]:
+    # Records misspell the case now and then (UrlFileNameViewController).
+    lowered = {e.lower() for e in entries}
+    return lowered, {part for entry in lowered for part in entry.rsplit("/", 1)[-1][:-len(".class")].split("$")}
+
+
+def _holds(index: tuple[set[str], set[str]], name: str) -> bool:
+    lowered, simple = index
+    if "." in name:
+        path = name.replace(".", "/").lower() + ".class"
+        return any(e == path or e.endswith("/" + path) for e in lowered)
+    return name.lower() in simple
 
 
 # ---- candidates -----------------------------------------------------------------------------------------
@@ -612,7 +668,8 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
            reason: str | None, listings=None) -> tuple[dict, dict, dict]:
     """(candidates by CVE id, links by purl, summary). ``datasets``: ecosystem -> its OSV dataset name;
     ``reason``: why candidates cannot be looked for at all, if so; ``listings``: the jar entries at hand, with
-    ``of(item)`` (the class entries of the jar holding an item, None when unknown) and ``has_class(name)``."""
+    ``of(item)`` (the class entries of the jar holding an item, None when unknown), ``has_class(name)`` and,
+    optionally, ``unsure(item)`` (entries it may or may not hold)."""
     if reason:
         return {}, {}, {"checked": False, "not_checked": reason}
     linker = Linker(db)
@@ -637,11 +694,29 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
     named_in: dict[tuple[str, str], set[str]] = {}
     advisory_in: dict[tuple[str, str], set[str]] = {}
 
-    held: dict[str, set | None] = {}
+    held: dict[str, tuple[set | None, set]] = {}
+    named_items = {item["purl"]: item for item in items}
+
+    cna_bodies: dict[str, dict | None] = {}
+
+    def cna_record(ident: str) -> dict | None:
+        if ident not in cna_bodies:
+            cna_bodies[ident] = db.cna_records([ident]).get(ident) if db.has("cvelist") else None
+        return cna_bodies[ident]
 
     def naming(ident: str) -> Naming:
         if ident not in namings:
-            namings[ident] = Naming.of(linker.record(ident), listings.has_class if listings else None)
+            is_class = listings.has_class if listings else None
+            fixed = (db.fix_of(ident) or {}).get("classes", [])
+            record = linker.record(ident)
+            if record is not None:
+                namings[ident] = Naming.of(record, is_class, fixed)
+            else:
+                # NVD has no text of it yet: the CNA's, with the classes its program files name.
+                own = cna_record(ident) or {}
+                facts = Naming.of(own, is_class, fixed)
+                files = [c for c in cna.program_classes(own.get("affected") or []) if c not in facts.classes]
+                namings[ident] = replace(facts, classes=facts.classes + tuple(files))
         return namings[ident]
 
     def group_of(home: str):
@@ -668,14 +743,15 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
             advisory_in[(ident, home)] = {m for m in modules if family("maven", m) == home}
         return advisory_in[(ident, home)]
 
-    def entries(item: dict) -> set | None:
+    def entries(item: dict) -> tuple[set | None, set]:
         if item["purl"] not in held:
-            held[item["purl"]] = listings.of(item) if listings else None
+            unsure = getattr(listings, "unsure", None)
+            held[item["purl"]] = (listings.of(item), unsure(item) if unsure else set()) if listings else (None, set())
         return held[item["purl"]]
 
     def placed(ident: str, item: dict) -> tuple[list | None, list | None]:
         facts = naming(ident)
-        return facts.placed(entries(item)) if facts.classes else ([], [])
+        return facts.placed(*entries(item)) if facts.classes else ([], [])
 
     def hit_of(ident: str, cpe: str, ecosystem: str, version: str) -> Match | None:
         return next((m for m in map(match_of, (linker.record(ident) or {}).get("matches", []))
@@ -685,8 +761,10 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
         entry = table.get(ident) or table.setdefault(ident, _candidate(linker.record(ident), kev_dates))
         entry["affects"].setdefault(item["purl"], {"cpe": cpe, "versions": hit.describe(),
                                                    "conditional": hit.conditional, "basis": basis,
-                                                   "single_cve_link": single})
+                                                   "single_cve_link": single, "versions_from": "nvd",
+                                                   "below_listed_lines": False, "cna_product": ""})
 
+    item_links: dict[str, dict[str, Link]] = {}
     for item in items:
         ecosystem = item["ecosystem"]
         problem = db.cve_index_missing(datasets.get(ecosystem))
@@ -694,6 +772,7 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
             not_checked[problem] += 1
             continue
         links = linker.links(ecosystem, item["name"])
+        item_links[item["purl"]] = links
         refused |= {(ecosystem, item["name"], cpe) for cpe in linker.apart(ecosystem, item["name"])}
         if not links or not item["version"]:
             without += 1
@@ -736,9 +815,104 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
                 hit = hit_of(ident, cpe, ecosystem, item["version"])
                 if hit is not None:
                     add(ident, item, cpe, hit, "named" if name in stated else "advisory", False)
+
+    # The CNAs' own records and the vendors' advisories, for what NVD cannot tell: records it has given no CPE
+    # yet, and, where a record or advisory names the package itself, records whose CPEs are not linked with it.
+    reaching: dict[str, dict[str, list[tuple[str, str]]]] = {}
+    for item in items:
+        name = item["name"]
+        if item["ecosystem"] != "maven" or ":" not in name or not item["version"] or item["purl"] not in item_links:
+            continue
+        module, found = cna.module_key(name), {}
+        if db.has("cvelist"):
+            for package, ident, how in db.cna_packages(module):
+                if how == "package" or db.known_package(package):
+                    found.setdefault(ident, []).append(("cna_package", package))
+            for cpe in sorted(item_links[item["purl"]]):
+                for ident in db.cna_cpe_ids(cpe):
+                    found.setdefault(ident, []).append(("cna_cpe", cpe))
+            for key in db.cna_links(name):
+                for ident in db.cna_key_ids(key):
+                    found.setdefault(ident, []).append(("cna_learned", key))
+        for ident in db.advised(module):
+            found.setdefault(ident, []).append(("advisory_direct", ""))
+        if found:
+            reaching[item["purl"]] = found
+    every = sorted({i for found in reaching.values() for i in found})
+    attribution, nvd_statuses = db.osv_attribution(every), db.nvd_status(every)
+    explicit = {i for i, named_by in (db.cna_named_packages(every) if db.has("cvelist") else {}).items()
+                if any(how == "package" or db.known_package(p) for p, how in named_by)}
+
+    def candidate_of(ident: str) -> dict:
+        record = linker.record(ident)
+        if record is not None:
+            return _candidate(record, kev_dates)
+        return _cna_candidate(cna_record(ident) or {"id": ident}, nvd_statuses.get(ident), kev_dates)
+
+    for purl, found in sorted(reaching.items()):
+        item = named_items[purl]
+        name, version, own = item["name"], item["version"], _own_ids(item, vulnerabilities)
+        home, linked_here = family("maven", name), item_links[purl]
+        for ident, paths in sorted(found.items()):
+            if ident in own or attribution.get(ident) or purl in table.get(ident, {}).get("affects", {}):
+                continue
+            record = linker.record(ident)
+            nvd_cpes = {match_of(m).cpe for m in (record or {}).get("matches", [])}
+            if nvd_cpes & set(linked_here):
+                continue
+            left = None
+            undecided = False
+            for basis, via in sorted(dict.fromkeys(paths), key=lambda p: CNA_PATHS.index(p[0])):
+                # A product name or a CPE stands for a package only until NVD has analysed the record, and
+                # not for a record that names its packages.
+                if basis in ("cna_cpe", "cna_learned") and (record is not None or ident in explicit):
+                    continue
+                if basis == "advisory_direct":
+                    advisory = db.advisory(ident)
+                    status, ranges = cna.advisory_status(advisory, version), cna.advisory_ranges(advisory)
+                    versions, product, single = cna.describe_ranges(ranges), advisory.get("project") or "", False
+                else:
+                    own_record = cna_record(ident)
+                    chosen = cna.entries_for(own_record, basis, via, name, db.known_package) if own_record else []
+                    if not chosen:
+                        continue
+                    if basis != "cna_package":
+                        narrowed = [e for e in chosen if not cna.narrows(e, name)]
+                        if not narrowed:
+                            left = "package_name_narrows"
+                            continue
+                        chosen = narrowed
+                        modules = modules_named(ident, "maven", home)
+                        if modules and not speaks_for(modules, name) and not placed(ident, item)[0]:
+                            left = "names_another_module"
+                            continue
+                    status = cna.told(cna.status_of(e, version) for e in chosen)
+                    ranges, versions = cna.affected_ranges(chosen), cna.describe(chosen)
+                    product = cna.product_text(chosen)
+                    single = linked_here[via].single if basis == "cna_cpe" else \
+                        basis == "cna_learned" and db.cna_links(name).get(via) == 1
+                if status is None:
+                    undecided = True
+                    continue
+                if status == "affected":
+                    entry = table.get(ident) or table.setdefault(ident, candidate_of(ident))
+                    entry["affects"][purl] = {
+                        "cpe": via if basis == "cna_cpe" else "", "versions": versions, "conditional": False,
+                        "basis": basis, "single_cve_link": single,
+                        "versions_from": "advisory" if basis == "advisory_direct" else "cna",
+                        "below_listed_lines": cna.below_listed_lines(ranges, version), "cna_product": product}
+                left = undecided = None
+                break
+            if left:
+                left_out[left] += 1
+            elif undecided:
+                left_out["versions_not_told"] += 1
     named = {item["purl"]: item for item in items}
+    meta = db.cna_meta(table) if db.has("cvelist") else {}
     for ident, entry in table.items():
         facts = naming(ident)
+        entry["record_from"] = "nvd" if linker.record(ident) is not None else "cna"
+        entry["cna"], entry["cna_published"], entry["cna_updated"] = meta.get(ident) or (None, None, None)
         modules = sorted({m for (i, _), found in named_in.items() if i == ident for m in found} - set(facts.modules))
         entry["modules_named"], entry["languages_named"] = [*facts.modules, *modules], list(facts.languages)
         entry["classes_named"] = list(facts.classes)
@@ -758,9 +932,11 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
             affected["other_language_only"] = facts.other_language_only(item["ecosystem"])
             affected["classes_in_jar"], affected["classes_not_in_jar"] = placed(ident, item)
             # A jar of the affected versions holds what the fix changed, unless the flaw is in another module.
-            fixed = fixes.held(entry["fixed_classes"], entries(item)) if entry["fixed_classes"] else []
+            own, unsure = entries(item)
+            fixed = fixes.held(entry["fixed_classes"], own) if entry["fixed_classes"] else []
             affected["fixed_classes_in_jar"] = fixed
-            affected["fixed_classes_not_in_jar"] = fixed == [] and bool(entry["fixed_classes"])
+            affected["fixed_classes_not_in_jar"] = fixed == [] and bool(entry["fixed_classes"]) \
+                and not fixes.held(entry["fixed_classes"], unsure)
     table = dict(sorted(table.items()))
     pairs = [a for c in table.values() for a in c["affects"].values()]
     summary = {
@@ -780,18 +956,22 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
             "named_classes_not_in_jar": sum(1 for a in pairs if a["classes_not_in_jar"] and not a["classes_in_jar"]),
             "advisory_names_another_module": sum(1 for a in pairs if a["advisory_names_another_module"]),
             "fixed_classes_not_in_jar": sum(1 for a in pairs if a["fixed_classes_not_in_jar"]),
+            "below_listed_lines": sum(1 for a in pairs if a["below_listed_lines"]),
         },
         "fix_commits": _fix_counts(table) if db.has("fixes") else None,
         "pairs_reached_by_name": sum(1 for a in pairs if a["basis"] == "named"),
         "pairs_reached_by_advisory": sum(1 for a in pairs if a["basis"] == "advisory"),
+        "pairs_by_basis": dict(sorted(Counter(a["basis"] for a in pairs).items())),
+        "pairs_versions_from": dict(sorted(Counter(a["versions_from"] for a in pairs).items())),
+        "records_from_cna": sum(1 for c in table.values() if c["record_from"] == "cna"),
         "pairs_left_out": dict(left_out),
         "links_refused": {"version_ranges_apart": len(refused)},
         "components": {"with_link": linked, "without_link": without, "not_checked": sum(not_checked.values())},
         "components_not_checked_because": dict(not_checked),
         "nvd_records_without_cpe": db.nvd_without_cpe(),
         # An online scan's findings are as of the scan; its candidates are as of these copies.
-        "data_as_of": {n: db.data_as_of(n) for n in ["nvd", *sorted(set(datasets.values())), "spring", "fixes"]
-                       if db.has(n)},
+        "data_as_of": {n: db.data_as_of(n) for n in ["nvd", *sorted(set(datasets.values())), "cvelist", "spring",
+                                                     "fixes"] if db.has(n)},
     }
     return table, links_of, summary
 
@@ -824,6 +1004,21 @@ def _related(item: dict, ident: str, facts: Naming, vulnerabilities: dict, linke
         if ids & facts.cves or any(ident in Naming.of(linker.record(i)).cves for i in sorted(ids)):
             out.append(key)
     return out
+
+
+def _cna_candidate(record: dict, nvd_status: str | None, kev_dates: dict) -> dict:
+    """A candidate from a CNA's record, for a CVE NVD has not given a CPE (``nvd_status``: NVD's status of it,
+    None when NVD does not have it yet). A record not kept with its text has the id only."""
+    cvss = record.get("cvss") or {}
+    severity = cvss.get("severity") if cvss.get("severity") in SEVERITIES else "UNKNOWN"
+    ident = record["id"]
+    return {"id": ident, "status": nvd_status or NOT_IN_NVD, "disputed": bool(record.get("disputed")),
+            "severity": severity, "cvss_score": cvss.get("score"), "cvss_vector": cvss.get("vector"),
+            "cvss_source": cvss.get("source"), "kev_date_added": kev_dates.get(ident),
+            "published": record.get("published") or None, "modified": record.get("updated") or None,
+            "cwe": record.get("cwe") or [], "description": record.get("description") or "",
+            "references": record.get("references") or [],
+            "url": f"{NVD_CVE}/{ident}" if nvd_status else f"{CVE_ORG}{ident}", "affects": {}}
 
 
 def _candidate(record: dict, kev_dates: dict) -> dict:

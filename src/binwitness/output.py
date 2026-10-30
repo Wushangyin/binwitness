@@ -221,14 +221,19 @@ def vulnerabilities_csv(result: dict, path: Path):
 
 
 CANDIDATE_COLUMNS = ["id", "severity", "cvss score", "cvss vector", "cvss source", "nvd status", "disputed",
-                     "known exploited (CISA KEV)", "published", "component", "cpe", "affected versions (NVD)",
-                     "only together with another product", "learned link (package / product / project)",
+                     "known exploited (CISA KEV)", "published", "component", "cpe", "affected versions",
+                     "versions from", "only on a line below those listed", "product in the CNA's record", "cna",
+                     "cna published", "only together with another product", "learned link (package / product / project)",
                      "link learned from", "link rests on one CVE", "packages linked with this cpe", "reached by",
                      "modules the vendor's advisory names", "advisory names another module",
                      "same flaw as finding", "names only another language", "named classes in this jar",
                      "named classes not in this jar", "classes the fix changed", "of them in this jar",
                      "none of the fix's classes in this jar", "fix commits", "cwe", "description", "url", "data as of"]
-REACHED_BY = {"learned": "learned link", "named": "named in the record", "advisory": "named in the vendor's advisory"}
+REACHED_BY = {"learned": "learned link", "named": "named in the record", "advisory": "named in the vendor's advisory",
+              "cna_package": "package named in the CNA's record", "cna_cpe": "CPE in the CNA's record",
+              "cna_learned": "learned link (product in the CNA's record)",
+              "advisory_direct": "module named in the vendor's advisory, with its versions"}
+VERSIONS_FROM = {"nvd": "NVD", "cna": "CNA's record", "advisory": "vendor's advisory"}
 
 
 def candidates_csv(result: dict, path: Path):
@@ -251,7 +256,10 @@ def candidates_csv(result: dict, path: Path):
                 link = (links.get(ref) or {}).get(a["cpe"]) or {}
                 rows.append([c["id"], c["severity"], c["cvss_score"], c["cvss_vector"], c["cvss_source"], c["status"],
                              "yes" if c["disputed"] else "", c["kev_date_added"] or "", (c["published"] or "")[:10],
-                             ref, a["cpe"], a["versions"], "yes" if a["conditional"] else "", _link_text(link),
+                             ref, a["cpe"], a["versions"], VERSIONS_FROM.get(a.get("versions_from", "nvd"), ""),
+                             "yes" if a.get("below_listed_lines") else "", a.get("cna_product") or "",
+                             c.get("cna") or "", (c.get("cna_published") or "")[:10],
+                             "yes" if a["conditional"] else "", _link_text(link),
                              " ".join(link.get("learned_from") or []), "yes" if a["single_cve_link"] else "",
                              link.get("packages", ""), REACHED_BY.get(a.get("basis", "learned"), ""),
                              " ".join(c.get("advisory_modules") or []),
@@ -360,8 +368,10 @@ def _candidate_lines(summary: dict | None) -> list[str]:
         return [f"candidates   not checked: {summary.get('not_checked')}"]
     counts = summary["components"]
     dates = ", ".join(f"{name} of {stamp[:10]}" for name, stamp in summary.get("data_as_of", {}).items() if stamp)
-    lines = [f"candidates   {summary['total']} NVD records not attributed to a package in the local OSV data, not "
-             "counted above; leads for manual review" + (": " + _listing(
+    from_cna = summary.get("records_from_cna", 0)
+    lines = [f"candidates   {summary['total']} CVE records not attributed to a package in the local OSV data"
+             + (f" ({from_cna} of them as their CNAs published them: NVD has given no CPE yet)" if from_cna else "")
+             + ", not counted above; leads for manual review" + (": " + _listing(
                  [(k.lower(), n) for k, n in summary["by_severity"].items()]
                  + [("disputed", summary["disputed"]), ("known exploited", summary["known_exploited"]),
                     ("only from links that rest on one CVE", summary["only_from_single_cve_links"])])
@@ -373,7 +383,7 @@ def _candidate_lines(summary: dict | None) -> list[str]:
              + (f"; NVD has given no CPE yet to {sum(summary['nvd_records_without_cpe'].values()):,} records"
                 if summary.get("nvd_records_without_cpe") else "")
              + (f" (local {dates})" if dates else "")]
-    flagged, left_out = summary.get("pairs_flagged"), sum((summary.get("pairs_left_out") or {}).values())
+    flagged, left_out = summary.get("pairs_flagged"), summary.get("pairs_left_out") or {}
     refused = sum((summary.get("links_refused") or {}).values())
     if flagged is not None:
         lines.append(f"             {summary['pairs']} component pairs, flagged for review: " + _listing(
@@ -381,10 +391,12 @@ def _candidate_lines(summary: dict | None) -> list[str]:
              ("record names only another language", flagged["other_language_only"]),
              ("named classes not in the jar", flagged["named_classes_not_in_jar"]),
              ("the vendor's advisory names another module", flagged.get("advisory_names_another_module", 0)),
-             ("none of the classes its fix changed in the jar", flagged.get("fixed_classes_not_in_jar", 0))])
+             ("none of the classes its fix changed in the jar", flagged.get("fixed_classes_not_in_jar", 0)),
+             ("only on a line below those the vendor lists", flagged.get("below_listed_lines", 0))])
             + (f"; {summary['pairs_reached_by_advisory']} pairs reached through the vendor's advisory"
                if summary.get("pairs_reached_by_advisory") else "")
-            + (f"; {left_out} pairs left out: the record names another module" if left_out else "")
+            + ("; pairs left out: " + _listing([(LEFT_OUT.get(k, k), n) for k, n in sorted(left_out.items())])
+               if sum(left_out.values()) else "")
             + (f"; {refused} CPE links refused: NVD's versions never meet OSV's" if refused else ""))
     fixes = summary.get("fix_commits")
     if fixes and fixes["candidates_citing_a_commit"]:
@@ -401,6 +413,9 @@ def _candidate_lines(summary: dict | None) -> list[str]:
     return lines
 
 
+LEFT_OUT = {"names_another_module": "the record names another module",
+            "package_name_narrows": "the CNA's package name leaves the build out",
+            "versions_not_told": "the CNA's record does not tell whether the version is affected"}
 INCOMPLETE = {
     "jars_not_looked_up": "{n} jars not looked up",
     "scripts_not_looked_up": "{n} scripts not looked up",

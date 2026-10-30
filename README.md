@@ -77,8 +77,9 @@ the reviewer who receives a delivery from someone else and has to sign off on th
 - **Unattributed CVEs are leads, not findings.** Some CVEs are never attributed to a package: GitHub
   leaves them unreviewed, or has no record. NVD names them by product (CPE). binwitness learns which CPE
   stands for a package from the CVEs OSV does attribute to it, never from names, and lists NVD's other
-  records for that CPE as [candidates](#nvd-candidates), kept to the module a record names. They are kept
-  out of the findings and their counts.
+  records for that CPE as [candidates](#nvd-candidates), kept to the module a record names. Before NVD
+  has given a record a CPE, the record as the CNA published it is read the same way
+  ([cvelist](#before-nvd-the-cnas-records)). Candidates are kept out of the findings and their counts.
 - **Upgrade targets are checked, not copied.** An advisory's "fixed in" names the first fix of one
   flaw. binwitness reads every advisory of the package and the versions actually published, and proposes
   the nearest release outside all of them. A fixed version that an advisory names but nobody published
@@ -255,13 +256,21 @@ left out. Five more things are flagged, never acted on:
 - same flaw as a finding: the record cites a CVE of one of the component's findings, or that finding's
   record cites the candidate (a copy of a flaw in another product gets a CVE of its own);
 - names only another language: the record names a binding in another language (the Go client, the C
-  library) and none in the package's own;
+  library) and none in the package's own. In a list of bindings a language counts however it is written
+  ("go bindings", "nodejs and D lang bindings"), JavaScript included, which elsewhere in the record of a
+  Java library is too common to tell anything. Java ME is another language;
 - named classes not in this jar: the record names classes (`org.example.Foo`, or a name of three or more
   words such as `UrlFilenameViewController`) and the jar holds none of them. Case is ignored and relocated
-  (shaded) copies count. A two-word name counts as a class only when some jar of the scan has a class by
-  that name, and its absence is never flagged: `BigInteger` is the JDK's. A class can also be missing
-  because the record names one of another library (a gadget in a deserialization flaw), or one that came
-  in a later version than the one in use; then the flaw is not in this version either;
+  (shaded) copies count. When the jar holds one of them, the others are not listed: a record often names
+  a JDK class or one of the application's beside the flawed one, and classes in `java.*` are never
+  missing. A two-word name counts as a class only when some jar of the scan has a class by that name, and
+  counts as missing only when the record names a member of it (`HTTP2Flusher.terminated`) or the fix changed it:
+  `BigInteger` is the JDK's. A library shaded into another jar (netty-codec-mqtt inside netty-all) holds
+  the classes whose folders include every word of its artifactId and end in one of them
+  (`io/netty/handler/codec/mqtt`); a class no single library of the jar owns that way may be any one's,
+  and is not missing for any of them. A class can also be missing because the record names one of another
+  library (a gadget in a deserialization flaw), or one that came in a later version than the one in use;
+  then the flaw is not in this version either;
 - the vendor's advisory names another module: with the `spring` dataset installed, Spring's own advisory
   of the CVE names modules of the project, and not this one. The modules it names are reached by name, as
   if the record named them, but no pair is left out for it: a vendor may name the module a feature is used
@@ -271,12 +280,17 @@ left out. Five more things are flagged, never acted on:
 - none of the classes its fix changed in this jar: with the `fixes` dataset installed, the GitHub commits
   the record cites in the project's own repository are read for the main-code classes they modified,
   deleted or renamed (by their names before the fix; from the commits NVD tagged as the patch when it
-  tagged any), and the jar holds none of them. Multi-release and relocated copies count. Classes the fix
-  added are listed apart and not looked for, since an affected version lacks them. A jar that holds some
-  of the classes is not flagged: a fix often changes a class every module shares as well. A class can
-  also be missing because it had another name in an older version, and a commit cited as the fix is not
-  always the fix itself. In the candidates of the delivery below, 39 of 467 pairs were flagged and
-  none of them had been judged real or plausible on review.
+  tagged any), and the jar holds none of them. Main code is `src/main/java`, or `java/` in an Ant build
+  such as Tomcat's. For a record NVD has not analysed, the commits its CNA's record cites count in the
+  repositories that the CVEs OSV attributes, under the same product name, cite; for Apache Tomcat, the
+  commits its security pages list for the CVE count as well. Multi-release and relocated copies count, and
+  so do classes a shaded library may hold as above. Classes the fix added are listed apart and not looked
+  for, since an affected version lacks them. A jar that holds some of the classes is not flagged: a fix
+  often changes a class every module shares as well. A class can also be missing because it had another
+  name in an older version, and a commit cited as the fix is not always the fix itself. In the candidates
+  of the delivery below, 102 of 656 pairs were flagged; none of the 73 of them judged on review was real
+  or plausible. Of the 70 pairs that Apache Tomcat's records reached in three deliveries, the 39 on a
+  module the fix did not change were flagged, and none of the others.
 
 Candidates are leads for manual review. A CPE names a product, and a product can be wider than the
 component: one CPE may stand for every module of a framework, as with netty above, or for a vendor's
@@ -287,21 +301,80 @@ learned-link column reads like `3/6 / 3/4 / 3/6; versions meet on 3 of 3`: the p
 CPE out of those with any CPE, the CPE's attributed CVEs of the same project out of all its attributed
 ones, the same as the first for the whole project, and on how many of the CVEs it was learned from that
 give versions on both sides the versions meet. The next column lists the CVEs the link was learned from.
-Further columns say how the pair was reached (a learned link, named in the record, or named in the
-vendor's advisory), list the modules the vendor's advisory names and the classes the fix changed (with
-those the jar holds, and the commits they were read from), and give the flags.
+Further columns say how the pair was reached (a learned link, named in the record, named in the
+vendor's advisory, or one of the ways of the [CNAs' records](#before-nvd-the-cnas-records)) and whose
+versions decided it, name the CNA, the product its record names and the day it published the record, list
+the modules the vendor's advisory names and the classes the fix changed (with those the jar holds, and the
+commits they were read from), and give the flags.
 
 Candidates are also where a new CVE shows up first. A CVE is often published with a CPE weeks or months
 before an advisory names its package. In the candidates of one delivery of about 1,100 jars, scanned in
 late October 2026, 37 records were judged real or plausible on review for at least one component; 30 of
-them were published from June 2026 on, and 36 had only an unreviewed GitHub advisory.
+them were published from June 2026 on, and 36 had only an unreviewed GitHub advisory. The CNAs' records
+brought 64 more that NVD had given no CPE yet, 47 of them published in October 2026; of the 40 judged on
+review, 32 were real or plausible for at least one component.
 
 Candidates come from local copies only, in every lookup mode: the `nvd` dataset and the OSV dataset of
-each ecosystem (`binwitness db sync nvd vulns`), and the `spring` advisories and `fixes` when installed.
+each ecosystem (`binwitness db sync nvd vulns`), and the `cvelist` records, the `spring` advisories and
+`fixes` when installed.
 An online scan takes its findings from the online services and its candidates from these copies. Their
 dates are given in the summary and in every row of `candidates.csv`. Without the copies, the summary says
 candidates were not checked, never that there are none. NVD records still awaiting analysis have no CPE
 yet; the summary counts them by status.
+
+### Before NVD: the CNAs' records
+
+NVD gives a record its CPEs days to months after the CNA (the organisation that assigned the CVE: Apache,
+GitHub, VulnCheck and some 500 others) published it, and defers many for good. Until then the CNA's own
+record is all there is. With the `cvelist` dataset installed, binwitness reads these records, as the CVE
+Program publishes them in [cvelistV5](https://github.com/CVEProject/cvelistV5), for CVEs that OSV
+attributes to no package. A record reaches a component in one of four ways, given as the `basis` of the
+pair:
+
+| `basis` | The record reaches the component |
+|---|---|
+| `cna_package` | by the package it names: `groupId:artifactId`, or a Maven repository URL whose path is the coordinates of a package OSV or the hash index knows. Other builds of the module are reached as for a record that names coordinates |
+| `cna_cpe` | by a CPE it carries that is linked with the package, as above |
+| `cna_learned` | by its product name, linked with the package the way a CPE is: by the four conditions above, from the CVEs OSV attributes and whose CNA records name one product. Names are compared in words, so "The Eclipse Foundation / Eclipse Jetty" and "eclipse / jetty.project" are the same product. A link learned from a single CVE must also read as the package: a word of the product name, other than words such as java, server or apache, is a word of the artifactId |
+| `advisory_direct` | with the `spring` dataset installed, Spring's advisory of the CVE names the module and gives the affected versions |
+
+A CPE or a product name stands for a package only while NVD has not analysed the record, and not for a
+record that names its packages. A record NVD has analysed whose CPEs are not linked with the package is
+mostly about another product. Taking the product name for it in October 2026 would have reached the ACS
+AEM Commons library with 1,023 records of Adobe Experience Manager, and the Java driver with 19 of
+Oracle's "MySQL Connectors", which are about Connector/Python. The package and the advisory name a module
+on any record, unless NVD's CPEs for the record are linked with the component; then NVD's versions
+decide. A pair is given once, by the first way that reaches it: NVD's learned links, a module the NVD
+record or the vendor's advisory names, then the four ways in the table's order. `versions_from` says whose
+versions decided (`nvd`, `cna` or `advisory`), and `record_from` whether NVD has the record with a CPE
+(`nvd`) or only the CNA's is there (`cna`). Every candidate gives the CNA's short name and the dates of its
+record (`cna`, `cna_published`, `cna_updated`).
+
+Versions are read in the terms of CVE JSON 5. A range that covers the version gives its status, an
+unaffected one first. Outside every range, the record's default status decides: `affected` makes the
+version affected, except beside ranges with an upper bound, where a later version is as likely one the
+vendor did not look at as one it found affected; `unaffected` makes it not affected; `unknown`, or no
+default, does not tell. **A version the default calls unaffected is one the vendor did not list, not one
+it found safe**: a CNA usually lists the release lines it supports, and older lines may have the flaw
+unremarked. A record that does not tell is not given, and the summary counts the pair as left out. Git
+commit ranges are not read. A range typed `semver` whose versions are Maven's (Tomcat's `9.0.0.M1`) is
+compared as Maven versions, and a range that starts at a product named in words ("Apache Ant 1.9.x" up to
+1.9.15) starts at the release line the words give.
+
+The flags of NVD's records apply as well, read from the CNA's description and the program files it names,
+and one more:
+
+- only on a line below those listed (`below_listed_lines`): the record gives affected ranges on two or
+  more release lines, and the version is affected only by the range from the first version up, on a line
+  older than the one that range ends on. The vendor listed the lines it supports and swept older ones in
+  without looking: Spring's advisory of CVE-2026-47857 lists reactor-core up to 3.4.41 and lines 3.5 and
+  3.8, which flags 3.3.13. A single range from the first version up is not flagged: that is the vendor
+  saying every earlier version is affected.
+
+Pairs reached by a CPE or a product name are also left out when the record's text names another module
+of the project, as for NVD's records, or when the CNA's package name is an artifactId stem that leaves the
+build out (Bouncy Castle writes `bcprov`, `bcpg`). The summary counts the pairs left out by reason and the
+pairs by `basis` and by `versions_from`.
 
 ### Upgrade advice
 
@@ -377,11 +450,12 @@ binwitness db remove osv-npm
 | `kev` | CISA Known Exploited Vulnerabilities catalog | 2 MB |
 | `maven-hashes` | SHA-1 of every jar on Maven Central ([Trivy java-db](https://github.com/aquasecurity/trivy-java-db), then the additions to Central's own index) | 1 GB download, 1.5 GB on disk; then 10-50 MB every week or two |
 | `nvd` | NVD CVE records that name an application (CPE), for [candidates](#nvd-candidates) | 235 MB download, 225 MB on disk; then 15 MB a day |
-| `spring` | The Spring projects' security advisories ([spring.io](https://spring.io/security)), for the modules each names, for [candidates](#nvd-candidates) | 260 kB download, 50 kB on disk |
-| `fixes` | The classes changed by the GitHub commits that NVD records cite as their fix, for [candidates](#nvd-candidates); needs `nvd` and `osv-maven` | about 170 commits from github.com: 3 MB download, 0.2 MB on disk |
+| `cvelist` | CVE records as their CNAs published them ([cvelistV5](https://github.com/CVEProject/cvelistV5)), for [candidates NVD has given no CPE yet](#before-nvd-the-cnas-records); needs `osv-maven` | 650 MB download, 130 MB on disk; then about 5 MB a day |
+| `spring` | The Spring projects' security advisories ([spring.io](https://spring.io/security)), for the modules and versions each names, for [candidates](#nvd-candidates) | 260 kB download, 140 kB on disk |
+| `fixes` | The classes changed by the GitHub commits that CVE records cite as their fix, or that Apache Tomcat's security pages list, for [candidates](#nvd-candidates); needs `nvd` and `osv-maven` | about 430 commits from github.com: 8 MB download, 0.35 MB on disk |
 
 Groups: `vulns` (both OSV datasets and `kev`), `java` (`osv-maven`, `kev`, `maven-hashes`), `all` (these,
-`nvd`, `spring` and `fixes`).
+`nvd`, `cvelist`, `spring` and `fixes`).
 Datasets live in `~/.cache/binwitness/datasets` (`--db-dir`, or `$BINWITNESS_DB`).
 
 Updates are incremental where the publisher allows it. OSV keeps a list of records by modification time,
@@ -392,14 +466,27 @@ spring.io amends advisories without dating the change, so the Spring copy is rep
 content differs. A commit does not change once made, so each one is fetched once; a later sync fetches
 only the commits cited by records new since. GitHub limits what one address may fetch: the commits are
 read a few at a time, and when GitHub stops answering, the sync keeps what it has and the next one goes
-on from there.
+on from there. The Tomcat security pages are read whole at each sync.
 
 NVD publishes one feed per year and a feed of the records modified in the last eight days. The first sync
 reads every yearly feed; later ones read only the modified feed, as long as the copy is less than seven
 days old, and skip it when its digest has not changed. An older copy is built again from the yearly
 feeds. Each feed is checked against the SHA-256 that NVD publishes next to it. A copy stored by version
 0.4.3 or earlier lacks the tags NVD gives the fix commits, and is downloaded again in full at the next
-sync (about 235 MB); the copy held stays in use until that is done, and without a connection.
+sync (about 235 MB); the copy held stays in use until that is done, and whenever there is no connection.
+
+The CVE Program publishes cvelistV5 as a snapshot of every record each midnight, the changes of each day,
+and those of each hour since midnight. The first sync of `cvelist` downloads the latest snapshot (about
+650 MB, one file that resumes where a dropped connection stopped) and the hour's changes; later ones
+apply the changes of each day the copy lacks (about 5 MB a day) and the latest hour's. The daily changes
+are kept for at least seven weeks: a copy more than 40 days behind, or one that lacks a day no longer
+published, is downloaded again. Of about 400,000 records, the text is kept only of those that may reach
+a Maven package (about 39,000): those OSV attributes, those that name a Maven package or a CPE, those
+that name a product a CVE OSV attributes names, and those a vendor's advisory names. Of the others, the
+id, the CNA, the dates and the product names are kept. When OSV's attributions make a product known
+later, the texts of its records are fetched one by one from the repository, at most 1,000 at each sync;
+`db status` says how many are still to fetch. A sync reads the repository's feed of releases first, and
+does nothing more when the copy is at the latest one and OSV's attributions have not changed since.
 
 The hash index starts from Trivy's java-db, which is rebuilt every day as one 1 GB file with no incremental
 form. After that, each sync applies the additions that Maven Central publishes to its own index every week
@@ -446,8 +533,9 @@ last synced more than seven days ago produces a warning.
 Each dataset is downloaded by your machine directly from its publisher, under the publisher's terms: OSV
 from Google's public bucket (each record carries the license of the database it comes from), the hash
 index from Aqua Security's `trivy-java-db` image on ghcr.io and from Maven Central's index, the KEV catalog
-from CISA, the CVE records from NVD's data feeds, the Spring advisories from spring.io, the fix commits
-from github.com. binwitness uses
+from CISA, the CVE records from NVD's data feeds and the CVE Program's cvelistV5 repository on GitHub,
+the Spring advisories from spring.io, the fix commits from github.com and Tomcat's security pages from
+tomcat.apache.org. binwitness uses
 NVD data but is not endorsed or certified by the NVD.
 
 ## Cross-checking another scanner
@@ -535,8 +623,8 @@ Claude Desktop, Cursor and other clients configured with an `mcpServers` JSON fi
 | `get_component` | one component by purl or by its full name: evidence, files, findings with fixed versions and advice, upgrade advice; locations on request. A part of a name gets the names that contain it, never one of them as the answer | nothing |
 | `get_vulnerability` | one finding with its OSV record: details, ranges, references | the advisory id to OSV, when the local datasets lack the record and lookups are allowed |
 | `upgrade_plan` | steps, worst first: remove, upgrade, replace, or change the host of bundled components; each says what it clears, what remains and its caveats. A release family is one step; its `per_member` lists the members with a target of their own or findings left | nothing |
-| `list_candidates` | the scan's [NVD candidates](#nvd-candidates), those with an unflagged component first, then worst first, filtered by text (component or CPE), severity, or without the disputed ones | nothing |
-| `get_candidate` | one candidate: the NVD record as of the last sync (status, description, CVSS, CWE, references), the components it reaches with NVD's version range and each one's flags, how each CPE was learned, and what to check before taking it as a finding | nothing |
+| `list_candidates` | the scan's [NVD candidates](#nvd-candidates), those with an unflagged component first, then worst first, filtered by text (component, CPE or the product a CNA's record names), severity, or without the disputed ones | nothing |
+| `get_candidate` | one candidate: the NVD record as of the last sync, or the CNA's where NVD has given no CPE (status, description, CVSS, CWE, references, the CNA and its dates), the components it reaches with the version range and whose it is, each one's flags, how each CPE was learned, and what to check before taking it as a finding | nothing |
 | `crosscheck` | classifies another scanner's export against a scan and saves the full report | what `crosscheck` sends; not offered with `--lookup local` |
 
 Every answer about a result starts with `coverage`: whether every lookup succeeded, what was not
@@ -584,7 +672,9 @@ scan a machine with no internet access, copy the dataset directory and, optional
 | [Maven Central index](https://repo1.maven.org/maven2/.index/) | `db sync`: weekly additions to the hash index |
 | [NVD data feeds](https://nvd.nist.gov/vuln/data-feeds) | `db sync` of the `nvd` dataset |
 | [Spring security advisories](https://spring.io/security) | `db sync` of the `spring` dataset |
-| [GitHub commits](https://github.com) | `db sync` of the `fixes` dataset: the diff of each commit an NVD candidate's record cites |
+| [cvelistV5](https://github.com/CVEProject/cvelistV5) | `db sync` of the `cvelist` dataset: snapshots and changes from github.com, single records from raw.githubusercontent.com |
+| [GitHub commits](https://github.com) | `db sync` of the `fixes` dataset: the diff of each commit a candidate's record or Tomcat's security pages cite |
+| [Apache Tomcat security pages](https://tomcat.apache.org/security.html) | `db sync` of the `fixes` dataset: the commits each lists for a CVE |
 | [GitHub advisories](https://github.com/advisories) | `crosscheck` only |
 
 ## Limitations
@@ -596,9 +686,20 @@ These limits are deliberate, so read them before relying on a result:
   They agree on ordinary versions; unusual version strings can compare differently.
 - **Advisory coverage is that of OSV.** An advisory that names no package (GitHub "unreviewed",
   NVD-only CPE records) cannot be matched to a component, and is at most a
-  [candidate](#nvd-candidates) for a component whose CPE could be learned. Vendor-private and national
-  vulnerability databases are not consulted. Treat counts as a lower bound. `crosscheck` against a
-  commercial tool's output is the practical way to see what such a database adds.
+  [candidate](#nvd-candidates) for a component whose CPE or product name could be learned. Vendor-private
+  and national vulnerability databases are not consulted. Treat counts as a lower bound. `crosscheck`
+  against a commercial tool's output is the practical way to see what such a database adds.
+- **Candidates are read from the records' words.** The text and fields of a record are matched, not
+  understood, and some readings are known to fail. Languages are read from the description only, not from
+  the package name or repository a CNA's record gives, and a language written in lower case counts only in
+  a list of bindings. Names written like classes that are not Java classes (TLS messages, native
+  functions) are taken for classes the jar lacks: in the delivery of about 1,100 jars above, 8 pairs of two
+  records on builds of netty-tcnative are flagged so, although the records name that package. A library
+  shaded into another jar does not hold the classes in folders that do not spell its artifactId
+  (netty-handler's `io/netty/handler/ssl`), so they are never missing for it, and its pairs are flagged
+  less. A class the fix changed may have had another name in an older version, so a pair on an old
+  version can be flagged although the flaw is there; a fix that changed no Java code flags nothing; and a
+  commit that merges many changes is read whole as the fix.
 - **Identification needs a published artifact or a declaration.** A private build, a fork or a relocated
   copy of a library with no `pom.properties` stays unidentified, unless the same delivery also carries a
   copy that was identified (or `--class-search` finds it). A release that only another repository

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import posixpath
+import re
 import sys
 import urllib.parse
 from collections import Counter
@@ -406,6 +407,7 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None, cand
 
     jar_hints = {}
     also_published = {}
+    hosts: dict[str, list[str]] = {}
     resources_of_third_party = 0
     for sha1, jar in jars.items():
         facts, verdict = jar.facts, verdicts[sha1]
@@ -468,6 +470,7 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None, cand
                                               "family": family(own_licenses)} if own_licenses else None),
                                  "locations": jar.locations})
             parent_label = facts.filename
+        hosts.setdefault(parent_label, []).append(sha1)
         for group, artifact, version in embedded:
             if options.first_party_groups and group.startswith(options.first_party_groups):
                 continue
@@ -553,7 +556,7 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None, cand
     store = candidates_db or db
     candidates, candidate_links, candidate_summary = nvd.attach(
         store, items, vulnerabilities, kev_dates, OSV_DATASET, _candidates_unavailable(options, store),
-        _Listings(jars))
+        _Listings(jars, hosts, items))
     if candidate_summary["checked"]:
         log(f"candidates: {candidate_summary['total']} NVD records not attributed to a package, for "
             f"{candidate_summary['components']['with_link']} components with a learned CPE")
@@ -648,23 +651,71 @@ def _candidates_unavailable(options: Options, store) -> str | None:
 class _Listings:
     """The class entries of the jars at hand, for the classes an NVD record names."""
 
-    def __init__(self, jars: dict):
+    def __init__(self, jars: dict, hosts: dict[str, list[str]] | None = None, items: list[dict] | None = None):
         self.jars = jars
+        self.hosts = hosts or {}  # what a library shaded into a jar names it by (contained_in) -> its SHA-1s
         self._simple: set[str] | None = None
+        self._shaded: dict[str, list[dict]] = {}
+        for item in items or []:
+            if not item["files"]:
+                for host in item["contained_in"]:
+                    self._shaded.setdefault(host, []).append(item)
+        self._shares: dict[str, dict | None] = {}
 
     def _classes(self, sha1: str) -> list[str] | None:
         listing = entries(self.jars[sha1].facts) if sha1 in self.jars else None
         return None if listing is None else [name for name in listing if name.endswith(".class")]
 
     def of(self, item: dict) -> set[str] | None:
-        """The class entries of an item's own jar files. A library shaded into another jar has none: its host
-        holds the classes of every library inside, which tells nothing about this one."""
+        """The class entries of an item's own jar files; of a library shaded into another jar, those of its host
+        found to be its own (see _share). None when unknown."""
+        if not item["files"]:
+            shares = [self._share(host) for host in item["contained_in"]]
+            if not shares or None in shares:
+                return None
+            return set().union(*(share["owned"].get(item["purl"], ()) for share in shares))
         found = None
         for sha1 in dict.fromkeys(f["sha1"] for f in item["files"]):
             classes = self._classes(sha1)
             if classes is not None:
                 found = (found or set()) | set(classes)
         return found
+
+    def unsure(self, item: dict) -> set[str]:
+        """The class entries an item's jar may or may not hold: those of the host of a library shaded into it
+        that no one library it holds is found for."""
+        if item["files"]:
+            return set()
+        return set().union(*(share["unowned"] for share in map(self._share, item["contained_in"]) if share))
+
+    def _share(self, host: str) -> dict | None:
+        """Which of a host jar's classes are which shaded library's, by package: a class is the library's whose
+        artifactId's words are all folders of its path, the last one of them its own folder
+        (io/netty/handler/codec/mqtt/MqttEncoder is netty-codec-mqtt's). One in a folder below (codec/socksx/v4)
+        is no one's: the shallower library (netty-codec) need not hold it. Neither is one that two libraries are
+        found for. None when the host's entries are unknown."""
+        if host not in self._shares:
+            listings = [self._classes(sha1) for sha1 in self.hosts.get(host, [])]
+            if not listings or None in listings:
+                self._shares[host] = None
+                return None
+            by_word: dict[str, list[tuple[str, set[str]]]] = {}
+            for item in self._shaded.get(host, []):
+                words = set(re.findall(r"[a-z0-9]+", item["name"].split(":", 1)[-1].lower()))
+                for word in words:
+                    by_word.setdefault(word, []).append((item["purl"], words))
+            owned: dict[str, set[str]] = {}
+            unowned: set[str] = set()
+            for entry in set().union(*listings):
+                folders = entry.lower().split("/")[:-1]
+                owners = {ref for ref, words in by_word.get(folders[-1], []) if words <= set(folders)} \
+                    if folders else set()
+                if len(owners) == 1:
+                    owned.setdefault(owners.pop(), set()).add(entry)
+                else:
+                    unowned.add(entry)
+            self._shares[host] = {"owned": owned, "unowned": unowned}
+        return self._shares[host]
 
     def has_class(self, name: str) -> bool:
         if self._simple is None:

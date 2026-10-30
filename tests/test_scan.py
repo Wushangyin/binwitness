@@ -812,3 +812,51 @@ def test_the_summary_counts_the_findings_it_does_not_list(tmp_path, delivery):
     at = lines.index("vulns        2 distinct: critical 1, medium 1, known exploited 1")
     assert lines[at + 1].startswith("  critical CVE-2023-0001        org.example:lib 1.0, upgrade to 1.1")
     assert lines[at + 2] == "  ... medium 1 not listed here (vulnerabilities.csv)"
+
+
+def test_the_classes_of_a_library_shaded_into_a_jar_are_told_by_their_package(monkeypatch):
+    import types
+    from binwitness import fixes, nvd, scan as scanning
+    monkeypatch.setattr(scanning, "entries", lambda facts: facts)
+    host_entries = {f"io/acme/net/{path}.class": (0, 0) for path in (
+        "codec/mqtt/MqttEncoder", "codec/socksx/v4/Socks4ClientDecoder", "codec/ByteToMessageDecoder",
+        "ssl/SslHandler", "codec/xml/XmlFrameDecoder")}
+    jars = {"aa": types.SimpleNamespace(facts=host_entries)}
+
+    def item(name, files=(), contained_in=()):
+        return {"purl": f"pkg:maven/io.acme/{name}@4.1", "name": f"io.acme:{name}", "files": list(files),
+                "contained_in": list(contained_in)}
+    host = item("net-all", [{"sha1": "aa"}])
+    mqtt, codec, socks, handler = (item(n, contained_in=["net-all-4.1.jar"])
+                                   for n in ("net-codec-mqtt", "net-codec", "net-codec-socks", "net-handler"))
+    xml, other_xml = item("net-codec-xml", contained_in=["net-all-4.1.jar"]), \
+        item("acme-codec-xml", contained_in=["net-all-4.1.jar"])
+    gone = item("net-buffer", contained_in=["net-other-4.1.jar"])
+    listings = scanning._Listings(jars, {"net-all-4.1.jar": ["aa"], "net-other-4.1.jar": ["bb"]},
+                                  [host, mqtt, codec, socks, handler, xml, other_xml, gone])
+    # A class is the library's whose words are all folders of its path, the last one of them its own folder.
+    assert listings.of(mqtt) == {"io/acme/net/codec/mqtt/MqttEncoder.class"}
+    assert listings.of(codec) == {"io/acme/net/codec/ByteToMessageDecoder.class"}
+    # One in a folder no library is named after (socksx/v4, ssl) is no one's: each may or may not hold it.
+    assert listings.of(socks) == set() and listings.of(handler) == set()
+    assert listings.unsure(socks) == {"io/acme/net/codec/socksx/v4/Socks4ClientDecoder.class",
+                                      "io/acme/net/ssl/SslHandler.class", "io/acme/net/codec/xml/XmlFrameDecoder.class"}
+    # Nor is one that two libraries are found for.
+    assert listings.of(xml) == set() and listings.of(other_xml) == set()
+    assert listings.of(host) == set(host_entries) and listings.unsure(host) == set()
+    # A host whose entries are unknown tells nothing of what is shaded into it.
+    assert listings.of(gone) is None and listings.unsure(gone) == set()
+    assert listings.has_class("MqttEncoder") and not listings.has_class("Socks4Server")
+
+    # The fix's classes in a library's share, or in the host's unowned part, are not missing from it.
+    mqtt_fix, socks_fix = ["io.acme.net.codec.mqtt.MqttEncoder"], ["io.acme.net.codec.socksx.v4.Socks4ClientDecoder"]
+    assert fixes.held(mqtt_fix, listings.of(mqtt)) == mqtt_fix and fixes.held(mqtt_fix, listings.of(socks)) == []
+    assert fixes.held(mqtt_fix, listings.unsure(socks)) == []
+    assert fixes.held(socks_fix, listings.of(socks)) == [] and fixes.held(socks_fix, listings.unsure(socks)) == socks_fix
+    # Nor are the classes a record names: may the jar hold one of them, none counts as missing.
+    named = nvd.Naming.of({"description": "Socks4ClientDecoder and ByteToMessageDecoder let a peer read memory."})
+    assert named.placed(listings.of(socks), listings.unsure(socks)) == ([], [])
+    assert named.placed(listings.of(mqtt), listings.unsure(mqtt)) == ([], [])
+    assert named.placed(listings.of(codec), listings.unsure(codec)) == (["ByteToMessageDecoder"], [])
+    assert nvd.Naming.of({"description": "ByteToMessageDecoder lets a peer read memory."}).placed(
+        listings.of(mqtt)) == ([], ["ByteToMessageDecoder"])

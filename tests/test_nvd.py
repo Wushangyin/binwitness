@@ -295,9 +295,28 @@ def test_a_build_named_without_its_group_is_read_as_its_module():
     ("Cross-site scripting: injected JavaScript runs in the console.", "maven", False),
     ("The Java client leaks tokens.", "npm", True),
     ("A flaw.", "maven", False),
+    # Bindings are named in any case, and JavaScript named as bindings is no longer neutral.
+    ("A flaw in Acme RPC go bindings.", "maven", True),
+    ("A flaw in Acme RPC nodejs and D lang bindings.", "maven", True),
+    ("A flaw in Acme RPC D language bindings.", "maven", True),
+    ("A flaw in Acme RPC all JS bindings.", "maven", True),
+    ("A flaw in Acme RPC java bindings.", "maven", False),
+    ("A flaw in Acme RPC C++, Java, Python, Go, D, C/GLib bindings.", "maven", False),
+    # Java ME is not Java, unless Java is named as well.
+    ("A flaw in Acme RPC Dart and Java ME bindings.", "maven", True),
+    ("A flaw in Acme RPC JavaME bindings.", "maven", True),
+    ("A flaw in Acme RPC Go, JavaME, Rust and Java bindings.", "maven", False),
+    # Only a list of bindings is read in any case: not the words before it, nor a "binding" of another kind.
+    ("Users go to the settings page; a flaw in Acme RPC bindings.", "maven", False),
+    ("Malicious JavaScript URIs register as POST Binding URLs.", "maven", False),
 ])
 def test_a_record_that_names_only_another_language(text, ecosystem, other):
     assert nvd.Naming.of({"description": text}).other_language_only(ecosystem) is other
+
+
+def test_the_languages_a_list_of_bindings_names():
+    facts = nvd.Naming.of({"description": "A flaw in Acme RPC \nnodejs and D lang bindings. JavaScript runs."})
+    assert facts.languages == ("JavaScript", "D", "Node.js") and facts.bound == ("Node.js", "D")
 
 
 def test_named_classes_are_found_in_a_jar_whatever_their_case_or_relocation():
@@ -305,10 +324,27 @@ def test_named_classes_are_found_in_a_jar_whatever_their_case_or_relocation():
                                           "PathPatternParserHelper resolve any path."}, is_class=lambda word: True)
     entries = {"org/acme/web/servlet/UrlFilenameViewController.class", "shaded/org/acme/web/socks/Frame.class",
                "org/acme/web/Server$Inner.class"}
+    # A jar that holds one of them is the one the record is of: the others it lacks may be the JDK's.
+    assert facts.placed(entries) == (["org.acme.web.socks.Frame", "UrlFileNameViewController"], [])
     # A two-word name missing from the jar says little (BigInteger is the JDK's), so it is not listed missing.
-    assert facts.placed(entries) == (["org.acme.web.socks.Frame", "UrlFileNameViewController"],
-                                     ["PathPatternParserHelper"])
+    other = {"org/acme/web/Server$Inner.class"}
+    assert facts.placed(other) == ([], ["org.acme.web.socks.Frame", "UrlFileNameViewController",
+                                        "PathPatternParserHelper"])
+    # Nor is any when the jar may hold one (a class of the jar a library is shaded into, not known to be its).
+    assert facts.placed(other, {"org/acme/web/tls/CertPinner.class"}) == ([], [])
     assert facts.placed(None) == (None, None)
+
+
+def test_a_short_name_is_a_class_when_a_member_of_it_or_a_fix_says_so():
+    text = ("Http2Flusher.terminated is never reset, MqttDecoder.decode() loops, Socket.IO and ReadMe.md are not "
+            "classes, and FrameCodec, WebFlux and javax.net.ssl.X509TrustManager are named too.")
+    facts = nvd.Naming.of({"description": text}, fixed=["org.acme.web.mqtt.FrameCodec"])
+    assert facts.classes == ("javax.net.ssl.X509TrustManager", "Http2Flusher", "MqttDecoder", "FrameCodec")
+    assert facts.confirmed == ("Http2Flusher", "MqttDecoder", "FrameCodec")
+    # Missing from a jar, they count; a class of the JDK's own packages never does.
+    jdk = nvd.Naming.of({"description": "java.security.KeyStore and Http2Flusher.terminated let a peer in."})
+    assert jdk.placed({"org/acme/web/Server.class"}) == ([], ["Http2Flusher"])
+    assert facts.placed({"org/acme/web/Server.class"}) == ([], list(facts.classes))
 
 
 # ---- syncing ------------------------------------------------------------------------------------------
@@ -425,7 +461,8 @@ def test_candidates_are_the_unattributed_records_of_a_linked_cpe_that_cover_the_
     assert table["CVE-2025-0004"]["affects"] == {lib: {
         "cpe": "example:lib", "versions": "< 2.0", "conditional": False, "basis": "learned", "single_cve_link": False,
         "related_findings": [], "other_language_only": False, "classes_in_jar": [], "classes_not_in_jar": [],
-        "advisory_names_another_module": False, "fixed_classes_in_jar": [], "fixed_classes_not_in_jar": False}}
+        "advisory_names_another_module": False, "fixed_classes_in_jar": [], "fixed_classes_not_in_jar": False,
+        "versions_from": "nvd", "below_listed_lines": False, "cna_product": ""}}
     assert table["CVE-2025-0004"]["kev_date_added"] == "2025-07-01"
     assert table["CVE-2025-0007"]["affects"][lib]["conditional"] is True
     assert table["CVE-2025-0008"]["disputed"] is True and table["CVE-2025-0008"]["severity"] == "LOW"
@@ -478,7 +515,8 @@ def test_candidates_carry_what_their_records_name(family_world):
     assert summary["pairs"] == 14 and summary["components"]["with_link"] == 3
     assert summary["pairs_flagged"] == {"same_flaw_as_a_finding": 2, "other_language_only": 3,
                                         "named_classes_not_in_jar": 1, "advisory_names_another_module": 0,
-                                        "fixed_classes_not_in_jar": 0}
+                                        "fixed_classes_not_in_jar": 0, "below_listed_lines": 0}
+    assert summary["pairs_by_basis"] == {"learned": 13, "named": 1} and summary["pairs_versions_from"] == {"nvd": 14}
     assert summary["pairs_reached_by_name"] == 1 and summary["pairs_left_out"] == {"names_another_module": 2}
     assert summary["links_refused"] == {"version_ranges_apart": 3}
     assert "bundler:suite" not in links[core]
@@ -695,9 +733,9 @@ def test_a_fix_commit_is_read_for_the_main_classes_it_changes():
         "main": [["added", "java", "org.acme.web.core.Limits"], ["deleted", "java", "org.acme.web.core.Gone"],
                  ["modified", "java", "org.acme.web.core.Server"], ["modified", "jdk1.4", "org.acme.web.core.Server"],
                  ["renamed", "java", "org.acme.web.socks.Decoder"]],
-        "java_elsewhere": 1, "other": 1}
+        "java_elsewhere": 1, "other": 1, "reader": fixes.READER}
     assert fixes.read_diff(io.BytesIO(diff), limit=len(diff) - 1) == {"unread": "too large"}
-    assert fixes.read_diff(io.BytesIO(b"")) == {"main": [], "java_elsewhere": 0, "other": 0}
+    assert fixes.read_diff(io.BytesIO(b"")) == {"main": [], "java_elsewhere": 0, "other": 0, "reader": fixes.READER}
 
 
 def test_the_commits_a_record_cites_and_what_its_fix_changed():
@@ -758,6 +796,14 @@ def test_commit_references_are_kept_with_their_tags_and_a_copy_stored_without_is
     assert any("earlier version" in line for line in logged) and world.state["nvd"]["layout"] == nvd.LAYOUT
 
 
+def asked(transport) -> list[str]:
+    return [url for _, url, _ in transport.calls]
+
+
+def commits_asked(transport) -> list[str]:
+    return [url for url in asked(transport) if url not in fixes.VENDOR_PAGES]
+
+
 def test_fix_commits_sync_from_github_and_go_on_where_they_stopped(fix_world, tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(localdb, "FIX_WORKERS", 1)
     limited = [2]
@@ -776,7 +822,9 @@ def test_fix_commits_sync_from_github_and_go_on_where_they_stopped(fix_world, tm
                  "sync fixes again later"}
     # GitHub's 429 passes: it is waited out, as a server error is, rather than ending the sync.
     assert slept == [2, 4, 2, 4, 8, 16]
-    assert all(url.startswith("https://github.com/acme/web/commit/") for _, url, _ in first.calls)
+    # Besides the commits, only the vendor's security pages are asked for: here none can be fetched.
+    assert {url for url in asked(first) if not url.startswith("https://github.com/acme/web/commit/")} == \
+        set(fixes.VENDOR_PAGES)
     assert fix_world.state["fixes"]["commits_not_read"] == 1
     assert main(["db", "status", "--db-dir", str(fix_world.directory)]) == 0
     assert "4 commits read; 1 not fetched yet: sync fixes again" in capsys.readouterr().out
@@ -788,11 +836,11 @@ def test_fix_commits_sync_from_github_and_go_on_where_they_stopped(fix_world, tm
     rest = ScriptedTransport(DIFF_ROUTES)
     assert fix_world.sync(["fixes"], fetcher=fetcher(rest), log=lambda m: None) == {
         "fixes": "fetched 1 commit; 5 of the 5 cited by 4 records held"}
-    assert [url.rsplit("/", 1)[1] for _, url, _ in rest.calls] == [f"{C}.diff"]
+    assert [url.rsplit("/", 1)[1] for url in commits_asked(rest)] == [f"{C}.diff"]
     again = ScriptedTransport(DIFF_ROUTES)
     assert fix_world.sync(["fixes"], fetcher=fetcher(again), log=lambda m: None) == {
         "fixes": "up to date: 5 commits cited by 4 records"}
-    assert again.calls == []
+    assert commits_asked(again) == []
     # When GitHub keeps refusing, the sync stops asking, and is not a failure: the next one goes on.
     fix_world.remove(["fixes"])
     monkeypatch.setattr(localdb, "FIX_FAILURES_TO_STOP", 2)
@@ -800,7 +848,7 @@ def test_fix_commits_sync_from_github_and_go_on_where_they_stopped(fix_world, tm
     assert fix_world.sync(["fixes"], fetcher=fetcher(refused), log=lambda m: None) == {
         "fixes": "fetched 0 commits; 0 of the 5 cited by 4 records held; 5 not fetched (GitHub stopped answering): "
                  "sync fixes again later"}
-    assert len(refused.calls) == 2 * localdb.Fetcher.retries
+    assert len(commits_asked(refused)) == 2 * localdb.Fetcher.retries
     assert LocalDb(tmp_path / "none").sync(["fixes"], fetcher=fetcher(refused), log=lambda m: None) == {
         "fixes": "failed: fixes are read from the NVD records of Maven packages: install nvd and osv-maven first "
                  "(binwitness db sync nvd osv-maven fixes)"}
@@ -848,6 +896,17 @@ def test_a_fix_that_changed_classes_the_jar_lacks_flags_the_pair(fix_world):
         "pairs_flagged_by_classes_from": {"commits not tagged as the patch": 2, "patch-tagged commits": 1}}
     assert summary["data_as_of"]["fixes"] == fix_world.data_as_of("nvd")
 
+    class Shaded(Listings):
+        """web-core as a library shaded into a host: of the host's classes, the decoder is no one library's."""
+
+        def unsure(self, found):
+            return {"org/acme/web/socks/SocksHandshakeDecoder.class"} if found["name"] == "org.acme.web:web-core" \
+                else set()
+    table, _, _ = nvd.attach(fix_world, FAMILY_ITEMS, FAMILY_FINDINGS, {}, {"maven": "osv-maven"}, None,
+                             Shaded(FIX_LISTINGS.entries))
+    assert pairs("CVE-2025-1305")[core] == ([], False)
+    assert pairs("CVE-2025-1304")[core] == ([], True)
+
 
 # ---- scans, files, MCP ------------------------------------------------------------------------------------
 
@@ -870,12 +929,12 @@ def test_an_online_scan_has_candidates_apart_from_its_findings(tmp_path, deliver
     assert "CVE-2025-0004" not in (out / "sbom.cdx.json").read_text("utf-8")
     assert "CVE-2025-0004" not in (out / "vulnerabilities.csv").read_text("utf-8")
     rows = list(csv.DictReader((out / "candidates.csv").open(encoding="utf-8-sig")))
-    assert [(r["id"], r["component"], r["affected versions (NVD)"]) for r in rows][0] == (
-        "CVE-2025-0004", lib["purl"], "< 2.0")
+    assert [(r["id"], r["component"], r["affected versions"], r["versions from"]) for r in rows][0] == (
+        "CVE-2025-0004", lib["purl"], "< 2.0", "NVD")
     assert rows[0]["link learned from"] == "CVE-2024-0013 CVE-2024-0012 CVE-2024-0011"
     assert rows[0]["data as of"].startswith("nvd ") and "osv-maven " in rows[0]["data as of"]
     text = render_summary(result)
-    assert "candidates   3 NVD records not attributed to a package in the local OSV data, not counted above" in text
+    assert "candidates   3 CVE records not attributed to a package in the local OSV data, not counted above" in text
     assert "NVD has given no CPE yet to 2 records (local nvd of " in text
 
 
@@ -917,7 +976,7 @@ def test_mcp_lists_candidates_and_gives_what_to_check(tmp_path, delivery, world)
                       net=Net(cache_dir=tmp_path / "c", offline=True, transport=ScriptedTransport({"": never})))
     scan_id = service.open_result(str(tmp_path / "out"))["scan_id"]
     assert service.overview(scan_id)["candidates"]["total"] == 3
-    assert "3 NVD candidates" in service.overview(scan_id)["coverage"]["candidates"]
+    assert "3 candidates (leads, not findings" in service.overview(scan_id)["coverage"]["candidates"]
     listed = service.list_candidates(scan_id, min_severity="high")
     assert [c["id"] for c in listed["candidates"]] == ["CVE-2025-0004", "CVE-2025-0007"]
     assert "not findings" in listed["note"]
@@ -938,7 +997,7 @@ def test_mcp_lists_candidates_and_gives_what_to_check(tmp_path, delivery, world)
     assert [c["id"] for c in component["candidates"]] == ["CVE-2025-0004", "CVE-2025-0007", "CVE-2025-0008"]
     with pytest.raises(Refused, match="a finding of this scan, not a candidate; get_vulnerability"):
         service.get_candidate(scan_id, "CVE-2023-0001")
-    with pytest.raises(Refused, match="an NVD candidate of this scan; get_candidate"):
+    with pytest.raises(Refused, match="not a finding but a candidate of this scan; get_candidate"):
         service.get_vulnerability(scan_id, "CVE-2025-0004")
 
 
@@ -980,7 +1039,7 @@ def test_flags_reach_the_files_and_the_mcp_tools(tmp_path, delivery, world, fami
     assert rows[("CVE-2025-1305", "web-core@1.0")]["learned link (package / product / project)"] == \
         "3/3 / 3/3 / 3/3; versions meet on 3 of 3"
     assert ("14 component pairs, flagged for review: same flaw as a finding 2, record names only another language 3, "
-            "named classes not in the jar 1; 2 pairs left out: the record names another module; 3 CPE links refused: "
+            "named classes not in the jar 1; pairs left out: the record names another module 2; 3 CPE links refused: "
             "NVD's versions never meet OSV's") in render_summary(result)
     service = Service(Config(results=tmp_path / "results", lookup="local"),
                       net=Net(cache_dir=tmp_path / "c", offline=True, transport=ScriptedTransport({"": never})))
@@ -1011,8 +1070,8 @@ def test_a_vendor_advisory_reaches_the_files_and_the_mcp_tools(tmp_path, deliver
     assert (socks["reached by"], socks["advisory names another module"]) == ("named in the vendor's advisory", "")
     assert (core["reached by"], core["advisory names another module"]) == ("learned link", "yes")
     assert core["modules the vendor's advisory names"] == "org.acme.web:web-socks"
-    assert "the vendor's advisory names another module 3; 1 pairs reached through the vendor's advisory; 2 pairs " \
-           "left out: the record names another module" in render_summary(result)
+    assert "the vendor's advisory names another module 3; 1 pairs reached through the vendor's advisory; pairs left " \
+           "out: the record names another module 2" in render_summary(result)
     service = Service(Config(results=tmp_path / "results", lookup="local"),
                       net=Net(cache_dir=tmp_path / "c", offline=True, transport=ScriptedTransport({"": never})))
     detail = service.get_candidate(service.open_result(str(out))["scan_id"], "CVE-2025-1305")

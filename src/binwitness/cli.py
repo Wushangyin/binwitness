@@ -62,8 +62,11 @@ def _net(args, offline: bool | None = None) -> Net:
 
 
 def _minute(stamp: str | None) -> str:
-    # Publishers state UTC with anything from no fraction to nanoseconds; minutes are enough to judge age.
-    return f"{stamp[:10]} {stamp[11:16]} UTC" if stamp and len(stamp) >= 16 else "?"
+    # Publishers state UTC with anything from no fraction to nanoseconds; minutes are enough to judge age. Some
+    # date their data by the day only (spring.io's advisories).
+    if stamp and len(stamp) >= 16:
+        return f"{stamp[:10]} {stamp[11:16]} UTC"
+    return stamp if stamp and len(stamp) == 10 else "?"
 
 
 def _hashes_detail(row: dict, hashes_every: float) -> str:
@@ -91,6 +94,10 @@ def _database(args) -> int:
                     print(f"  {'':13} {_hashes_detail(row, args.hashes_every)}")
                 if row["name"] == "nvd" and not row["layout_current"]:
                     print(f"  {'':13} stored by an earlier version: the next sync downloads it again (about 235 MB)")
+                if row["name"] == "cvelist":
+                    print(f"  {'':13} {row['kept'] or 0:,} kept with their text, {row['links'] or 0:,} product names "
+                          f"learned" + (f"; {row['bodies_not_fetched']:,} texts not fetched yet: sync cvelist again"
+                                        if row["bodies_not_fetched"] else ""))
                 if row["name"] == "fixes":
                     print(f"  {'':13} {row['commits'] or 0:,} commits read" + (
                         f"; {row['commits_not_read']:,} not fetched yet: sync fixes again" if row["commits_not_read"]
