@@ -486,6 +486,25 @@ def test_cna_records_reach_the_jars_nvd_cannot_tell_of_yet(cna_world):
     assert summary["data_as_of"]["cvelist"] == "2026-10-30T01:00:00Z"
 
 
+def test_a_package_read_from_a_repository_url_is_known_by_a_jar_that_is_its_published_artifact(cna_world):
+    db, transport, sync, _ = cna_world
+    transport.routes["/releases.atom"] = releases("cve_2026-10-30_0200Z")
+    transport.routes["/2026-10-30_delta_CVEs_at_0200Z.zip"] = delta(web(
+        "CVE-2026-2011", UP_TO_2, collectionURL="https://repo1.maven.org/maven2/org/acme/web/web-socks/"))
+    sync("cvelist")
+    core, everything, embed, socks = (i["purl"] for i in FAMILY_ITEMS)
+
+    def reached(confidence):
+        items = [{**i, "confidence": confidence} for i in FAMILY_ITEMS]
+        table, _, _ = nvd.attach(db, items, FAMILY_FINDINGS, {}, {"maven": "osv-maven"}, None, FAMILY_LISTINGS)
+        return {ref: a["basis"] for ref, a in table["CVE-2026-2011"]["affects"].items()}
+    # Neither OSV nor a hash index knows web-socks, and CNAs miswrite such paths: the record stands for no package,
+    # and reaches the family by its product name.
+    assert reached("declared") == {core: "cna_learned", everything: "cna_learned", embed: "cna_learned"}
+    # A jar here that is the published artifact of web-socks shows the package exists.
+    assert reached("exact") == reached("content") == {socks: "cna_package"}
+
+
 def test_cna_records_reach_the_files_the_mcp_tools_and_the_db_status(tmp_path, delivery, cna_world,  # noqa: F811
                                                                       capsys):
     db, *_ = cna_world

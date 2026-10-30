@@ -1,9 +1,13 @@
+import io
 import json
+import struct
+import zipfile
+import zlib
 from pathlib import Path
 
 import pytest
 
-from binwitness.jar import jar_facts, name_hints
+from binwitness.jar import entries, jar_facts, name_hints
 from binwitness.licenses import detect, expression_family, family, spdx_id
 from binwitness.npm import parse
 from binwitness.versions import compare, in_range
@@ -44,6 +48,32 @@ def test_a_corrupt_entry_is_reported_and_the_rest_of_the_jar_still_read():
     facts = jar_facts("app-2.0.jar", bytes(data))
     assert facts.coordinate == ("org.example", "app", "2.0")
     assert len(facts.damaged) == 1 and facts.damaged[0].startswith("META-INF/MANIFEST.MF: ")
+
+
+def listed_twice(jar: bytes, name: str) -> bytes:
+    """The jar with ``name`` listed a second time in its central directory, over the same data."""
+    start = jar.rindex(b"PK\x05\x06")
+    count, size, offset = struct.unpack("<HII", jar[start + 10:start + 20])
+    directory = jar[offset:offset + size]
+    at = 0
+    while True:
+        length = 46 + sum(struct.unpack("<HHH", directory[at + 28:at + 34]))
+        if directory[at + 46:at + 46 + len(name)] == name.encode():
+            record = directory[at:at + length]
+            break
+        at += length
+    end = jar[start:start + 8] + struct.pack("<HHII", count + 1, count + 1, size + len(record), offset) + jar[start + 20:]
+    return jar[:offset] + directory + record + end
+
+
+def test_an_entry_listed_twice_over_the_same_data_is_read_once():
+    jar = listed_twice(make_jar("org.example", "app", "2.0", {"META-INF/LICENSE.txt": "Apache License\nVersion 2.0"}),
+                       "META-INF/LICENSE.txt")
+    assert [i.filename for i in zipfile.ZipFile(io.BytesIO(jar)).infolist()].count("META-INF/LICENSE.txt") == 2
+    facts = jar_facts("app-2.0.jar", jar)
+    assert facts.damaged == [] and facts.licenses
+    assert [name for name in entries(facts) if name == "META-INF/LICENSE.txt"] == ["META-INF/LICENSE.txt"]
+    assert zlib.decompress(facts.listing).decode().count("META-INF/LICENSE.txt") == 1
 
 
 def test_gpl_version_is_read_next_to_the_gpl_title():

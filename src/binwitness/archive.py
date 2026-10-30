@@ -307,7 +307,7 @@ class Walker:
 
     def _zip(self, source: bytes | Path, location: str, depth: int, inside_jar: bool = False) -> Iterator[Item]:
         with zipfile.ZipFile(source if isinstance(source, Path) else io.BytesIO(source)) as archive:
-            infos = [info for info in archive.infolist() if not info.is_dir()]
+            infos = [info for info in listed_once(archive) if not info.is_dir()]
             # A jar's own lockfiles or package.json (webjars) describe the jar, which is identified itself.
             if inside_jar:
                 infos = [info for info in infos if info.filename.lower().endswith(JAR_SUFFIXES + (".js",))]
@@ -480,6 +480,19 @@ class Walker:
             if done.returncode != 0:
                 self.warnings.append(f"{location}: {name} failed ({done.stderr.decode(errors='replace')[:200]})")
             yield from self._directory(out, location + "!/", depth, follow_links=False)
+
+
+def listed_once(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
+    """The archive's entries, an entry listed twice over the same data once. Some published jars list an entry
+    twice (spring-boot-jarmode-layertools 2.4.1, its LICENSE.txt and NOTICE.txt); Python 3.12's zip-bomb check
+    takes the second listing for data that overlaps the first's, and reading the name reads the second."""
+    seen = set()
+    out = []
+    for info in archive.infolist():
+        if (info.filename, info.header_offset) not in seen:
+            seen.add((info.filename, info.header_offset))
+            out.append(info)
+    return out
 
 
 def _disk_entry(path: Path) -> _Entry:

@@ -136,9 +136,9 @@ What is examined:
 
 | Found in the delivery | How it is identified |
 |---|---|
-| any `.jar`, and plugins and libraries packed the same way (`.hpi`, `.jpi`, `.aar`, `.nar`, `.kar`, resource adapter `.rar`), at top level or nested in fat jars, wars, ears, zips, tars, images | SHA-1 lookup in the local hash index when installed, on deps.dev, then on Maven Central search. Otherwise the jar's own `META-INF/maven/**/pom.properties`, compared with the file published under those coordinates on Maven Central, then on the `--maven-repo` repositories: a matching published checksum makes the identification `exact`, matching entries make it `content`. |
+| any `.jar`, and plugins and libraries packed the same way (`.hpi`, `.jpi`, `.aar`, `.nar`, `.kar`, resource adapter `.rar`), at top level or nested in fat jars, wars, ears, zips, tars, images | SHA-1 lookup in the local hash index when installed; for a file it does not list, on deps.dev, then on Maven Central search. Otherwise the jar's own `META-INF/maven/**/pom.properties`, compared with the file published under those coordinates on Maven Central, then on the `--maven-repo` repositories: a matching published checksum makes the identification `exact`, matching entries make it `content`. |
 | a jar with several `pom.properties`, none named after the file (renamed, and shading other libraries) | each declared artifact is compared with the jar entry by entry, the one named in the manifest first; the one whose published entries all match is the jar (`content`), the others are contained in it |
-| renamed or re-zipped copies of a jar identified in the same delivery | every entry but the manifest, index, signatures and Maven build metadata has the CRC-32 and size of the identified jar: `content`, with no request. A copy whose entries match jars identified as different components (releases that changed only the version) stays unidentified and lists them in `same_content_as` |
+| renamed or re-zipped copies of a jar identified in the same delivery | every entry but the manifest, index, signatures and Maven build metadata has the CRC-32 and size of the identified jar: `content`, with no request. This also holds for a copy whose only `pom.properties` is not borne out by its file name and could not be compared with a published artifact (a library shaded into it, read offline), unless the identified jar is another release of the artifact it declares. A copy whose entries match jars identified as different components (releases that changed only the version) stays unidentified and lists them in `same_content_as` |
 | jars with none of the above (Gradle builds, renamed and re-zipped), with `--class-search` | candidates come from three places, tried in turn: a class from the jar's main package looked up on Maven Central search, narrowed to the version the manifest or file name suggests; the artifact names the file name and manifest suggest, under the groupIds of that package and of identified jars of the same family (`spring-jcl` beside `spring-core`); and, with `--maven-repo`, the artifacts Central search lists for the class, at the suggested version. A candidate is accepted only if its published entries match the jar's (`content`); the hints themselves are never trusted. |
 | shaded jars | extra `pom.properties` inside the jar become components contained in the jar (`contained_in`). So does a jar's only `pom.properties` when the jar's name does not mention it and either most of that artifact's published entries are missing (guice carries only cglib's) or the jar holds more entries of its own than the artifact has (a driver that bundles a compression library whole) |
 | `netty-all` style artifacts | the module list in `META-INF/io.netty.versions.properties` |
@@ -164,8 +164,17 @@ like. Dependency files of ecosystems binwitness does not read (`requirements.txt
 
 The same file is sometimes published under several coordinates: a project that moved its groupId
 (`com.oracle.ojdbc` and `com.oracle.database.jdbc`), a copy republished by someone else, a release that
-did not change a jar. The component is named by the coordinates in the jar's own `pom.properties` when
-they are among them, otherwise by one that matches the file name. A jar whose contents match several copies
+did not change a jar. The component is named by the first of them in this order: the coordinates in the
+jar's own `pom.properties`, one that matches the file name, one whose groupId the jar's packages are in,
+the artifact with more releases in the hash index (the line that went on publishing; only with the index
+installed), then alphabetical order. The hash index files each file under one coordinate only, often a
+republication (commons-io in a NetBeans module, Bouncy Castle 1.38 under the old `bouncycastle` groupId),
+and then lists no file under the original's version. The jar's `pom.properties` names the original in that
+case, unless it names the indexed artifact itself with another version (`7.4.1` for `7.4.1.jre8`, a
+snapshot). Failing that, the file name (`bcprov-jdk14-1.38.jar`) does, when the index knows that artifact,
+lists no file for that version and numbers its releases the same way; of several groupIds that publish the
+artifact, the one the packages are in is taken, then one with releases before and after that version, the
+indexed one, the one with more releases. A jar whose contents match several copies
 of the same release is named by the one whose packaging differs least from it: the original, not the
 `commons-collections` that `org.lucee` republishes. The rest are listed with the file
 (`also_published_as`), and advisories filed under any of them count for the component, marked with the
@@ -235,6 +244,17 @@ Package names are never compared with product names. A package with no such hist
 and the summary counts it as not checked. A link learned from a single CVE is marked as resting on one
 CVE, the weakest kind.
 
+An artifact relocated to new coordinates is the same library published on under them, and a CPE learned
+for either stands for both: `com.mysql:mysql-connector-j` has too few CVEs of its own to learn one, and
+`mysql:mysql-connector-java`, which it took over from, has plenty. Only the last POM of the old coordinates
+says so (`<distributionManagement><relocation>`), and that version has no jar. binwitness reads it (and,
+for the other direction, the component's own) for a package OSV has advisories for under the same
+artifactId and another groupId, or under one that differs only in how far its last word goes (`-j`,
+`-java`), and only when that package has a CPE the component lacks. Such pairs are reached by a "link
+learned for relocated coordinates"; `learned_for` and `relocated_by` name the package the link was learned
+for and the POM that says it moved. The summary counts the POMs that could not be read; in an offline scan
+those are the ones not in the cache.
+
 A record is left out when NVD rejected it, when an advisory in any installed OSV dataset attributes the
 CVE to a package (withdrawn advisories included), when the scan already reports it, under its own id or
 an alias, or when its CPE is for another language runtime (`target_sw` such as `node.js` on a Maven
@@ -301,8 +321,9 @@ learned-link column reads like `3/6 / 3/4 / 3/6; versions meet on 3 of 3`: the p
 CPE out of those with any CPE, the CPE's attributed CVEs of the same project out of all its attributed
 ones, the same as the first for the whole project, and on how many of the CVEs it was learned from that
 give versions on both sides the versions meet. The next column lists the CVEs the link was learned from.
-Further columns say how the pair was reached (a learned link, named in the record, named in the
-vendor's advisory, or one of the ways of the [CNAs' records](#before-nvd-the-cnas-records)) and whose
+Further columns say how the pair was reached (a learned link, one learned for relocated coordinates, named
+in the record, named in the vendor's advisory, or one of the ways of the
+[CNAs' records](#before-nvd-the-cnas-records)) and whose
 versions decided it, name the CNA, the product its record names and the day it published the record, list
 the modules the vendor's advisory names and the classes the fix changed (with those the jar holds, and the
 commits they were read from), and give the flags.
@@ -314,9 +335,10 @@ them were published from June 2026 on, and 36 had only an unreviewed GitHub advi
 brought 64 more that NVD had given no CPE yet, 47 of them published in October 2026; of the 40 judged on
 review, 32 were real or plausible for at least one component.
 
-Candidates come from local copies only, in every lookup mode: the `nvd` dataset and the OSV dataset of
+Candidates come from local copies, in every lookup mode: the `nvd` dataset and the OSV dataset of
 each ecosystem (`binwitness db sync nvd vulns`), and the `cvelist` records, the `spring` advisories and
-`fixes` when installed.
+`fixes` when installed. Only the POMs that tell a relocation are read from the Maven repositories, or from
+the cache in an offline scan.
 An online scan takes its findings from the online services and its candidates from these copies. Their
 dates are given in the summary and in every row of `candidates.csv`. Without the copies, the summary says
 candidates were not checked, never that there are none. NVD records still awaiting analysis have no CPE
@@ -504,7 +526,10 @@ only extends the block.
 
 A large file (the OSV archives, the cvelist snapshot, the hash base) is fetched in pieces of 8 MB over four
 connections when its server sends ranges: one connection is often held far below what the line gives, and
-a slow one then holds up a piece, not the file. A dropped connection resumes where it stopped, and a sync
+a slow one then holds up a piece, not the file. Once no piece is left to start, a free connection fetches
+the rest of a piece going at under half the typical speed a second time, and the piece is taken from
+whichever fetch finishes first; the bytes fetched twice stay within one piece. A dropped connection resumes
+where it stopped, and a sync
 that gives up resumes on the next run, unless the file has changed in between. If a sync fails, the copy already installed is kept. Only one `db sync` or `db remove` runs on a directory at a
 time; a second one is refused rather than left waiting behind a download that can take an hour on a slow
 line.
@@ -524,12 +549,12 @@ entry-by-entry comparison of rebuilt jars with their published originals, `--cla
 JavaScript files. In `local` mode, what is neither in a dataset nor in the cache is left out and counted
 in a warning; a jar that stays unidentified for that reason says so, since an online scan may identify it.
 
-The hash index records one coordinate per file, where deps.dev lists all of them, and deps.dev leaves out
-classifier jars (`json-lib-2.4-jdk15.jar`), which the index has. When a jar's `pom.properties` names
-coordinates the index does not give, or the indexed coordinates do not match the file name, binwitness
-asks deps.dev (or the cache) as well. For a jar that declares nothing, the two sources can still name
-different coordinates of the same file, so a `local` and an `online` scan may differ in a component's
-name; with `auto`, the index answers first, as in `local`.
+With the hash index installed, a jar it lists is named from the jar and the index alone, never from
+deps.dev or the cache, so a `local` scan names a jar the same way whatever the cache holds, and `auto` names
+it as `local` does. A jar the index does not list is looked up on deps.dev, which lists every coordinate of
+a file but leaves out classifier jars (`json-lib-2.4-jdk15.jar`), then on Maven Central search. Where the
+index lists only a republication and the jar carries no clue to the original, a `local` and an `online`
+scan can still differ in a component's name.
 
 The result records which local datasets were read and how current they were (`data_sources.local`),
 also in an `online` scan, whose candidates come from them; where the findings came from is `options.lookup`.

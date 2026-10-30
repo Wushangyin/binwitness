@@ -470,18 +470,19 @@ def twin(tmp_path):
 
 
 def test_advisory_filed_under_the_other_coordinate_of_the_same_file_counts(tmp_path, twin):
-    result, _ = run(tmp_path, twin, ScriptedTransport(twin_routes("org.example.mirror:json-lib", "net.sf.json-lib:json-lib")))
+    # Both coordinates fit the file name, so the fixed order decides: com.example.mirror before net.sf.json-lib.
+    result, _ = run(tmp_path, twin, ScriptedTransport(twin_routes("net.sf.json-lib:json-lib", "com.example.mirror:json-lib")))
     [component] = result["components"]
-    assert component["purl"] == "pkg:maven/org.example.mirror/json-lib@2.4"
+    assert component["purl"] == "pkg:maven/com.example.mirror/json-lib@2.4"
     assert component["files"][0]["also_published_as"] == ["pkg:maven/net.sf.json-lib/json-lib@2.4"]
     assert component["vulnerabilities"] == ["CVE-2023-0003"]
     assert result["vulnerabilities"]["CVE-2023-0003"]["affects"] == {
-        "pkg:maven/org.example.mirror/json-lib@2.4": {"fixed": ["2.5"], "via": "pkg:maven/net.sf.json-lib/json-lib@2.4"}}
-    # Whichever of the two a lookup names first, the file gets the same advisories.
+        "pkg:maven/com.example.mirror/json-lib@2.4": {"fixed": ["2.5"], "via": "pkg:maven/net.sf.json-lib/json-lib@2.4"}}
+    # Whichever of the two the registry lists first, the file gets the same name and advisories.
     swapped, _ = run(tmp_path / "swapped", twin,
-                     ScriptedTransport(twin_routes("net.sf.json-lib:json-lib", "org.example.mirror:json-lib")))
-    assert swapped["components"][0]["vulnerabilities"] == ["CVE-2023-0003"]
-    assert "via" not in swapped["vulnerabilities"]["CVE-2023-0003"]["affects"]["pkg:maven/net.sf.json-lib/json-lib@2.4"]
+                     ScriptedTransport(twin_routes("com.example.mirror:json-lib", "net.sf.json-lib:json-lib")))
+    assert swapped["components"] == result["components"]
+    assert swapped["vulnerabilities"]["CVE-2023-0003"]["affects"] == result["vulnerabilities"]["CVE-2023-0003"]["affects"]
     out = tmp_path / "out"
     write_all(result, out)
     assert "advisory names pkg:maven/net.sf.json-lib/json-lib@2.4" in (out / "vulnerabilities.csv").read_text()
@@ -490,7 +491,8 @@ def test_advisory_filed_under_the_other_coordinate_of_the_same_file_counts(tmp_p
 
 
 def test_crosscheck_matches_a_component_named_by_its_other_coordinate(tmp_path, twin):
-    result, net = run(tmp_path, twin, ScriptedTransport(twin_routes("org.example.mirror:json-lib", "net.sf.json-lib:json-lib")))
+    result, net = run(tmp_path, twin, ScriptedTransport(twin_routes("com.example.mirror:json-lib", "net.sf.json-lib:json-lib")))
+    assert result["components"][0]["name"] == "com.example.mirror:json-lib"
     other = tmp_path / "other.csv"
     other.write_text("component,version,vulnerability\nnet.sf.json-lib:json-lib,2.4,CVE-2023-0003\n"
                      "net.sf.json-lib:json-lib,2.4,CVE-2023-9004\n")   # GitHub has it, OSV does not
@@ -543,6 +545,40 @@ def test_a_renamed_rezipped_copy_takes_the_coordinate_of_the_identified_jar_with
     assert result["unidentified"] == [] and result["summary"]["jars"]["copies_of_identified_jars"] == 1
     # The copy needed no class search: nothing about it left the machine but its hash.
     assert not any("fc%3A" in url for _, url, _ in transport.calls)
+
+
+def test_a_copy_whose_only_pom_properties_nothing_can_check_takes_the_coordinate_of_the_jar_it_copies(tmp_path):
+    # It carries the pom.properties of a library shaded into it, and no registry answers for that library.
+    shaded = {"META-INF/maven/org.example/inner/pom.properties": "groupId=org.example\nartifactId=inner\nversion=3.2\n"}
+    copy = make_zip({"META-INF/MANIFEST.MF": "Manifest-Version: 1.0\r\nCreated-By: repacker\r\n\r\n",
+                     **CODEC_CONTENTS, **shaded})
+    # A file name that bears the pom.properties out keeps it.
+    named = make_zip({"META-INF/MANIFEST.MF": "Manifest-Version: 1.0\r\nCreated-By: other\r\n\r\n",
+                      **CODEC_CONTENTS, **shaded})
+    result, _ = copies_scan(tmp_path, {"lib/codec-1.5.jar": CODEC, "lib/frghf-1.5.jar": copy, "lib/inner-3.2.jar": named},
+                            hash_route(CODEC, "org.example:codec", "1.5"))
+    files = {f["filename"]: (c["name"], f["confidence"]) for c in result["components"] for f in c["files"]}
+    assert files["frghf-1.5.jar"] == ("org.example:codec", "content")
+    assert files["inner-3.2.jar"] == ("org.example:inner", "declared")
+
+
+def test_a_copy_declaring_another_release_of_the_library_it_matches_keeps_its_version(tmp_path):
+    # A release that changed no class: the entries match 1.5, the pom.properties says 1.6.
+    later = make_zip({"META-INF/MANIFEST.MF": "Manifest-Version: 1.0\r\nCreated-By: repacker\r\n\r\n", **CODEC_CONTENTS,
+                      "META-INF/maven/org.example/codec/pom.properties":
+                          "groupId=org.example\nartifactId=codec\nversion=1.6\n"})
+    published = make_zip({"META-INF/MANIFEST.MF": "Manifest-Version: 1.0\r\nCreated-By: builder\r\n\r\n",
+                          **CODEC_CONTENTS})
+    for jars, routes in (({"lib/codec-1.5.jar": CODEC}, hash_route(CODEC, "org.example:codec", "1.5")),
+                         ({"lib/codec-1.5.jar": CODEC, "lib/codec-1.6.jar": published},
+                          {**hash_route(CODEC, "org.example:codec", "1.5"),
+                           **hash_route(published, "org.example:codec", "1.6")})):
+        where = tmp_path / str(len(jars))
+        where.mkdir()
+        result, _ = copies_scan(where, {**jars, "lib/frghf-1.6.jar": later}, routes)
+        files = {f["filename"]: (c["name"], c["version"], f["confidence"])
+                 for c in result["components"] for f in c["files"]}
+        assert files["frghf-1.6.jar"] == ("org.example:codec", "1.6", "declared")
 
 
 def test_a_copy_matching_releases_of_different_versions_stays_unidentified_and_names_them(tmp_path):

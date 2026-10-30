@@ -1,8 +1,9 @@
 """Maven coordinates from registries: hash lookups, published-artifact comparison and POM licenses.
 
-A coordinate is only ever taken from a registry hash match or from the jar's own pom.properties. File names
-are never turned into coordinates: jars built by Gradle carry no pom.properties, and a guessed groupId
-attaches the wrong project's advisories.
+A coordinate is only ever taken from a registry hash match or from the jar's own pom.properties. A file name
+alone is never turned into coordinates: jars built by Gradle carry no pom.properties, and a guessed groupId
+attaches the wrong project's advisories. It is used only for a file the local hash index has, to recognise
+the original of a republication that the index files the jar under.
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ from collections import Counter
 from binwitness.jar import split_name
 from binwitness.licenses import detect, pom_licenses
 from binwitness.net import Net, NetError
+from binwitness.versions import compare
 
 DEPS_DEV = "https://api.deps.dev/v3"
 CENTRAL = "https://repo1.maven.org/maven2"
@@ -34,31 +36,26 @@ PACKAGING = re.compile(r"META-INF/(MANIFEST\.MF|INDEX\.LIST|[^/]+\.(SF|RSA|DSA|E
 PACKAGING_TEXT = "the manifest, index, signatures and Maven build metadata"
 
 
-def lookup_hash(net: Net, sha1: str, filename: str, db=None, declared: tuple[str, str, str] | None = None) -> dict | None:
+def lookup_hash(net: Net, sha1: str, filename: str, db=None, declared: tuple[str, str, str] | None = None,
+                package=lambda: None) -> dict | None:
     """Registry entry whose published file has exactly this SHA-1, or None. ``declared`` is the coordinate in
-    the jar's own pom.properties: of several coordinates publishing the same file, it names the original."""
+    the jar's own pom.properties: of several coordinates publishing the same file, it names the original.
+    ``package`` returns the jar's main package, which tells whose namespace the jar is in.
+
+    Which of several coordinates is taken depends only on the jar and the installed datasets, never on what
+    the response cache happens to hold: a local scan of the same jar names it the same way every time."""
     stem = split_name(filename)[0]
-
-    def named(candidate) -> bool:
-        return stem == f"{candidate[1]}-{candidate[2]}" or stem.startswith(f"{candidate[1]}-{candidate[2]}-")
-
-    candidates, source = [], "Maven Central index, local copy"
     if db is not None and db.has("maven-hashes"):
-        candidates = [(*c, None) for c in db.coordinates_for_sha1(sha1)]
-    # The local index files each jar under a single coordinate, so a file that another project republished
-    # (commons-io inside NetBeans) can sit under the republisher's name, and it lacks some artifacts. Unless
-    # it names the file as the file names itself, the registry's full list decides, as without the index.
-    settled = any(named(c) for c in candidates) and (declared is None or declared in {c[:3] for c in candidates})
-    if not settled:
-        try:
-            listed = _deps_dev(net, sha1)
-        except NetError:
-            if not candidates:
-                raise
-            listed = []
-        if listed:
-            candidates = listed + [c for c in candidates if c[:3] not in {x[:3] for x in listed}]
-            source = "deps.dev"
+        indexed = db.coordinates_for_sha1(sha1)
+        if indexed:
+            own = _displaced(db, indexed, stem, declared, package)
+            pick = own[0] if own else _choose(indexed, stem, declared, package, db)
+            hit = {"coordinate": pick, "source": "Maven Central index, local copy", "licenses": None,
+                   "alternatives": [c for c in indexed if c != pick]}
+            if own:
+                hit["named_by"] = own[1]
+            return hit
+    candidates, source = _deps_dev(net, sha1), "deps.dev"
     if not candidates:
         query = urllib.parse.quote(f'1:"{sha1}"')
         docs = (net.get_json(f"{CENTRAL_SEARCH}?q={query}&rows=20&wt=json", stable=True) or {}).get(
@@ -67,11 +64,88 @@ def lookup_hash(net: Net, sha1: str, filename: str, db=None, declared: tuple[str
         source = "search.maven.org"
     if not candidates:
         return None
-    # The same file can be published under several coordinates (a project that moved its groupId).
-    pick = next((c for c in candidates if c[:3] == declared), None) or next((c for c in candidates if named(c)),
-                                                                             candidates[0])
-    return {"coordinate": pick[:3], "source": source, "licenses": pick[3],
-            "alternatives": [c[:3] for c in candidates if c[:3] != pick[:3]]}
+    pick = _choose([c[:3] for c in candidates], stem, declared, package)
+    return {"coordinate": pick, "source": source, "licenses": next(c[3] for c in candidates if c[:3] == pick),
+            "alternatives": list(dict.fromkeys(c[:3] for c in candidates if c[:3] != pick))}
+
+
+def _names(stem: str, coordinate) -> bool:
+    return stem == f"{coordinate[1]}-{coordinate[2]}" or stem.startswith(f"{coordinate[1]}-{coordinate[2]}-")
+
+
+def _shared(group: str, package: str | None) -> int:
+    """How many names long a groupId is, when the package begins with all of them and they are at least two
+    (org.bouncycastle for org.bouncycastle.crypto). A groupId that only shares org.apache with the package
+    is as likely a bundler that republished it."""
+    names = group.split(".")
+    return len(names) if len(names) >= 2 and (package or "").split(".")[:len(names)] == names else 0
+
+
+def _choose(candidates: list, stem: str, declared, package, db=None) -> tuple[str, str, str]:
+    """The same file under several coordinates (a project that moved its groupId, a republication): the jar's
+    own pom.properties, then its file name, then the groupId its packages are in, then the line with the most
+    releases in the hash index, the line that went on publishing; and finally the alphabet, the order deps.dev
+    lists them in. The groupId's length says nothing: com.oracle.ojdbc moved to com.oracle.database.jdbc,
+    while xerces was republished as org.exist-db.thirdparty.xerces."""
+    namespace = package() if len(candidates) > 1 else None
+    return min(candidates, key=lambda c: (c != declared, not _names(stem, c), -_shared(c[0], namespace),
+                                          -len(db.maven_versions(*c[:2])) if db is not None else 0, c))
+
+
+def _fields(version: str) -> int:
+    match = re.match(r"\d+(?:\.\d+)*", version)
+    return match.group().count(".") + 1 if match else 0
+
+
+def _related(artifact: str, other: str) -> bool:
+    return artifact == other or other.startswith(artifact + "-") or artifact.startswith(other + "-") \
+        or other.endswith("-" + artifact) or artifact.endswith("-" + other)
+
+
+def _displaced(db, indexed: list, stem: str, declared, package) -> tuple[tuple[str, str, str], str] | None:
+    """The jar's own coordinate when the local index files the jar under a republication of it, and why.
+
+    The index keeps one coordinate per file, so a jar that another project republished unchanged sits under
+    whichever coordinate the index met first: commons-io 2.6 under NetBeans', bcprov-jdk14 1.38 under the
+    old bouncycastle groupId with the version 138. The original then has no file for that version. The
+    jar's pom.properties, or else its file name, is taken when that version is missing under it and its
+    artifactId is related to the indexed one; for a file name, the groupId is the one the jar's packages are
+    in, the one whose releases come before and after the version, the indexed one, or the one with the most
+    releases, among those that lack the version and number their versions alike (1.38 is not of the 124-140
+    line)."""
+    def missing(group, artifact, version) -> bool:
+        versions = db.maven_versions(group, artifact)
+        return version not in versions and (not versions or _fields(version) in {_fields(v) for v in versions})
+
+    if declared in indexed:
+        return None
+    # The project's own release whose pom.properties lacks the variant suffix (7.4.1 for 7.4.1.jre8) or names
+    # the snapshot it was built from is no republication.
+    if declared and declared[:2] in {c[:2] for c in indexed}:
+        return None
+    # A republisher's coordinate can fit the file name just as well (json-lib-2.4-jdk15 under a mirror's
+    # groupId), so the pom.properties is asked first.
+    if declared and (_names(stem, declared) or any(_related(declared[1], c[1]) for c in indexed)):
+        found = declared[0] in db.maven_groups(declared[1]) and missing(*declared)
+        return (declared, "pom.properties") if found else None
+    if any(_names(stem, c) for c in indexed):
+        return None
+    for split in reversed(list(re.finditer(r"-(?=\d)", stem))):
+        artifact, version = stem[:split.start()], stem[split.end():]
+        if not any(_related(artifact, c[1]) for c in indexed):
+            continue
+        groups = [g for g in db.maven_groups(artifact) if missing(g, artifact, version)]
+        if groups:
+            own, namespace = {c[:2] for c in indexed}, package()
+
+            def surrounds(group) -> bool:
+                order = {compare("maven", v, version) for v in db.maven_versions(group, artifact)}
+                return -1 in order and 1 in order
+
+            group = min(groups, key=lambda g: (-_shared(g, namespace), not surrounds(g), (g, artifact) not in own,
+                                               -len(db.maven_versions(g, artifact)), g))
+            return (group, artifact, version), "file name"
+    return None
 
 
 def _deps_dev(net: Net, sha1: str) -> list[tuple]:

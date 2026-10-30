@@ -23,6 +23,8 @@ from binwitness.npm import parse as parse_npm
 # The local index lacks some public jars (it keeps one coordinate per file, and Google's repository is not
 # Central), so absence from it does not mean that no registry has the file.
 OFFLINE_UNKNOWN = "not in the local datasets or the cache; an online scan can tell whether a registry has it"
+HASH_INDEX_MISSING = ("the Maven Central hash index is not installed; `binwitness db sync maven-hashes` installs it, "
+                      "and an offline scan then identifies the published ones")
 
 CONFIDENCE = ("exact", "content", "declared")
 # Each candidate costs a checksum and a directory lookup, and the search stops at the first full match.
@@ -175,7 +177,8 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None, cand
         if is_first_party_jar(facts):
             return {"first_party": True}
         try:
-            hit = maven.lookup_hash(net, facts.sha1, facts.filename, db, facts.coordinate)
+            hit = maven.lookup_hash(net, facts.sha1, facts.filename, db, facts.coordinate,
+                                    lambda: _package(facts))
         except OfflineMiss:
             hit, failure = None, OFFLINE_UNKNOWN
         except NetError as error:
@@ -183,9 +186,13 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None, cand
         else:
             failure = None
         if hit:
-            return {"coordinate": hit["coordinate"], "method": f"file SHA-1 matches the published artifact "
-                    f"({hit['source']})", "confidence": "exact", "published": "identical",
-                    "licenses": hit["licenses"], "alternatives": hit["alternatives"]}
+            method = f"file SHA-1 matches the published artifact ({hit['source']})"
+            if hit.get("named_by"):
+                method = (f"file SHA-1 matches {':'.join(hit['alternatives'][0])} in the Maven Central index "
+                          f"(local copy), which republishes it; the coordinates come from the jar's "
+                          f"{hit['named_by']}, and the index has no file under them")
+            return {"coordinate": hit["coordinate"], "method": method, "confidence": "exact",
+                    "published": "identical", "licenses": hit["licenses"], "alternatives": hit["alternatives"]}
         demoted = None
         if facts.coordinate:
             published, comparison, repository = check_published(facts, facts.coordinate, facts.filename)
@@ -344,9 +351,20 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None, cand
                     verified.setdefault(fingerprint, {}).setdefault(verdict["coordinate"], sha1)
         matched = 0
         for sha1, verdict in verdicts.items():
-            if verdict.get("coordinate") or verdict.get("first_party"):
+            if verdict.get("first_party"):
+                continue
+            # A pom.properties that the file name does not bear out and nothing could check (guice's copy carries
+            # only cglib's; the published listing that tells is not in the cache) gives way to an identified jar
+            # with the same entries, as it does once the listing has shown it to belong to a shaded library.
+            unchecked = verdict.get("confidence") == "declared" and not jars[sha1].facts.named_by_file
+            if verdict.get("coordinate") and not unchecked:
                 continue
             same = verified.get(_content_print(jars[sha1].facts)) or {}
+            if unchecked:
+                # Another release of the declared artifact with the same entries (rome-utils 1.12.1 and 1.15.0)
+                # bears the declaration out rather than contradicting it.
+                if len(same) != 1 or any(c[:2] == verdict["coordinate"][:2] for c in same):
+                    continue
             if len(same) > 1:
                 # Releases that changed nothing but the version (an annotations jar) cannot be told apart.
                 verdict["same_content_as"] = sorted(":".join(c) for c in same)
@@ -356,7 +374,8 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None, cand
                 verdicts[sha1] = {
                     "coordinate": coordinate, "confidence": "content", "published": "repackaged",
                     "licenses": source.get("licenses"), "alternatives": source.get("alternatives"),
-                    "demoted": verdict.get("demoted"), "copy_of": original, "repository": source.get("repository"),
+                    "demoted": verdict["coordinate"] if unchecked else verdict.get("demoted"), "copy_of": original,
+                    "repository": source.get("repository"),
                     "method": f"every entry but {maven.PACKAGING_TEXT} has the CRC-32 and size of "
                               f"{jars[original].facts.filename} in the same delivery, identified as the "
                               f"published artifact"}
@@ -508,12 +527,14 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None, cand
             try:
                 return staticjs.identify(net, entry["digest"], entry["head"], declared_npm)
             except NetError as error:
-                return {"error": str(error)}
+                return {"error": str(error), "offline": isinstance(error, OfflineMiss)}
         found = map_parallel(identify_script, script_list, options.workers)
         for entry, hit in zip(script_list, found):
             if hit and "error" in hit:
                 unmatched_scripts += entry["locations"]
-                warnings.append(f"script lookup failed: {hit['error']}")
+                # A lookup an offline scan did not make is counted in the offline warning, as a jar's is.
+                if not hit["offline"]:
+                    warnings.append(f"script lookup failed: {hit['error']}")
                 scripts_not_looked_up += 1
             elif not hit:
                 (bundled_scripts if staticjs.is_bundle(entry["locations"], entry["head"])
@@ -556,7 +577,7 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None, cand
     store = candidates_db or db
     candidates, candidate_links, candidate_summary = nvd.attach(
         store, items, vulnerabilities, kev_dates, OSV_DATASET, _candidates_unavailable(options, store),
-        _Listings(jars, hosts, items))
+        _Listings(jars, hosts, items), lambda name: upgrades.relocated_to(net, name, options.maven_repos))
     if candidate_summary["checked"]:
         log(f"candidates: {candidate_summary['total']} NVD records not attributed to a package, for "
             f"{candidate_summary['components']['with_link']} components with a learned CPE")
@@ -576,6 +597,11 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None, cand
         warnings.append("nothing to identify: the inputs hold no jar, npm lockfile, node_modules package or "
                         "JavaScript file that binwitness reads")
 
+    lookup = options.lookup or ("online" if db is None else "local" if net.offline else "auto")
+    unknown_offline = sum(1 for u in unidentified if u["reason"] == OFFLINE_UNKNOWN)
+    if unknown_offline and lookup != "online" and not (db and db.has("maven-hashes")):
+        warnings.append(f"{unknown_offline} jar{'' if unknown_offline == 1 else 's'} not identified offline: "
+                        + HASH_INDEX_MISSING)
     items.sort(key=lambda c: (c["ecosystem"], c["name"], c["version"]))
     for item in items:
         item["locations"].sort()
@@ -593,7 +619,7 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None, cand
                     "vulnerabilities": options.vulnerabilities,
                     "upgrades": options.vulnerabilities and options.upgrades, "class_search": options.class_search,
                     "maven_repos": list(options.maven_repos), "offline": net.offline,
-                    "lookup": options.lookup or ("online" if db is None else "local" if net.offline else "auto"),
+                    "lookup": lookup,
                     "mirrors": dict(net.mirrors)},
         # The local copies an online scan's candidates were read from are recorded as well: their dates are what
         # the candidates are as of.
@@ -726,6 +752,11 @@ class _Listings:
             self._simple = {part for sha1 in self.jars for entry in self._classes(sha1) or []
                             for part in entry.rsplit("/", 1)[-1][:-len(".class")].split("$")}
         return name in self._simple
+
+
+def _package(facts: JarFacts) -> str | None:
+    found = representative_class(entries(facts) or {})
+    return found.rsplit(".", 1)[0] if found else None
 
 
 def _own_entries(facts: JarFacts) -> list[tuple[str, int, int]] | None:

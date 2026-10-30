@@ -20,6 +20,7 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import asdict, dataclass, replace
 
 from binwitness import cna, fixes
+from binwitness.net import NetError, map_parallel
 from binwitness.versions import compare
 from binwitness.vulns import SEVERITIES
 
@@ -42,6 +43,7 @@ REFERENCES_KEPT = 20
 # downloaded again, since only the records NVD changes since would be stored anew.
 LAYOUT = 2
 LEARNED_FROM_KEPT = 5
+RELOCATION_READERS = 8
 SCHEMA = """
 CREATE TABLE records(id TEXT PRIMARY KEY, modified TEXT, status TEXT, body BLOB);
 CREATE TABLE cpes(vendor TEXT, product TEXT, id TEXT);
@@ -665,11 +667,12 @@ def _holds(index: tuple[set[str], set[str]], name: str) -> bool:
 # ---- candidates -----------------------------------------------------------------------------------------
 
 def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datasets: dict[str, str],
-           reason: str | None, listings=None) -> tuple[dict, dict, dict]:
+           reason: str | None, listings=None, moved_to=None) -> tuple[dict, dict, dict]:
     """(candidates by CVE id, links by purl, summary). ``datasets``: ecosystem -> its OSV dataset name;
     ``reason``: why candidates cannot be looked for at all, if so; ``listings``: the jar entries at hand, with
     ``of(item)`` (the class entries of the jar holding an item, None when unknown), ``has_class(name)`` and,
-    optionally, ``unsure(item)`` (entries it may or may not hold)."""
+    optionally, ``unsure(item)`` (entries it may or may not hold); ``moved_to(name)``: where the latest POM of a
+    Maven artifact relocates it, as (new name, which POM says so), or None; NetError when it cannot be read."""
     if reason:
         return {}, {}, {"checked": False, "not_checked": reason}
     linker = Linker(db)
@@ -764,7 +767,73 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
                                                    "single_cve_link": single, "versions_from": "nvd",
                                                    "below_listed_lines": False, "cna_product": ""})
 
+    # An artifact relocated to new coordinates is the same library published on under them: a CPE learned for
+    # either stands for both (mysql:mysql-connector-java and com.mysql:mysql-connector-j, whose few CVEs of its own
+    # teach none). Only the old coordinate's POM says so, and a POM is read for a package OSV knows by the same
+    # artifactId under another groupId, or by one that differs in the end of its last word, and only when one of the
+    # two has a CPE the other lacks.
+    relocations: dict[str, tuple[str, str] | None] = {}
+    relocations_unread: set[str] = set()
+    similar: dict | None = None
+
+    def relocated(name: str) -> tuple[str, str] | None:
+        if name not in relocations:
+            try:
+                relocations[name] = moved_to(name)
+            except NetError:
+                relocations[name], _ = None, relocations_unread.add(name)
+        return relocations[name]
+
+    def others_of(item: dict, own: dict[str, Link]) -> list[tuple[str, dict[str, Link]]]:
+        """The packages that may be the item's artifact at other coordinates and have a CPE it lacks, with their
+        links."""
+        nonlocal similar
+        if similar is None:
+            similar = {}
+            for other in db.osv_packages("maven"):
+                if ":" in other:
+                    artifact = other.split(":", 1)[1]
+                    similar.setdefault(artifact, []).append(other)
+                    if "-" in artifact:
+                        similar.setdefault(("stem", artifact.rsplit("-", 1)[0]), []).append(other)
+        artifact = item["name"].split(":", 1)[1]
+        last = artifact.rsplit("-", 1)[-1]
+        others = similar.get(artifact, [])
+        if "-" in artifact:
+            for other in similar.get(("stem", artifact.rsplit("-", 1)[0]), []):
+                word = other.split(":", 1)[1].rsplit("-", 1)[-1]
+                if word != last and (word.startswith(last) or last.startswith(word)):
+                    others = [*others, other]
+        return [(other, theirs) for other in sorted(set(others) - {item["name"]})
+                if set(theirs := linker.links("maven", other)) - set(own)]
+
+    def moves(item: dict, own: dict[str, Link]) -> dict[str, tuple[Link, str, str]]:
+        """CPEs learned for coordinates relocated to or from the item's: cpe -> (link, those coordinates, the POM
+        that relocates them)."""
+        found = {}
+        for other, theirs in others_of(item, own):
+            moved = relocated(other)
+            if not (moved and moved[0] == item["name"]):
+                moved = relocated(item["name"])
+                if not (moved and moved[0] == other):
+                    continue
+            found |= {cpe: (link, other, moved[1]) for cpe, link in theirs.items() if cpe not in own and cpe not in found}
+        return found
+
+    def movable(item: dict) -> bool:
+        return bool(moved_to) and item["ecosystem"] == "maven" and ":" in item["name"] and bool(item["version"])
+
+    if moved_to and not db.cve_index_missing(datasets.get("maven")):
+        # The POMs are read a few at a time, the others' first and then the items' own where needed: one at a
+        # time, the 40 of a delivery of 1,100 jars made its scan 100 s longer.
+        pending = [(item, others_of(item, linker.links("maven", item["name"]))) for item in items if movable(item)]
+        map_parallel(relocated, sorted({other for _, others in pending for other, _ in others}), RELOCATION_READERS)
+        map_parallel(relocated, sorted({item["name"] for item, others in pending
+                                        if any((relocations[other] or ("",))[0] != item["name"] for other, _ in others)}),
+                     RELOCATION_READERS)
+
     item_links: dict[str, dict[str, Link]] = {}
+    shared_links: dict[str, dict[str, tuple[str, str]]] = {}
     for item in items:
         ecosystem = item["ecosystem"]
         problem = db.cve_index_missing(datasets.get(ecosystem))
@@ -772,6 +841,11 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
             not_checked[problem] += 1
             continue
         links = linker.links(ecosystem, item["name"])
+        if movable(item):
+            shared = moves(item, links)
+            if shared:
+                links = {**links, **{cpe: link for cpe, (link, _, _) in shared.items()}}
+                shared_links[item["purl"]] = {cpe: (other, by) for cpe, (_, other, by) in shared.items()}
         item_links[item["purl"]] = links
         refused |= {(ecosystem, item["name"], cpe) for cpe in linker.apart(ecosystem, item["name"])}
         if not links or not item["version"]:
@@ -782,7 +856,9 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
             if (ecosystem, link.cpe) not in packages:
                 packages[(ecosystem, link.cpe)] = linker.packages(ecosystem, link.cpe)
             link.packages = packages[(ecosystem, link.cpe)]
-        links_of[item["purl"]] = {cpe: link.as_dict() for cpe, link in links.items()}
+        moved = shared_links.get(item["purl"], {})
+        links_of[item["purl"]] = {cpe: link.as_dict() | ({"learned_for": moved[cpe][0], "relocated_by": moved[cpe][1]}
+                                                         if cpe in moved else {}) for cpe, link in links.items()}
         own = _own_ids(item, vulnerabilities)
         home = family(ecosystem, item["name"])
         for cpe, link in links.items():
@@ -801,7 +877,10 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
                     if not speaks_for(modules, item["name"]) and not placed(ident, item)[0]:
                         left_out["names_another_module"] += 1
                         continue
-                add(ident, item, cpe, hit, "learned", link.single)
+                add(ident, item, cpe, hit, "relocated" if cpe in moved else "learned", link.single)
+                pair = table[ident]["affects"][item["purl"]]
+                if pair["basis"] == "relocated":
+                    pair |= {"learned_for": moved[cpe][0], "relocated_by": moved[cpe][1]}
     # A record that names its module reaches that module, in any build, even where no CPE could be learned for
     # it (a module without CVEs of its own, or one inside an all-in-one jar), through the CPE learned for the
     # others; so does the vendor's advisory of it.
@@ -818,6 +897,13 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
 
     # The CNAs' own records and the vendors' advisories, for what NVD cannot tell: records it has given no CPE
     # yet, and, where a record or advisory names the package itself, records whose CPEs are not linked with it.
+    # A coordinate read from a repository URL counts for a package known to exist: OSV or the hash index knows it,
+    # or a jar here is its published artifact (an online scan finds that out without the index); not one that
+    # merely says so in its pom.properties.
+    published = {i["name"] for i in items if i["ecosystem"] == "maven" and i.get("confidence") in ("exact", "content")}
+
+    def known(name: str) -> bool:
+        return name in published or db.known_package(name)
     reaching: dict[str, dict[str, list[tuple[str, str]]]] = {}
     for item in items:
         name = item["name"]
@@ -826,7 +912,7 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
         module, found = cna.module_key(name), {}
         if db.has("cvelist"):
             for package, ident, how in db.cna_packages(module):
-                if how == "package" or db.known_package(package):
+                if how == "package" or known(package):
                     found.setdefault(ident, []).append(("cna_package", package))
             for cpe in sorted(item_links[item["purl"]]):
                 for ident in db.cna_cpe_ids(cpe):
@@ -841,7 +927,7 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
     every = sorted({i for found in reaching.values() for i in found})
     attribution, nvd_statuses = db.osv_attribution(every), db.nvd_status(every)
     explicit = {i for i, named_by in (db.cna_named_packages(every) if db.has("cvelist") else {}).items()
-                if any(how == "package" or db.known_package(p) for p, how in named_by)}
+                if any(how == "package" or known(p) for p, how in named_by)}
 
     def candidate_of(ident: str) -> dict:
         record = linker.record(ident)
@@ -873,7 +959,7 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
                     versions, product, single = cna.describe_ranges(ranges), advisory.get("project") or "", False
                 else:
                     own_record = cna_record(ident)
-                    chosen = cna.entries_for(own_record, basis, via, name, db.known_package) if own_record else []
+                    chosen = cna.entries_for(own_record, basis, via, name, known) if own_record else []
                     if not chosen:
                         continue
                     if basis != "cna_package":
@@ -966,12 +1052,17 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
         "records_from_cna": sum(1 for c in table.values() if c["record_from"] == "cna"),
         "pairs_left_out": dict(left_out),
         "links_refused": {"version_ranges_apart": len(refused)},
+        "links_shared_by_relocation": [{"component": purl, "learned_for": other, "relocated_by": by}
+                                       for purl, other, by in sorted({(purl, other, by) for purl, moved in
+                                                                      shared_links.items() for other, by in moved.values()})],
+        "relocations_not_read": len(relocations_unread),
         "components": {"with_link": linked, "without_link": without, "not_checked": sum(not_checked.values())},
         "components_not_checked_because": dict(not_checked),
         "nvd_records_without_cpe": db.nvd_without_cpe(),
-        # An online scan's findings are as of the scan; its candidates are as of these copies.
+        # An online scan's findings are as of the scan; its candidates are as of these copies. A copy that was
+        # installed but not read (no candidate cites a commit) is left out, as in data_sources.
         "data_as_of": {n: db.data_as_of(n) for n in ["nvd", *sorted(set(datasets.values())), "cvelist", "spring",
-                                                     "fixes"] if db.has(n)},
+                                                     "fixes"] if n in db.used},
     }
     return table, links_of, summary
 

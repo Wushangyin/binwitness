@@ -10,6 +10,7 @@ from pathlib import Path
 
 from binwitness import __version__
 from binwitness.licenses import spdx_id
+from binwitness.scan import HASH_INDEX_MISSING, OFFLINE_UNKNOWN
 from binwitness.versions import compare
 from binwitness.vulns import SEVERITIES
 
@@ -229,11 +230,18 @@ CANDIDATE_COLUMNS = ["id", "severity", "cvss score", "cvss vector", "cvss source
                      "same flaw as finding", "names only another language", "named classes in this jar",
                      "named classes not in this jar", "classes the fix changed", "of them in this jar",
                      "none of the fix's classes in this jar", "fix commits", "cwe", "description", "url", "data as of"]
-REACHED_BY = {"learned": "learned link", "named": "named in the record", "advisory": "named in the vendor's advisory",
+REACHED_BY = {"learned": "learned link", "relocated": "link learned for relocated coordinates",
+              "named": "named in the record", "advisory": "named in the vendor's advisory",
               "cna_package": "package named in the CNA's record", "cna_cpe": "CPE in the CNA's record",
               "cna_learned": "learned link (product in the CNA's record)",
               "advisory_direct": "module named in the vendor's advisory, with its versions"}
 VERSIONS_FROM = {"nvd": "NVD", "cna": "CNA's record", "advisory": "vendor's advisory"}
+
+
+def _reached_text(pair: dict) -> str:
+    if pair.get("basis") == "relocated":
+        return f"link learned for {pair['learned_for']}, relocated by {pair['relocated_by']}"
+    return REACHED_BY.get(pair.get("basis", "learned"), "")
 
 
 def candidates_csv(result: dict, path: Path):
@@ -261,7 +269,7 @@ def candidates_csv(result: dict, path: Path):
                              c.get("cna") or "", (c.get("cna_published") or "")[:10],
                              "yes" if a["conditional"] else "", _link_text(link),
                              " ".join(link.get("learned_from") or []), "yes" if a["single_cve_link"] else "",
-                             link.get("packages", ""), REACHED_BY.get(a.get("basis", "learned"), ""),
+                             link.get("packages", ""), _reached_text(a),
                              " ".join(c.get("advisory_modules") or []),
                              "yes" if a.get("advisory_names_another_module") else "",
                              " ".join(a.get("related_findings") or []), "yes" if a.get("other_language_only") else "",
@@ -348,6 +356,11 @@ def render_summary(result: dict) -> str:
     if incomplete:
         lines.append("INCOMPLETE   " + "; ".join(INCOMPLETE[k].format(n=n) for k, n in incomplete.items())
                      + " (see warnings)")
+    unknown_offline = sum(1 for u in result["unidentified"] if u["reason"] == OFFLINE_UNKNOWN)
+    if unknown_offline and options.get("lookup") != "online" \
+            and "maven-hashes" not in (result.get("data_sources") or {}).get("local", {}):
+        lines.append(f"tip          {unknown_offline} jar{'' if unknown_offline == 1 else 's'} not identified offline: "
+                     + HASH_INDEX_MISSING)
     unnamed = [u for u in result["unidentified"] if u["reason"].startswith("no registry has this file")]
     if unnamed and not (options.get("class_search") and options.get("maven_repos")):
         lines.append(f"tip          {len(unnamed)} unidentified jar{'' if len(unnamed) == 1 else 's'}: "
@@ -402,7 +415,9 @@ def _candidate_lines(summary: dict | None) -> list[str]:
                if summary.get("pairs_reached_by_advisory") and not by_basis else "")
             + ("; pairs left out: " + _listing([(LEFT_OUT.get(k, k), n) for k, n in sorted(left_out.items())])
                if sum(left_out.values()) else "")
-            + (f"; {refused} CPE links refused: NVD's versions never meet OSV's" if refused else ""))
+            + (f"; {refused} CPE links refused: NVD's versions never meet OSV's" if refused else "")
+            + (f"; {summary['relocations_not_read']} POMs not read to tell whether an artifact was relocated"
+               if summary.get("relocations_not_read") else ""))
     fixes = summary.get("fix_commits")
     if fixes and fixes["candidates_citing_a_commit"]:
         read = fixes["commits"]

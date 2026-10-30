@@ -11,6 +11,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from binwitness.archive import listed_once
 from binwitness.licenses import detect, manifest_value, pom_licenses
 
 MANIFEST_KEYS = ("Implementation-Title", "Implementation-Version", "Implementation-Vendor",
@@ -89,12 +90,14 @@ def jar_facts(filename: str, source: bytes | Path, digests: tuple[str, str, int]
 
 
 def _read_facts(facts: JarFacts, archive: zipfile.ZipFile):
-    names = archive.namelist()
+    # A name listed twice over different data reads its last listing, as zipfile does.
+    by_name = {info.filename: info for info in listed_once(archive)}
+    names = list(by_name)
 
     def read(name: str) -> bytes:
         # A jar with one corrupt or encrypted entry is still a jar: report the entry, keep the rest.
         try:
-            return archive.read(name)
+            return archive.read(by_name[name])
         except (zipfile.BadZipFile, zlib.error, EOFError, NotImplementedError, RuntimeError) as error:
             facts.damaged.append(f"{name}: {error}")
             return b""
@@ -192,7 +195,7 @@ def _record_listing(facts: JarFacts, archive: zipfile.ZipFile):
     if facts.damaged:
         return
     lines = []
-    for info in archive.infolist():
+    for info in listed_once(archive):
         if info.is_dir():
             continue
         try:

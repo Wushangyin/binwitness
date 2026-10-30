@@ -455,6 +455,18 @@ def relocation(net: Net, name: str, version: str, repositories: tuple[str, ...] 
     return None
 
 
+def relocated_to(net: Net, name: str, repositories: tuple[str, ...] = ()) -> tuple[str, str] | None:
+    """Where the latest POM of a Maven artifact relocates it, as :func:`relocation`. The versions are the
+    repositories' own list: the hash index has none without a jar, and a POM that relocates comes without one
+    (mysql:mysql-connector-java has jars up to 8.0.30; 8.0.31 on are POMs that point to com.mysql)."""
+    group, artifact = name.split(":", 1)
+    versions, _ = _maven_metadata(net, group, artifact, repositories)
+    if not versions:
+        return None
+    return relocation(net, name, max(versions, key=functools.cmp_to_key(lambda a, b: compare("maven", a, b))),
+                      repositories)
+
+
 def note_license_changes(items: list[dict], families: list[dict], license_of, workers: int = 16) -> None:
     """A caveat on advice whose target declares a more restrictive license than the version in use, or one
     binwitness does not classify (org.elasticsearch:elasticsearch 7.9.3, Apache-2.0, to 7.17, Elastic-2.0 or
@@ -569,15 +581,14 @@ def attach(net: Net, db, items: list[dict], table: dict, repositories: tuple[str
         item["upgrade"] = block
 
     # A coordinate that stopped being published may live on under another name: its last POM says where.
-    order = functools.cmp_to_key(lambda a, b: compare("maven", a, b))
     stuck = [item for item in wanted if item["ecosystem"] == "maven" and not net.offline
              and item["upgrade"]["verdict"] in ("partial", "no-published-fix", "upgrade-across-major")]
 
     def moved(item):
-        records, listing = gathered[("maven", item["name"])]
-        if not listing.versions:
+        try:
+            found = relocated_to(net, item["name"], repositories)
+        except NetError:
             return None
-        found = relocation(net, item["name"], max(listing.versions, key=order), repositories)
         return (found, gather(("maven", found[0]), item["version"])) if found else None
 
     for item, found in zip(stuck, map_parallel(moved, stuck, max(workers, 4))):

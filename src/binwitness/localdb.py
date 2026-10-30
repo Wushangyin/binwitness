@@ -28,6 +28,7 @@ import posixpath
 import re
 import shutil
 import sqlite3
+import statistics
 import struct
 import tarfile
 import threading
@@ -90,6 +91,16 @@ FIX_BATCH = 40
 # PART_SIZE over so many connections at once, so that a slow one holds up a piece, not the file.
 DOWNLOAD_CONNECTIONS = 4
 PART_SIZE = 8 << 20
+PART_CHUNK = 64 << 10  # read at a time: a piece's speed is known as it goes
+# Pieces mostly take about as long as each other, but one in fourteen took four to eight times the median, and the
+# last of them held up the file. Once none is left to start, an idle connection fetches the rest of one going at
+# under 1/HEDGE_SLOWER of the median finished piece's speed again, if it has run as long as a piece takes at that
+# speed (within HEDGE_LEAST and HEDGE_AFTER seconds) and needs as long again; the bytes fetched twice are kept
+# within a piece's size.
+HEDGE_SLOWER = 2
+HEDGE_LEAST = 2.0  # a connection took up to a second to set up
+HEDGE_AFTER = 5.0
+HEDGE_CHECK = 1.0  # seconds between an idle connection's looks
 FIX_FAILURES_TO_STOP = 8
 # cvelistV5 keeps each day's changes as a release for at least seven weeks (seen in October 2026); a copy further
 # behind is downloaded again.
@@ -298,7 +309,9 @@ class Fetcher:
     def _download_parts(self, url, target: Path, headers, progress, connections: int) -> bool:
         """Fetch ``url`` in pieces over several connections, each piece resuming where it stopped, also in a
         later sync; join them into ``target``. False, having fetched nothing, when the server does not send
-        ranges or the file is no larger than a piece; and when the file changed under pieces fetched before."""
+        ranges or the file is no larger than a piece; and when the file changed under pieces fetched before.
+        Once no piece is left to start, an idle connection fetches the rest of one going at a small part of the
+        others' speed a second time, and the piece is taken from whichever fetch finishes first."""
         def sent():
             return dict((headers() if callable(headers) else headers) or {})
 
@@ -322,6 +335,9 @@ class Fetcher:
         layout = {"total": total, "etag": etag, "piece": PART_SIZE}
         plan = target.with_name(target.name + ".parts")
         pieces = [target.with_name(f"{target.name}.{k + 1}-of-{count}") for k in range(count)]
+        # A second fetch writes apart from the piece's own file, which therefore only ever holds a beginning of
+        # the piece: one interrupted is not kept, and the piece resumes from its own file.
+        seconds = [piece.with_name(piece.name + ".second") for piece in pieces]
         try:
             resumed = json.loads(plan.read_text("utf-8")) == layout
         except (OSError, ValueError):
@@ -331,59 +347,180 @@ class Fetcher:
                 stale.unlink()
             plan.write_text(json.dumps(layout), "utf-8")
         bounds = [(k * PART_SIZE, min(total, (k + 1) * PART_SIZE) - 1) for k in range(count)]
-        lock = threading.Lock()
-        stopped = threading.Event()
+        wanted = [end - start + 1 for start, end in bounds]
+        have = [piece.stat().st_size if piece.exists() else 0 for piece in pieces]
+        reached = list(have)  # as far as either fetch of a piece has got
+        complete = [h >= w for h, w in zip(have, wanted)]
+        waiting = [k for k in range(count) if not complete[k]]
+        # Every write is made under this lock, after checking the piece is still wanted: a fetch that lost, or
+        # outlived the download, writes nothing, and no file is held open for the join to find.
+        cv = threading.Condition()
+        running = {}  # piece: when its fetch started and the bytes it had then
+        rates, outcome, errors = [], {}, []
+        # spent: the bytes second fetches have fetched twice or for nothing; one starts only if that, with the
+        # rest of each one under way (again) and of its own, stays within a piece.
+        again, spent, stopped, over = {}, 0, False, False
 
-        def size(path):
-            return path.stat().st_size if path.exists() else 0
-        done = [size(piece) for piece in pieces]
+        def ask(k):
+            asked = {**sent(), "Range": f"bytes={bounds[k][0] + have[k]}-{bounds[k][1]}"}
+            if etag:
+                asked["If-Range"] = etag
+            return asked
 
         def fetch(k):
-            start, end = bounds[k]
-            piece, wanted = pieces[k], end - start + 1
-
             def attempt():
-                have = size(piece)
-                if have >= wanted:
-                    return 206, None
-                asked = {**sent(), "Range": f"bytes={start + have}-{end}"}
-                if etag:
-                    asked["If-Range"] = etag
+                with cv:
+                    if complete[k] or over:
+                        return 206, None
+                    asked, at = ask(k), have[k]
                 status, answer, stream = self.opener(url, asked)
                 with closing(stream):
                     _refuse_if_limited(url, status, answer)
                     if status != 206:
                         # 200: the whole file, as it is now; it changed since the other pieces were fetched.
                         return status, None
-                    with piece.open("ab") as out:
-                        while have < wanted and (chunk := stream.read(min(1 << 20, wanted - have))):
-                            out.write(chunk)
-                            have += len(chunk)
-                            with lock:
-                                done[k] = have
-                                if progress:
-                                    progress(sum(done), total)
-                if have < wanted:
-                    raise ConnectionError(f"connection closed after {have} of {wanted} bytes of piece {k + 1}")
+                    while at < wanted[k] and (chunk := stream.read(min(PART_CHUNK, wanted[k] - at))):
+                        with cv:
+                            if complete[k] or over:
+                                return 206, None
+                            with pieces[k].open("ab") as out:
+                                out.write(chunk)
+                            at = have[k] = at + len(chunk)
+                            reached[k] = max(reached[k], at)
+                            if at == wanted[k]:
+                                complete[k] = True
+                                began, had = running[k]
+                                rates.append((at - had) / max(time.monotonic() - began, 1e-6))
+                            cv.notify_all()
+                if at < wanted[k]:
+                    raise ConnectionError(f"connection closed after {at} of {wanted[k]} bytes of piece {k + 1}")
                 return 206, None
-            reached = [size(piece)]
+            last = [have[k]]
 
             def progressed():
-                now = size(piece)
-                moved, reached[0] = now > reached[0], now
+                moved, last[0] = have[k] > last[0], have[k]
                 return moved
-            # A piece that fails or finds the file changed starts no more; those under way finish, and are kept
-            # for the next sync.
-            if stopped.is_set():
-                return None
             try:
-                status = self._retry(url, attempt, progressed)[0]
+                return self._retry(url, attempt, progressed)[0]
             except SyncError as error:
-                status = error
-            if status != 206:
-                stopped.set()
-            return status
-        statuses = map_parallel(fetch, range(count), min(connections, count))
+                return error
+
+        def fetch_again(k):
+            nonlocal spent
+            with cv:
+                asked, at = ask(k), have[k]
+            began, mode, twice = at, "wb", None  # "wb": over one a sync killed outright left
+            try:
+                status, _, stream = self.opener(url, asked)
+                with closing(stream):
+                    while status == 206 and at < wanted[k] and (
+                            chunk := stream.read(min(PART_CHUNK, wanted[k] - at))):
+                        with cv:
+                            if complete[k] or over:
+                                return
+                            with seconds[k].open(mode) as out:
+                                out.write(chunk)
+                            at, mode = at + len(chunk), "ab"
+                            reached[k] = max(reached[k], at)
+                            if at == wanted[k]:
+                                # The piece's own file has got at least as far as this fetch began; what it got
+                                # since was fetched twice.
+                                twice = have[k] - began
+                                with seconds[k].open("rb") as source, pieces[k].open("ab") as out:
+                                    source.seek(have[k] - began)
+                                    shutil.copyfileobj(source, out, 1 << 20)
+                                have[k], complete[k] = at, True
+                            cv.notify_all()
+            except (OSError, http.client.HTTPException):
+                pass  # the piece's own fetch goes on
+            finally:
+                with cv:
+                    seconds[k].unlink(missing_ok=True)
+                    # A second fetch that lost or failed fetched its bytes for nothing.
+                    del again[k]
+                    spent += at - began if twice is None else twice
+                    cv.notify_all()
+
+        def slowest():
+            """The piece to fetch a second time, if one is going at under 1/HEDGE_SLOWER of the median finished
+            piece's speed, has run long enough to tell, and will take a while yet."""
+            if not rates:
+                return None
+            now, typical, chosen = time.monotonic(), statistics.median(rates), None
+            wait, reserved = max(HEDGE_LEAST, min(HEDGE_AFTER, PART_SIZE / typical)), spent + sum(again.values())
+            for k, (began, had) in running.items():
+                left, taken = wanted[k] - have[k], now - began
+                rate = (have[k] - had) / taken if taken > 0 else 0
+                if (complete[k] or k in again or taken < wait or reserved + left > PART_SIZE
+                        or rate * HEDGE_SLOWER >= typical):
+                    continue
+                needs = left / rate if rate else float("inf")
+                if needs >= wait and (chosen is None or needs > chosen[0]):
+                    chosen = (needs, k)
+            return chosen[1] if chosen else None
+
+        def work():
+            nonlocal stopped
+            while True:
+                with cv:
+                    task = None
+                    while task is None:
+                        if over or stopped or all(complete):
+                            return
+                        if waiting:
+                            k = waiting.pop(0)
+                            running[k] = (time.monotonic(), have[k])
+                            task = fetch
+                        elif (k := slowest()) is not None:
+                            again[k], task = wanted[k] - have[k], fetch_again
+                        else:
+                            cv.wait(HEDGE_CHECK)
+                try:
+                    result = task(k)
+                except Exception as error:  # noqa: BLE001 -- raised to the caller below
+                    result = error
+                    with cv:
+                        errors.append(error)
+                with cv:
+                    if task is fetch:
+                        del running[k]
+                        outcome[k] = result
+                    # A piece that fails or finds the file changed starts no more; those under way finish, and are
+                    # kept for the next sync.
+                    if isinstance(result, Exception) or task is fetch and result != 206:
+                        stopped = True
+                    cv.notify_all()
+
+        def settled():
+            return all(complete) or stopped and all(complete[k] for k in running)
+        workers = [threading.Thread(target=work, name=f"{target.name} {n + 1}", daemon=True)
+                   for n in range(min(connections, len(waiting)))]
+        try:
+            for worker in workers:
+                worker.start()
+            shown = None
+            while True:
+                # A timeout, so that Ctrl-C is not held up where waiting on a lock cannot be interrupted (Windows).
+                with cv:
+                    if not settled():
+                        cv.wait(HEDGE_CHECK)
+                    finished, now = settled(), sum(reached)
+                if progress and now != shown:
+                    progress(now, total)
+                    shown = now
+                if finished:
+                    break
+        finally:
+            # Fetches still under way, the loser of a piece fetched twice, or all of them on Ctrl-C: none writes
+            # after this. Their threads end with their connections.
+            with cv:
+                over = True
+                cv.notify_all()
+            for stale in seconds:
+                stale.unlink(missing_ok=True)
+        if errors:
+            raise errors[0]
+        statuses = [outcome.get(k) for k in range(count)]
         if 200 in statuses:
             for piece in pieces:
                 piece.unlink(missing_ok=True)
@@ -534,6 +671,10 @@ class LocalDb:
         return [n for (n,) in self._rows(OSV_DATASET[ecosystem], "SELECT DISTINCT name FROM affected "
                                          "WHERE name >= ? AND name < ? ORDER BY name",
                                          (prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1)))]
+
+    def osv_packages(self, ecosystem: str) -> list[str]:
+        """Names of every package OSV has advisories for, withdrawn ones included."""
+        return [n for (n,) in self._rows(OSV_DATASET[ecosystem], "SELECT DISTINCT name FROM affected ORDER BY name", ())]
 
     def maven_groups(self, artifact: str) -> list[str]:
         """The groupIds that publish an artifactId, as far as the hash index knows; none when it is not installed."""

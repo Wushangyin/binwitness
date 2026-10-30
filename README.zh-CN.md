@@ -90,9 +90,9 @@ binwitness scan INPUT... -o OUTDIR [options]
 
 | 交付物中的内容 | 识别方式 |
 |---|---|
-| 任何 `.jar`，以及同样打包的插件和库（`.hpi`、`.jpi`、`.aar`、`.nar`、`.kar`、资源适配器 `.rar`），无论在顶层还是嵌在 fat jar、war、ear、zip、tar、镜像里 | 按 SHA-1 依次查本地哈希索引（已安装时）、deps.dev、Maven Central 搜索。都查不到时，读 jar 自带的 `META-INF/maven/**/pom.properties`，先在 Maven Central、再在 `--maven-repo` 仓库中与该坐标下的发布件比对：发布的校验和一致判 `exact`，条目一致判 `content`。 |
+| 任何 `.jar`，以及同样打包的插件和库（`.hpi`、`.jpi`、`.aar`、`.nar`、`.kar`、资源适配器 `.rar`），无论在顶层还是嵌在 fat jar、war、ear、zip、tar、镜像里 | 按 SHA-1 查本地哈希索引（已安装时）；索引中没有的，依次查 deps.dev、Maven Central 搜索。都查不到时，读 jar 自带的 `META-INF/maven/**/pom.properties`，先在 Maven Central、再在 `--maven-repo` 仓库中与该坐标下的发布件比对：发布的校验和一致判 `exact`，条目一致判 `content`。 |
 | 含多份 `pom.properties`、且都与文件名不对应的 jar（改过名，又 shade 了其他库） | 逐个拿声明的构件与该 jar 逐条比对，manifest 中提到的优先；发布件条目全部对上的那个就是这个 jar（`content`），其余视为包含在其中 |
-| 同一交付物中已识别 jar 的改名或重新压缩副本 | 除 manifest、索引、签名和 Maven 构建元数据外，每个条目的 CRC-32 和大小都与已识别的 jar 相同：判 `content`，不发任何请求。副本的条目同时对上多个不同组件的（只改了版本号的几次发布），保持未识别，并在 `same_content_as` 中列出这些组件 |
+| 同一交付物中已识别 jar 的改名或重新压缩副本 | 除 manifest、索引、签名和 Maven 构建元数据外，每个条目的 CRC-32 和大小都与已识别的 jar 相同：判 `content`，不发任何请求。副本唯一的 `pom.properties` 与文件名对不上、又没能与发布件比对的（属于打进去的库，离线读取时），同样按此认定，除非那个已识别的 jar 正是它声明的构件的另一个版本。副本的条目同时对上多个不同组件的（只改了版本号的几次发布），保持未识别，并在 `same_content_as` 中列出这些组件 |
 | 以上都不满足的 jar（Gradle 构建、改名并重新压缩的），开启 `--class-search` 时 | 候选依次来自三处：取 jar 主包下的一个类到 Maven Central 搜索，并按 manifest 或文件名提示的版本缩小范围；文件名和 manifest 提示的构件名，配上该包名以及同族已识别 jar 的 groupId（`spring-core` 旁边的 `spring-jcl`）；开启 `--maven-repo` 时，再取中央仓搜索为该类列出的构件，按提示的版本查。只接受发布件条目与该 jar 对上的候选（`content`），提示本身从不直接采信。 |
 | shade 过的 jar | jar 里多出的 `pom.properties` 成为包含在该 jar 中的组件（`contained_in`）。jar 唯一的 `pom.properties` 在以下情况下也这样处理：jar 的名字没有提到它，并且该构件的发布条目大半缺失（guice 只带有 cglib 的），或 jar 自有的条目比该构件还多（把整个压缩库打进去的数据库驱动） |
 | `netty-all` 这类合集构件 | `META-INF/io.netty.versions.properties` 中的模块清单 |
@@ -105,7 +105,7 @@ binwitness scan INPUT... -o OUTDIR [options]
 
 目录输入会跟随其中的符号链接；指回已遍历目录的链接不会重复进入。大于 16 MB 的条目先写入临时文件再读取，不整个放进内存；解压后膨胀一百倍以上的条目视为解压炸弹跳过。所有被跳过的内容（失效的链接、读不了的压缩包、解压炸弹、压缩包内的链接）都会列在警告中。构建缓存会跳过，并列入 `skipped_build_caches`：带 `CACHEDIR.TAG` 标记的目录（Cargo 的 `target/`）、`.next/cache`、`node_modules/.cache`、`.angular/cache`、`.parcel-cache` 等。binwitness 不读取的生态的依赖文件（`requirements.txt`、`pyproject.toml`、`go.mod`、`Cargo.toml`、`Gemfile`、`composer.json` 等）会在警告和 `not_covered` 中点名，免得把不含这些依赖的结果当成没有问题。
 
-同一个文件有时以多个坐标发布：项目改过 groupId（`com.oracle.ojdbc` 与 `com.oracle.database.jdbc`）、别人重新发布的副本、某个 jar 没有变化的新版本。组件名优先取 jar 自带 `pom.properties` 中的坐标（如果在其中），否则取与文件名相符的那个。内容同时对上同一版本几个副本的 jar，取打包差异最少的那个命名：是原件，而不是 `org.lucee` 重新发布的 `commons-collections`。其余坐标随文件列出（`also_published_as`），登记在其中任何一个坐标下的漏洞公告都计入该组件，并注明公告针对的是哪个坐标。
+同一个文件有时以多个坐标发布：项目改过 groupId（`com.oracle.ojdbc` 与 `com.oracle.database.jdbc`）、别人重新发布的副本、某个 jar 没有变化的新版本。组件名按以下次序取第一个：jar 自带 `pom.properties` 中的坐标，与文件名相符的坐标，jar 内的包位于其 groupId 之下的坐标，哈希索引里版本更多的构件（即一直在发版的那条线；仅在装了索引时），最后按字母序。哈希索引每个文件只记一个坐标，记的常常是重新发布的副本（NetBeans 模块里的 commons-io、旧 `bouncycastle` groupId 下的 Bouncy Castle 1.38），原件的那个版本下就没有文件。这时由 jar 的 `pom.properties` 指出原件，除非它写的就是索引中的那个构件、只是版本不同（`7.4.1` 对 `7.4.1.jre8`，或快照版本）。没有的话，由文件名（`bcprov-jdk14-1.38.jar`）指出，条件是索引认识这个构件、其下没有该版本的文件，且该版本的编号方式与这个构件的已发布版本相同；发布这个构件的 groupId 有多个时，依次取 jar 内的包位于其下的、该版本前后都有发布版本的、索引所记的、发布版本更多的。内容同时对上同一版本几个副本的 jar，取打包差异最少的那个命名：是原件，而不是 `org.lucee` 重新发布的 `commons-collections`。其余坐标随文件列出（`also_published_as`），登记在其中任何一个坐标下的漏洞公告都计入该组件，并注明公告针对的是哪个坐标。
 
 ### 输出
 
@@ -138,6 +138,8 @@ binwitness scan INPUT... -o OUTDIR [options]
 
 从不拿包名去比产品名。没有这类历史的包不出候选，摘要把它计为未检查。只从一个 CVE 学到的关联标为「只依据一个 CVE」，是最弱的一种。
 
+迁到新坐标的构件是同一个库换了坐标继续发布，为其中一方学到的 CPE 对双方都成立。例如 `com.mysql:mysql-connector-j` 自己的 CVE 太少学不出 CPE，而它接替的 `mysql:mysql-connector-java` 有很多。迁移只写在旧坐标最后一版的 POM 里（`<distributionManagement><relocation>`），而那一版没有 jar。对于 OSV 有公告的某个包，若它与组件 artifactId 相同而 groupId 不同，或 artifactId 只差最后一个词写到多长（`-j`、`-java`），并且它有组件没有的 CPE，binwitness 就读这份 POM；反方向时读组件自己的。这样得到的组件对，落到方式是「为迁移坐标学到的关联」：`learned_for` 写关联是为哪个包学到的，`relocated_by` 写哪份 POM 声明了迁移。读不到的 POM 由摘要计数；离线扫描中，就是缓存里没有的那些。
+
 以下记录不列入：NVD 已驳回（Rejected）的；任何一个已安装的 OSV 数据集把该 CVE 归到某个包名下的（含已撤回的公告）；本次扫描已经报告的，不论用的是它自己的编号还是别名；CPE 属于其他语言运行时的（Maven 包上的 `target_sw` 为 `node.js` 之类）。NVD 标为有争议的记录保留并标出。NVD 只在与另一产品（平台）同时出现时才列出的 CPE，标为有条件。
 
 记录正文点名了什么，也会读出来。正文点名了该包所在项目的 Maven 模块时，无论用的是坐标（`groupId:artifactId`）还是带构建后缀的 artifactId（`bcpkix-fips`、`bcpkix-jdk18on`），候选都只落在这些模块上，扫描里是它的哪个构建都算：这些模块即使学不到 CPE 也会落到，项目的其他模块则不列入，除非其 jar 里有记录点名的类（合集 jar）。只点了构建名的，按 OSV 和手边 jar 所知的该模块 groupId 定位，装了哈希索引时也查它；定位不了的不予理会。包名以所点模块名开头的照样算（`bc-fips` 是 FIPS 版的 provider，对应 `bcprov`），拿不准时宁留不删。只点了不带构建后缀的 artifactId（如 `camel-http`）不据此剔除任何组件对：这类记录点的常常是漏洞的触发路径，缺陷本身在共享模块里。摘要给出因此不列入的组件对数。另有五项只做标记，不据此取舍：
@@ -148,11 +150,11 @@ binwitness scan INPUT... -o OUTDIR [options]
 - 厂商公告点名了别的模块：装了 `spring` 数据集时，Spring 自己对该 CVE 的公告点名了该项目的模块，却没有点这一个。公告点名的模块按名落到，如同记录点了它们；但不据此剔除任何组件对：厂商点的可能是功能的使用入口，而不是修复实际改动的共享模块（CVE-2025-41232 的修复只改了 `spring-security-core`，公告点的是 `spring-security-aspects`）。点名了模块且 OSV 也有归属的 Spring 公告中，有 23/137 条与 OSV 所列的包一个都不重合（2026 年 10 月）；
 - 修复改动的类都不在此 jar 中：装了 `fixes` 数据集时，读取记录所引用的、该项目自己仓库里的 GitHub 提交，取其修改、删除或改名的主代码类（按修复前的类名；NVD 给某些提交标了 Patch 时只取这些提交），而该 jar 一个都没有。主代码指 `src/main/java`，Tomcat 这类 Ant 构建则是 `java/`。NVD 尚未分析的记录，其 CNA 记录引用的提交，只在 OSV 已归属、且产品名相同的 CVE 所引用的仓库里才算；Apache Tomcat 的安全页为该 CVE 列出的提交也算。多版本 jar 的版本目录、重定位副本，以及按上一条可能属于该库的类，都算。修复新增的类单独列出、不拿来查，因为受影响的版本本来就没有它们。jar 里有其中一部分类的不标记：修复常常顺带改了各模块共用的类。类缺失也可能另有原因：它在较早的版本里叫别的名字，或者被引用为修复的提交并不就是修复本身。在下文那份交付物的候选中，656 个组件对里标出了 102 个，其中经复核的 73 个没有一个被判为成立或可能成立。三份交付物中 Apache Tomcat 的记录落到的 70 个组件对里，落在修复没改动的模块上的 39 个全部标出，其余的一个也没标。
 
-候选是供人工复核的线索。CPE 指的是产品，产品可能比组件宽：一个 CPE 可能代表一个框架的所有模块（如上面的 netty），也可能代表某厂商多种语言的驱动。候选不计入发现，不参与 `--fail-on`，也不写进 `sbom.cdx.json` 和 `vulnerabilities.csv`。它们写在 `binwitness.json`（`candidates`，每条关联的依据在 `candidate_links`）和 `candidates.csv` 中。`candidates.csv` 的「学到的关联」列形如 `3/6 / 3/4 / 3/6; versions meet on 3 of 3`：该包带此 CPE 的 CVE 数 / 带任意 CPE 的 CVE 数，该 CPE 已归属 CVE 中同一项目的数量 / 已归属 CVE 总数，按整个项目算的第一组数，以及学习所依据、两边都给出版本的 CVE 中有几个版本相交。下一列列出学到这条关联所依据的 CVE。后面几列给出该组件对是怎么来的（学到的关联、记录点名、厂商公告点名，或 [CNA 记录](#nvd-之前cna-的记录)的某种落法）、版本由谁判定，CNA 的名称、其记录写的产品名和发布日期，厂商公告点名的模块、修复改动的类（及其中该 jar 有的类、读取所依据的提交），以及上述各项标记。
+候选是供人工复核的线索。CPE 指的是产品，产品可能比组件宽：一个 CPE 可能代表一个框架的所有模块（如上面的 netty），也可能代表某厂商多种语言的驱动。候选不计入发现，不参与 `--fail-on`，也不写进 `sbom.cdx.json` 和 `vulnerabilities.csv`。它们写在 `binwitness.json`（`candidates`，每条关联的依据在 `candidate_links`）和 `candidates.csv` 中。`candidates.csv` 的「学到的关联」列形如 `3/6 / 3/4 / 3/6; versions meet on 3 of 3`：该包带此 CPE 的 CVE 数 / 带任意 CPE 的 CVE 数，该 CPE 已归属 CVE 中同一项目的数量 / 已归属 CVE 总数，按整个项目算的第一组数，以及学习所依据、两边都给出版本的 CVE 中有几个版本相交。下一列列出学到这条关联所依据的 CVE。后面几列给出该组件对是怎么来的（学到的关联、为迁移坐标学到的关联、记录点名、厂商公告点名，或 [CNA 记录](#nvd-之前cna-的记录)的某种落法）、版本由谁判定，CNA 的名称、其记录写的产品名和发布日期，厂商公告点名的模块、修复改动的类（及其中该 jar 有的类、读取所依据的提交），以及上述各项标记。
 
 新 CVE 也往往先出现在候选里。CVE 带着 CPE 发布后，常常要过几周甚至几个月才有公告指名到包。在一份约 1,100 个 jar 的交付物（2026 年 10 月下旬扫描）的候选中，复核判为对至少一个组件成立或可能成立的记录有 37 条，其中 30 条发布于 2026 年 6 月以后，36 条只有 GitHub 未审核的公告。CNA 的记录又带来 64 条 NVD 还没配 CPE 的记录，其中 47 条发布于 2026 年 10 月；经复核的 40 条中，32 条对至少一个组件成立或可能成立。
 
-不论哪种查询方式，候选都只来自本地副本：`nvd` 数据集和各生态的 OSV 数据集（`binwitness db sync nvd vulns`），装了时还有 `cvelist` 记录、`spring` 公告和 `fixes`。联网扫描的发现来自在线服务，候选仍来自这些副本。副本的日期写在摘要里，也写在 `candidates.csv` 的每一行。没有这些副本时，摘要写明候选未检查，从不说没有候选。NVD 尚在等待分析的记录还没有 CPE，摘要按状态给出其数量。
+不论哪种查询方式，候选都来自本地副本：`nvd` 数据集和各生态的 OSV 数据集（`binwitness db sync nvd vulns`），装了时还有 `cvelist` 记录、`spring` 公告和 `fixes`。只有判断迁移用的 POM 从 Maven 仓库读取，离线扫描时从缓存读。联网扫描的发现来自在线服务，候选仍来自这些副本。副本的日期写在摘要里，也写在 `candidates.csv` 的每一行。没有这些副本时，摘要写明候选未检查，从不说没有候选。NVD 尚在等待分析的记录还没有 CPE，摘要按状态给出其数量。
 
 ### NVD 之前：CNA 的记录
 
@@ -236,7 +238,7 @@ CVE 项目发布 cvelistV5 的方式是：每天午夜一份全部记录的快�
 
 Maven Central 限制单个地址能下载的索引量。所以同步最多每周检查一次新增部分，每应用完一份就保存进度。如果中央仓回复已达上限（HTTP 429），同步立即停止并告诉你何时再试：提前重试只会延长封禁。
 
-大文件（OSV 压缩包、cvelist 快照、哈希索引底库）在服务器支持按范围下载时，切成 8 MB 的块，用四个连接同时下载：单个连接常被压到远低于线路的速度，这样慢连接只拖住一块，拖不住整个文件。连接中断时从断点续传，中途放弃的同步在下次运行时接着做，期间文件变了的除外。同步失败时保留已安装的副本。同一目录同一时间只能运行一个 `db sync` 或 `db remove`，第二个会直接拒绝，而不是排在一个在慢速线路上可能要下一小时的下载后面等待。
+大文件（OSV 压缩包、cvelist 快照、哈希索引底库）在服务器支持按范围下载时，切成 8 MB 的块，用四个连接同时下载：单个连接常被压到远低于线路的速度，这样慢连接只拖住一块，拖不住整个文件。所有块都已开始下载后，空闲的连接会把速度不到常见速度一半的那块的剩余部分再下一遍，哪边先下完就用哪边；重复下载的字节合计不超过一块。连接中断时从断点续传，中途放弃的同步在下次运行时接着做，期间文件变了的除外。同步失败时保留已安装的副本。同一目录同一时间只能运行一个 `db sync` 或 `db remove`，第二个会直接拒绝，而不是排在一个在慢速线路上可能要下一小时的下载后面等待。
 
 `scan --lookup` 决定如何使用数据集：
 
@@ -248,7 +250,7 @@ Maven Central 限制单个地址能下载的索引量。所以同步最多每周
 
 数据集覆盖按哈希识别 jar、漏洞匹配和 KEV 标记。有些查询仍然需要联网，或需要之前联网扫描留下的缓存：哈希索引中没有的 jar 在中央仓公布的校验和、构件本身没写明的许可证、重新构建的 jar 与其发布件的逐条比对、`--class-search`，以及随项目拷入的 JavaScript 文件。`local` 模式下，既不在数据集中、也不在缓存中的内容会被略过，并在警告中计数；因此未能识别的 jar 会注明这一点，因为联网扫描可能认得出它。
 
-哈希索引每个文件只记一个坐标，deps.dev 会列出全部坐标；但 deps.dev 不收分类器 jar（`json-lib-2.4-jdk15.jar`），索引则收。jar 的 `pom.properties` 声明的坐标索引中没有，或索引给出的坐标与文件名对不上时，binwitness 还会查 deps.dev（或缓存）。对什么都没声明的 jar，两个来源仍可能给出同一文件的不同坐标，所以 `local` 与 `online` 两种扫描得出的组件名可能不同；`auto` 模式下先由索引回答，与 `local` 相同。
+装了哈希索引时，索引中有的 jar 只由 jar 本身和索引定名，不查 deps.dev，也不看缓存，所以 `local` 扫描不论缓存里有什么，同一个 jar 的组件名都相同，`auto` 与 `local` 定名一致。索引中没有的 jar 依次查 deps.dev（列出同一文件的全部坐标，但不收分类器 jar，如 `json-lib-2.4-jdk15.jar`）和 Maven Central 搜索。索引里只有重新发布的副本、jar 本身又没有指向原件的线索时，`local` 与 `online` 两种扫描得出的组件名仍可能不同。
 
 结果中记录了读过哪些本地数据集以及它们的时效（`data_sources.local`）；`online` 扫描的候选也取自本地数据集，同样记录。结论查自哪里看 `options.lookup`。数据集超过七天未同步会产生警告。
 

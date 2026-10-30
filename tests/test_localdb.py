@@ -7,6 +7,7 @@ import json
 import sqlite3
 import struct
 import tarfile
+import threading
 import time
 import urllib.parse
 from contextlib import closing
@@ -18,6 +19,7 @@ from binwitness import localdb, maven
 from binwitness.cli import main
 from binwitness.localdb import Fetcher, LocalDb, SyncError, expand
 from binwitness.net import Net
+from binwitness.output import render_summary
 from binwitness.scan import OFFLINE_UNKNOWN, Options, scan
 from binwitness.vulns import affects
 
@@ -359,6 +361,261 @@ def test_pieces_of_a_file_that_changed_are_not_joined(tmp_path, monkeypatch):
     Fetcher(opener=changing, sleep=lambda s: None).download("https://x/f", target, connections=2)
     assert target.read_bytes() == data
     assert (server.asked[0], server.asked[-1]) == ("bytes=0-0", None) and set(server.asked[1:-1]) <= set(PARTS)
+    assert [p.name for p in tmp_path.iterdir()] == ["file"]
+
+
+class Held:
+    """A connection that sends its body in steps: so many bytes, then nothing until the step's event is set (or
+    its function returns)."""
+
+    def __init__(self, body: bytes, *steps):
+        self.body, self.steps, self.at = body, list(steps), 0
+        self.closed = threading.Event()
+
+    def read(self, size=-1):
+        while self.steps and self.at >= self.steps[0][0]:
+            wait = self.steps.pop(0)[1]
+            wait.wait(10) if isinstance(wait, threading.Event) else wait()
+        end = min(self.steps[0][0] if self.steps else len(self.body), len(self.body),
+                  len(self.body) if size < 0 else self.at + size)
+        chunk, self.at = self.body[self.at:end], max(self.at, end)
+        return chunk
+
+    def close(self):
+        self.closed.set()
+
+
+def holding(server, held: dict):
+    """``server``, with the ranges ``held`` maps to steps answered by a Held connection."""
+    streams = {}
+
+    def open_(url, headers):
+        status, answer, stream = server(url, headers)
+        if headers.get("Range") in held:
+            streams[headers["Range"]] = Held(stream.read(), *held[headers["Range"]])
+            return status, answer, streams[headers["Range"]]
+        return status, answer, stream
+    return open_, streams
+
+
+@pytest.fixture
+def quick_seconds(monkeypatch):
+    """Pieces of 1280 bytes; a piece is fetched a second time once it has run 50 ms slower than the others (by
+    then a held connection has sent what it sends: one with nothing yet would be asked again from the start)."""
+    monkeypatch.setattr(localdb, "PART_SIZE", 1280)
+    monkeypatch.setattr(localdb, "HEDGE_LEAST", 0.05)
+    monkeypatch.setattr(localdb, "HEDGE_AFTER", 0.05)
+    monkeypatch.setattr(localdb, "HEDGE_CHECK", 0.01)
+
+
+def test_a_piece_held_up_at_the_end_is_fetched_again_and_taken_from_the_first_to_finish(tmp_path, quick_seconds):
+    data = bytes(range(256)) * 20
+    server = RangeServer(data)
+    release, moved = threading.Event(), threading.Event()
+    piece = tmp_path / "file.4-of-4"
+
+    def own_fetch_moves_on():
+        moved.set()
+        deadline = time.monotonic() + 10
+        while piece.stat().st_size < 400 and time.monotonic() < deadline:
+            time.sleep(0.005)
+    # Its own fetch sends 100 bytes; the second fetch begins from there, and the own one sends 300 more before
+    # the second sends anything.
+    open_, streams = holding(server, {PARTS[3]: [(100, moved), (400, release)],
+                                      "bytes=3940-5119": [(0, own_fetch_moves_on)]})
+    target = tmp_path / "file"
+    Fetcher(opener=open_, sleep=lambda s: None).download(
+        "https://x/f", target, sha256=f"sha256:{hashlib.sha256(data).hexdigest()}", connections=2)
+    assert target.read_bytes() == data
+    # The rest is asked once more, after every piece has been started.
+    assert sorted(server.asked[1:-1]) == PARTS and server.asked[-1] == "bytes=3940-5119"
+    # The fetch that lost goes on until its connection sends again, and then writes nothing.
+    release.set()
+    assert streams[PARTS[3]].closed.wait(5)
+    assert target.read_bytes() == data
+    assert [p.name for p in tmp_path.iterdir()] == ["file"]
+
+
+@pytest.mark.parametrize("held, sent, again, most", [
+    # Each rest is less than half a piece: both are fetched again at once.
+    ((2, 3), 700, 2, 2),
+    # Either rest is most of a piece: the one is fetched again only once the other's second fetch is over.
+    ((2, 3), 100, 2, 1),
+    # More connections are idle, and the rest is small: a piece is fetched a second time over one of them.
+    ((3,), 1000, 1, 1),
+])
+def test_pieces_are_fetched_again_at_once_as_far_as_their_rests_keep_within_a_piece(
+        tmp_path, quick_seconds, held, sent, again, most):
+    data = bytes(range(256)) * 20
+    server = RangeServer(data)
+    release, gate = threading.Event(), threading.Event()
+    open_, _ = holding(server, {PARTS[k]: [(sent, release)] for k in held})
+    seconds, open_at_once = [], [0]
+
+    def opener(url, headers):
+        status, answer, stream = open_(url, headers)
+        if headers["Range"] in ("bytes=0-0", *PARTS):
+            return status, answer, stream
+        # The first second fetch is held a while: one started meanwhile would be open with it.
+        if not seconds:
+            threading.Timer(0.3, gate.set).start()
+        seconds.append(Held(stream.read(), (0, gate)))
+        open_at_once[0] = max(open_at_once[0], sum(not s.closed.is_set() for s in seconds))
+        return status, answer, seconds[-1]
+    try:
+        Fetcher(opener=opener, sleep=lambda s: None).download("https://x/f", tmp_path / "file", connections=4)
+    finally:
+        release.set()
+    assert (tmp_path / "file").read_bytes() == data
+    # No own fetch got further meanwhile: nothing was fetched twice.
+    assert (len(seconds), open_at_once[0]) == (again, most)
+
+
+def test_bytes_a_second_fetch_got_before_it_failed_count_as_fetched_for_nothing(tmp_path, quick_seconds):
+    data = bytes(range(256)) * 20
+    server = RangeServer(data)
+    release = threading.Event()
+    open_, _ = holding(server, {PARTS[2]: [(100, release)], PARTS[3]: [(100, release)]})
+    seconds = []
+
+    def opener(url, headers):
+        status, answer, stream = open_(url, headers)
+        if headers["Range"] in ("bytes=0-0", *PARTS):
+            return status, answer, stream
+        # Closed after 200 bytes: 200 and either rest of 1180 make more than a piece.
+        seconds.append(Held(stream.read()[:200]))
+        return status, answer, seconds[-1]
+
+    def let_go_once_another_would_have_started():
+        deadline = time.monotonic() + 10
+        while not seconds and time.monotonic() < deadline:
+            time.sleep(0.005)
+        if seconds:
+            seconds[0].closed.wait(10)
+        # Another second fetch, were it allowed, would start within HEDGE_CHECK of the first one's end.
+        time.sleep(0.3)
+        release.set()
+    threading.Thread(target=let_go_once_another_would_have_started, daemon=True).start()
+    Fetcher(opener=opener, sleep=lambda s: None).download("https://x/f", tmp_path / "file", connections=4)
+    assert (tmp_path / "file").read_bytes() == data
+    assert len(seconds) == 1
+
+
+def test_a_piece_is_fetched_again_once_it_has_run_as_long_as_one_takes_at_the_others_speed(tmp_path, quick_seconds,
+                                                                                         monkeypatch):
+    monkeypatch.setattr(localdb, "HEDGE_AFTER", 30.0)
+    data = bytes(range(256)) * 20
+    server = RangeServer(data)
+    release = threading.Event()
+    open_, _ = holding(server, {PARTS[3]: [(100, release)]})
+    seconds = []
+
+    def opener(url, headers):
+        status, answer, stream = open_(url, headers)
+        if headers["Range"] not in ("bytes=0-0", *PARTS):
+            seconds.append(headers["Range"])
+        return status, answer, stream
+    # The other pieces took no time: the held one is fetched again after HEDGE_LEAST, long before this.
+    threading.Timer(2.0, release.set).start()
+    try:
+        Fetcher(opener=opener, sleep=lambda s: None).download("https://x/f", tmp_path / "file", connections=4)
+    finally:
+        release.set()
+    assert (tmp_path / "file").read_bytes() == data
+    assert seconds == ["bytes=3940-5119"]
+
+
+def test_second_fetches_fetch_no_more_than_a_piece_twice_in_all(tmp_path, quick_seconds):
+    data = bytes(range(256)) * 20
+    server = RangeServer(data)
+    release, moved = threading.Event(), {2: threading.Event(), 3: threading.Event()}
+    seconds = []
+
+    def opener(url, headers):
+        status, answer, stream = server(url, headers)
+        span = headers["Range"]
+        if span in PARTS[2:]:
+            return status, answer, Held(stream.read(), (100, moved[PARTS.index(span)]), (1000, release))
+        if span in ("bytes=0-0", *PARTS):
+            return status, answer, stream
+        k = int(span[len("bytes="):].split("-")[0]) // 1280
+
+        def own_fetch_gets_900_more():
+            moved[k].set()
+            deadline = time.monotonic() + 10
+            while (tmp_path / f"file.{k + 1}-of-4").stat().st_size < 1000 and time.monotonic() < deadline:
+                time.sleep(0.005)
+        seconds.append(Held(stream.read(), (0, own_fetch_gets_900_more)))
+        return status, answer, seconds[-1]
+
+    def let_go_once_another_would_have_started():
+        deadline = time.monotonic() + 10
+        while not seconds and time.monotonic() < deadline:
+            time.sleep(0.005)
+        if seconds:
+            seconds[0].closed.wait(10)
+        # A second fetch for the other piece, were it allowed, would start within HEDGE_CHECK of the first one's end.
+        time.sleep(0.3)
+        for event in (*moved.values(), release):
+            event.set()
+    threading.Thread(target=let_go_once_another_would_have_started, daemon=True).start()
+    Fetcher(opener=opener, sleep=lambda s: None).download("https://x/f", tmp_path / "file", connections=4)
+    assert (tmp_path / "file").read_bytes() == data
+    # 900 bytes of the first were fetched twice: the other's 1180 left would make more than a piece.
+    assert len(seconds) == 1
+
+
+def test_a_sync_stopped_during_a_second_fetch_resumes_the_piece_from_its_own_file(tmp_path, quick_seconds):
+    data = bytes(range(256)) * 20
+    server = RangeServer(data)
+    release = threading.Event()
+    open_, streams = holding(server, {PARTS[3]: [(100, release)], "bytes=3940-5119": [(300, release)]})
+    target = tmp_path / "file"
+
+    def interrupt(done, total):
+        # Ctrl-C once the second fetch has got further than the piece's own.
+        if done >= 3 * 1280 + 400:
+            raise KeyboardInterrupt
+    with pytest.raises(KeyboardInterrupt):
+        Fetcher(opener=open_, sleep=lambda s: None).download("https://x/f", target, progress=interrupt,
+                                                             connections=2)
+    # What the second fetch had is not kept, even while its connection is still open.
+    assert not (tmp_path / "file.4-of-4.second").exists()
+    release.set()
+    assert len(streams) == 2 and all(s.closed.wait(5) for s in streams.values())
+    # Neither wrote after the interrupt, and the second's bytes are not kept.
+    assert sorted(p.name for p in tmp_path.iterdir()) == [*(f"file.{k}-of-4" for k in range(1, 5)), "file.parts"]
+    assert (tmp_path / "file.4-of-4").read_bytes() == data[3840:3940]
+    server.asked.clear()
+    Fetcher(opener=server, sleep=lambda s: None).download(
+        "https://x/f", target, sha256=f"sha256:{hashlib.sha256(data).hexdigest()}", connections=2)
+    assert target.read_bytes() == data
+    assert server.asked == ["bytes=0-0", "bytes=3940-5119"]
+    assert [p.name for p in tmp_path.iterdir()] == ["file"]
+
+
+def test_a_second_fetch_left_by_a_sync_killed_outright_is_not_added_to(tmp_path, quick_seconds):
+    data = bytes(range(256)) * 20
+    server = RangeServer(data)
+    # As a sync killed outright leaves it: piece 4 begun, the others not, and a second fetch of piece 4 begun.
+    (tmp_path / "file.parts").write_text(json.dumps({"total": 5120, "etag": '"v1"', "piece": 1280}), "utf-8")
+    (tmp_path / "file.4-of-4").write_bytes(data[3840:3940])
+    (tmp_path / "file.4-of-4.second").write_bytes(b"x" * 300)
+    release = threading.Event()
+
+    def open_(url, headers):
+        status, answer, stream = server(url, headers)
+        # Piece 4's own fetch (the first to ask for the rest of it) sends nothing; its second fetch finishes it.
+        if headers["Range"] == "bytes=3940-5119" and server.asked.count("bytes=3940-5119") == 1:
+            return status, answer, Held(stream.read(), (0, release))
+        return status, answer, stream
+    try:
+        Fetcher(opener=open_, sleep=lambda s: None).download(
+            "https://x/f", tmp_path / "file", sha256=f"sha256:{hashlib.sha256(data).hexdigest()}", connections=2)
+    finally:
+        release.set()
+    assert (tmp_path / "file").read_bytes() == data
+    assert sorted(server.asked) == sorted(["bytes=0-0", *PARTS[:3], "bytes=3940-5119", "bytes=3940-5119"])
     assert [p.name for p in tmp_path.iterdir()] == ["file"]
 
 
@@ -717,6 +974,29 @@ def test_local_lookup_needs_no_network(tmp_path, bundle):
     codec = next(c for c in result["components"] if c["name"] == "io.netty:netty-codec-http")
     assert codec["upgrade"]["verdict"] == "unverified" and "offline" in codec["upgrade"]["reason"]
     assert result["summary"]["incomplete"]["upgrade_versions_not_checked"] == 2
+    # The index is installed: the jar it lacks is not blamed on a missing dataset.
+    assert not [w for w in result["warnings"] if "db sync maven-hashes" in w]
+    assert "db sync maven-hashes" not in render_summary(result)
+
+
+def test_an_offline_scan_without_the_hash_index_says_how_to_identify_jars_locally(tmp_path, bundle):
+    db = installed(tmp_path, [])
+    db.remove(["maven-hashes"])
+    db = LocalDb.open(tmp_path / "db")
+    net = Net(cache_dir=tmp_path / "cache", offline=True, transport=ScriptedTransport({"": never}))
+    result = scan([bundle], net, Options(first_party_groups=("com.acme",), scan_js=False), log=lambda m: None, db=db)
+    assert result["options"]["lookup"] == "local"
+    # The jars that declare their coordinates are named all the same; the one that declares none is not.
+    assert [u["filename"] for u in result["unidentified"]] == ["private.jar"]
+    assert ("1 jar not identified offline: the Maven Central hash index is not installed; `binwitness db sync "
+            "maven-hashes` installs it, and an offline scan then identifies the published ones") in result["warnings"]
+    assert "tip          1 jar not identified offline: the Maven Central hash index is not installed" \
+        in render_summary(result)
+    # Replaying an online scan's cache: the index would not be asked.
+    replay = scan([bundle], net, Options(first_party_groups=("com.acme",), scan_js=False, lookup="online"),
+                  log=lambda m: None)
+    assert replay["unidentified"] and not [w for w in replay["warnings"] if "db sync maven-hashes" in w]
+    assert "db sync maven-hashes" not in render_summary(replay)
 
 
 def test_auto_lookup_asks_online_only_for_what_the_index_lacks(tmp_path, bundle):
@@ -779,6 +1059,22 @@ def test_cli_db_status_tells_what_the_next_sync_will_do(tmp_path, capsys):
     assert "last synced more than 7 days ago: kev; run `binwitness db sync`" in out
 
 
+def test_an_offline_scan_counts_the_scripts_it_could_not_look_up(tmp_path):
+    db = installed(tmp_path, [])
+    delivery = tmp_path / "site.zip"
+    delivery.write_bytes(make_zip({"static/js/widget.js": b"(function(){var a=1;})();\n" * 50,
+                                   "static/js/other.js": b"(function(){var b=2;})();\n" * 50}))
+    transport = ScriptedTransport({"": never})
+    net = Net(cache_dir=tmp_path / "cache", offline=True, transport=transport)
+    result = scan([delivery], net, Options(), log=lambda m: None, db=db)
+    assert transport.calls == []
+    assert not [w for w in result["warnings"] if w.startswith("script lookup failed")]
+    assert result["summary"]["incomplete"]["scripts_not_looked_up"] == 2
+    assert sorted(result["unmatched_scripts"]) == ["site.zip!/static/js/other.js", "site.zip!/static/js/widget.js"]
+    offline = next(w for w in result["warnings"] if w.startswith("offline: "))
+    assert "data.jsdelivr.com 2" in offline
+
+
 def test_cli_offline_online_replays_the_cache_without_datasets(tmp_path):
     db = installed(tmp_path, [])
     jar = tmp_path / "x.jar"
@@ -803,16 +1099,23 @@ def test_default_dataset_dir_is_not_a_cache_shard(monkeypatch, tmp_path):
 # ---- one file, several coordinates ---------------------------------------------------------------------
 
 class OneCoordinateIndex:
-    """The local index as Trivy builds it: each file under a single coordinate."""
+    """The local index as Trivy builds it: each file under a single coordinate, so an artifact whose file was
+    republished unchanged has no file for that version."""
 
-    def __init__(self, entries):
-        self.entries = entries
+    def __init__(self, entries, versions=None):
+        self.entries, self.versions = entries, versions or {}
 
     def has(self, name):
         return name == "maven-hashes"
 
     def coordinates_for_sha1(self, sha1):
         return [self.entries[sha1]] if sha1 in self.entries else []
+
+    def maven_groups(self, artifact):
+        return sorted({group for group, other in self.versions if other == artifact})
+
+    def maven_versions(self, group, artifact):
+        return list(self.versions.get((group, artifact), []))
 
 
 def deps_dev_answer(*coordinates):
@@ -821,37 +1124,61 @@ def deps_dev_answer(*coordinates):
 
 
 REPUBLISHED = "81" * 20
-INDEX = OneCoordinateIndex({REPUBLISHED: ("org.netbeans.external", "org-apache-commons-io", "RELEASE113")})
+NETBEANS = ("org.netbeans.external", "org-apache-commons-io", "RELEASE113")
+COMMONS_IO = ("commons-io", "commons-io", "2.6")
+INDEX = OneCoordinateIndex({REPUBLISHED: NETBEANS}, {
+    NETBEANS[:2]: ["RELEASE90", "RELEASE113"], COMMONS_IO[:2]: ["2.5", "2.7"],
+    ("org.lucee", "commons-io"): ["2.4.0", "2.6.0", "2.8.0"]})
 
 
-def test_index_coordinate_that_does_not_name_the_file_defers_to_the_registry(tmp_path):
-    transport = ScriptedTransport({"api.deps.dev": deps_dev_answer(
-        ("commons-io", "commons-io", "2.6"), ("org.netbeans.external", "org-apache-commons-io", "RELEASE113"))})
-    net = Net(cache_dir=tmp_path / "cache", transport=transport, sleep=lambda s: None)
-    hit = maven.lookup_hash(net, REPUBLISHED, "commons-io-2.6.jar", INDEX)
-    assert (hit["coordinate"], hit["source"]) == (("commons-io", "commons-io", "2.6"), "deps.dev")
-    assert hit["alternatives"] == [("org.netbeans.external", "org-apache-commons-io", "RELEASE113")]
-    # A renamed file gets the coordinate a scan without the index would give it.
-    assert maven.lookup_hash(net, REPUBLISHED, "io.jar", INDEX)["coordinate"] == \
-        maven.lookup_hash(net, REPUBLISHED, "io.jar")["coordinate"]
-    # Offline, the cached answer decides the same way.
-    offline = Net(cache_dir=tmp_path / "cache", offline=True, transport=ScriptedTransport({"": never}))
-    assert maven.lookup_hash(offline, REPUBLISHED, "commons-io-2.6.jar", INDEX)["coordinate"] == (
-        "commons-io", "commons-io", "2.6")
+def quiet_net(tmp_path, offline=False):
+    return Net(cache_dir=tmp_path / "cache", offline=offline, transport=ScriptedTransport({"": never}),
+               sleep=lambda s: None)
 
 
-def test_index_coordinate_that_names_the_file_needs_no_request(tmp_path):
-    net = Net(cache_dir=tmp_path / "cache", transport=ScriptedTransport({"": never}), sleep=lambda s: None)
-    hit = maven.lookup_hash(net, REPUBLISHED, "org-apache-commons-io-RELEASE113.jar", INDEX)
-    assert (hit["coordinate"], hit["source"]) == (
-        ("org.netbeans.external", "org-apache-commons-io", "RELEASE113"), "Maven Central index, local copy")
+def test_a_republished_jar_takes_the_coordinates_it_declares_when_the_index_has_no_file_under_them(tmp_path):
+    net = quiet_net(tmp_path)
+    hit = maven.lookup_hash(net, REPUBLISHED, "commons-io-2.6.jar", INDEX, COMMONS_IO)
+    assert (hit["coordinate"], hit["named_by"], hit["alternatives"]) == (COMMONS_IO, "pom.properties", [NETBEANS])
+    # Renamed, it still declares them.
+    assert maven.lookup_hash(net, REPUBLISHED, "io.jar", INDEX, COMMONS_IO)["coordinate"] == COMMONS_IO
+    # A file for 2.6 under commons-io is another file than this one, which is then NetBeans' own.
+    taken = OneCoordinateIndex(INDEX.entries, {**INDEX.versions, COMMONS_IO[:2]: ["2.5", "2.6", "2.7"]})
+    hit = maven.lookup_hash(net, REPUBLISHED, "commons-io-2.6.jar", taken, COMMONS_IO)
+    assert (hit["coordinate"], "named_by" in hit) == (NETBEANS, False)
+    # Coordinates the index does not know at all are not taken on the jar's word.
+    unknown = OneCoordinateIndex(INDEX.entries, {NETBEANS[:2]: ["RELEASE113"]})
+    assert maven.lookup_hash(net, REPUBLISHED, "commons-io-2.6.jar", unknown, COMMONS_IO)["coordinate"] == NETBEANS
+    # Nor the version of the project's own release in its pom.properties, which lacks a variant suffix or
+    # names a snapshot.
+    own = ("com.example", "driver", "7.4.1.jre8")
+    index = OneCoordinateIndex({REPUBLISHED: own}, {own[:2]: ["7.4.0.jre8", "7.4.1.jre8", "7.4.1.jre11"]})
+    for version in ("7.4.1", "7.4.1-SNAPSHOT"):
+        hit = maven.lookup_hash(net, REPUBLISHED, "driver-7.4.1.jre8.jar", index, (*own[:2], version))
+        assert (hit["coordinate"], "named_by" in hit) == (own, False)
+    # Nor are those of a library the jar merely carries: they neither name the file nor the indexed artifact.
+    carried = ("org.example", "inner-lib", "1.0")
+    inside = OneCoordinateIndex(INDEX.entries, {**INDEX.versions, carried[:2]: ["0.9", "1.1"]})
+    assert maven.lookup_hash(net, REPUBLISHED, "bundle.jar", inside, carried)["coordinate"] == NETBEANS
+    assert net.offline_misses == 0
 
 
-def test_offline_without_the_registry_answer_keeps_the_index_coordinate(tmp_path):
-    net = Net(cache_dir=tmp_path / "cache", offline=True, transport=ScriptedTransport({"": never}))
-    hit = maven.lookup_hash(net, REPUBLISHED, "commons-io-2.6.jar", INDEX)
-    assert hit["coordinate"] == ("org.netbeans.external", "org-apache-commons-io", "RELEASE113")
-    assert net.offline_misses == 1
+def test_the_index_coordinate_that_names_the_file_needs_no_request(tmp_path):
+    hit = maven.lookup_hash(quiet_net(tmp_path), REPUBLISHED, "org-apache-commons-io-RELEASE113.jar", INDEX)
+    assert (hit["coordinate"], hit["source"]) == (NETBEANS, "Maven Central index, local copy")
+
+
+def test_a_cached_registry_answer_does_not_change_the_coordinates_a_local_scan_gives(tmp_path):
+    online = Net(cache_dir=tmp_path / "cache", sleep=lambda s: None, transport=ScriptedTransport(
+        {"api.deps.dev": deps_dev_answer(("org.lucee", "commons-io", "2.6.0"), COMMONS_IO, NETBEANS)}))
+    assert maven.lookup_hash(online, REPUBLISHED, "io.jar")["coordinate"] == COMMONS_IO
+    for cache in ("cache", "empty"):
+        offline = Net(cache_dir=tmp_path / cache, offline=True, transport=ScriptedTransport({"": never}))
+        for filename in ("commons-io-2.6.jar", "io.jar"):
+            assert maven.lookup_hash(offline, REPUBLISHED, filename, INDEX, COMMONS_IO)["coordinate"] == COMMONS_IO
+        assert maven.lookup_hash(offline, REPUBLISHED, "commons-io-2.6.jar", INDEX)["coordinate"] == COMMONS_IO
+        assert maven.lookup_hash(offline, REPUBLISHED, "io.jar", INDEX)["coordinate"] == NETBEANS
+        assert offline.offline_misses == 0
 
 
 def test_offline_finds_in_the_cache_what_the_index_lacks(tmp_path):
@@ -872,8 +1199,126 @@ def test_the_jar_s_own_coordinate_names_the_original_of_a_republished_file(tmp_p
     original = ("net.sf.json-lib", "json-lib", "2.4")
     assert maven.lookup_hash(net, shared, "json-lib-2.4-jdk15.jar", declared=original)["coordinate"] == original
     # The index filed it under the republisher, whose name fits the file just as well.
-    index = OneCoordinateIndex({shared: ("org.example.mirror", "json-lib", "2.4")})
-    assert maven.lookup_hash(net, shared, "json-lib-2.4-jdk15.jar", index, original)["coordinate"] == original
-    agreeing = OneCoordinateIndex({shared: original})
-    quiet = Net(cache_dir=tmp_path / "other", transport=ScriptedTransport({"": never}), sleep=lambda s: None)
+    index = OneCoordinateIndex({shared: ("org.example.mirror", "json-lib", "2.4")},
+                               {("org.example.mirror", "json-lib"): ["2.4"], original[:2]: ["2.3"]})
+    quiet = quiet_net(tmp_path / "other")
+    assert maven.lookup_hash(quiet, shared, "json-lib-2.4-jdk15.jar", index, original)["coordinate"] == original
+    agreeing = OneCoordinateIndex({shared: original}, {original[:2]: ["2.3", "2.4"]})
     assert maven.lookup_hash(quiet, shared, "json-lib-2.4-jdk15.jar", agreeing, original)["coordinate"] == original
+
+
+BOUNCY = "b1" * 20
+OLD_BOUNCY = ("bouncycastle", "bcprov-jdk14", "138")
+BOUNCY_LINES = {OLD_BOUNCY[:2]: ["124", "136", "138", "139", "140"],
+                ("org.bouncycastle", "bcprov-jdk14"): ["1.43", "1.44", "1.86"],
+                ("org.codehaus.xfire", "bcprov-jdk14"): ["133"]}
+
+
+def test_a_file_name_names_the_original_whose_version_the_index_has_no_file_for(tmp_path):
+    net = quiet_net(tmp_path, offline=True)
+    index = OneCoordinateIndex({BOUNCY: OLD_BOUNCY}, BOUNCY_LINES)
+    hit = maven.lookup_hash(net, BOUNCY, "bcprov-jdk14-1.38.jar", index, package=lambda: "org.bouncycastle.crypto")
+    assert (hit["coordinate"], hit["named_by"], hit["alternatives"]) == (
+        ("org.bouncycastle", "bcprov-jdk14", "1.38"), "file name", [OLD_BOUNCY])
+    # 1.38 is not a version of the 124-140 line, nor of the xfire one.
+    alone = OneCoordinateIndex({BOUNCY: OLD_BOUNCY}, {k: v for k, v in BOUNCY_LINES.items() if k[0] != "org.bouncycastle"})
+    assert maven.lookup_hash(net, BOUNCY, "bcprov-jdk14-1.38.jar", alone)["coordinate"] == OLD_BOUNCY
+    # The file's own name for the indexed coordinate settles it.
+    assert maven.lookup_hash(net, BOUNCY, "bcprov-jdk14-138.jar", index)["coordinate"] == OLD_BOUNCY
+    # A name unrelated to the indexed artifact proves nothing, even one the index knows without that version.
+    renamed = OneCoordinateIndex({BOUNCY: OLD_BOUNCY}, {**BOUNCY_LINES, ("org.example", "crypto"): ["1.37", "1.39"]})
+    assert maven.lookup_hash(net, BOUNCY, "crypto-1.38.jar", renamed)["coordinate"] == OLD_BOUNCY
+    # The longest artifactId the name can be read as comes first: log4j-1.2-api 2.17.1, not log4j 1.2-api-2.17.1.
+    bridge, repackaged = "c7" * 20, ("org.example.repack", "log4j-1.2-api", "r5")
+    lines = OneCoordinateIndex({bridge: repackaged}, {
+        repackaged[:2]: ["r4", "r5"], ("org.apache.logging.log4j", "log4j-1.2-api"): ["2.17.0", "2.17.2"],
+        ("log4j", "log4j"): ["1.1", "1.2.17"]})
+    assert maven.lookup_hash(net, bridge, "log4j-1.2-api-2.17.1.jar", lines)["coordinate"] == (
+        "org.apache.logging.log4j", "log4j-1.2-api", "2.17.1")
+    # A version the line has a file for is another file.
+    taken = OneCoordinateIndex({BOUNCY: OLD_BOUNCY}, {**BOUNCY_LINES, ("org.bouncycastle", "bcprov-jdk14"): ["1.38"]})
+    assert maven.lookup_hash(net, BOUNCY, "bcprov-jdk14-1.38.jar", taken)["coordinate"] == OLD_BOUNCY
+    assert net.offline_misses == 0
+
+
+def test_the_groupid_a_file_name_is_given_is_the_package_s_then_the_indexed_one_then_the_longest_line(tmp_path):
+    net = quiet_net(tmp_path, offline=True)
+    servlet, mirror = "d4" * 20, ("org.example.dependencies.servlet", "servlet-api-2.5", "2.0")
+    index = OneCoordinateIndex({servlet: mirror}, {
+        mirror[:2]: ["2.0"], ("javax.servlet", "servlet-api"): ["3.0-alpha-1"],
+        ("servletapi", "servlet-api"): ["2.2", "2.3", "2.4"], ("tomcat", "servlet-api"): ["5.5.12", "5.5.23"]})
+    assert maven.lookup_hash(net, servlet, "servlet-api-2.5.jar", index, package=lambda: "javax.servlet.http")[
+        "coordinate"] == ("javax.servlet", "servlet-api", "2.5")
+    assert maven.lookup_hash(net, servlet, "servlet-api-2.5.jar", index)["coordinate"] == (
+        "servletapi", "servlet-api", "2.5")
+    annotations, older = "e5" * 20, ("com.google.code.findbugs", "jsr305", "2.0.3")
+    index = OneCoordinateIndex({annotations: older}, {
+        older[:2]: ["1.3.9", "2.0.3", "3.0.1", "3.0.2"],
+        ("dev.example.jpms", "jsr305"): ["3.0.2-r1", "3.0.2-r2", "3.0.2-r4", "3.0.2-r5", "3.0.2-r6"]})
+    assert maven.lookup_hash(net, annotations, "jsr305-3.0.0.jar", index, package=lambda: "javax.annotation")[
+        "coordinate"] == ("com.google.code.findbugs", "jsr305", "3.0.0")
+    # With no line around the version, the indexed groupId, which publishes this very file, before a longer line.
+    last = OneCoordinateIndex(index.entries, {**index.versions, older[:2]: ["1.3.9", "2.0.3"]})
+    assert maven.lookup_hash(net, annotations, "jsr305-3.0.0.jar", last)["coordinate"] == (
+        "com.google.code.findbugs", "jsr305", "3.0.0")
+    # Before the indexed groupId: the line whose releases come before and after the version.
+    first = ("net.example.findbugs", "jsr305", "1.3.7")
+    index = OneCoordinateIndex({annotations: first}, {
+        first[:2]: ["1.3.2", "1.3.7"], older[:2]: ["1.3.9", "2.0.3", "3.0.1", "3.0.2"]})
+    assert maven.lookup_hash(net, annotations, "jsr305-2.0.2.jar", index)["coordinate"] == (
+        "com.google.code.findbugs", "jsr305", "2.0.2")
+    # Of groupIds neither the package nor the index points to, the one that published the artifact longest.
+    widget, carrier = "a8" * 20, ("org.example.bundle", "widget-2.5", "1")
+    index = OneCoordinateIndex({widget: carrier}, {
+        carrier[:2]: ["1"], ("aa", "widget"): ["1.0"], ("bb", "widget"): ["1.0", "2.0", "2.4"]})
+    assert maven.lookup_hash(net, widget, "widget-2.5.jar", index)["coordinate"] == ("bb", "widget", "2.5")
+    el, bundled = "f6" * 20, ("tomcat", "commons-el", "5.5.23")
+    index = OneCoordinateIndex({el: bundled}, {bundled[:2]: ["5.5.23"], ("commons-el", "commons-el"): []})
+    assert maven.lookup_hash(net, el, "commons-el-1.0.jar", index)["coordinate"] == ("commons-el", "commons-el", "1.0")
+
+
+class SeveralCoordinateIndex(OneCoordinateIndex):
+    """An index whose later additions file the same file under a second coordinate."""
+
+    def coordinates_for_sha1(self, sha1):
+        return list(self.entries.get(sha1, []))
+
+
+def test_of_indexed_coordinates_that_fit_alike_the_line_that_went_on_publishing_names_the_file(tmp_path):
+    shared, early, late = "b9" * 20, ("org.alpha", "lib", "1.0"), ("org.beta", "lib", "1.0")
+    for listed in ([early, late], [late, early]):
+        index = SeveralCoordinateIndex({shared: listed}, {early[:2]: ["1.0"], late[:2]: ["0.9", "1.0", "1.1", "2.0"]})
+        hit = maven.lookup_hash(quiet_net(tmp_path, offline=True), shared, "lib-1.0.jar", index)
+        assert (hit["coordinate"], hit["alternatives"]) == (late, [early])
+
+
+def test_without_the_index_the_same_listing_in_any_order_gives_the_same_coordinates(tmp_path):
+    listed = [NETBEANS, ("org.lucee", "commons-io", "2.6.0"), COMMONS_IO]
+    for order, expected in ((listed, COMMONS_IO), (listed[::-1], COMMONS_IO)):
+        net = Net(cache_dir=tmp_path / str(len(order)) / str(order[0]), sleep=lambda s: None,
+                  transport=ScriptedTransport({"api.deps.dev": deps_dev_answer(*order)}))
+        hit = maven.lookup_hash(net, REPUBLISHED, "io.jar")
+        assert (hit["coordinate"], hit["licenses"], sorted(hit["alternatives"])) == (
+            expected, ["Apache-2.0"], sorted(listed[:2]))
+    moved = [OLD_BOUNCY, ("org.bouncycastle", "bcprov-jdk14", "1.38")]
+    for order in (moved, moved[::-1]):
+        net = Net(cache_dir=tmp_path / "bc" / order[0][0], sleep=lambda s: None,
+                  transport=ScriptedTransport({"api.deps.dev": deps_dev_answer(*order)}))
+        assert maven.lookup_hash(net, BOUNCY, "bc.jar", package=lambda: "org.bouncycastle.crypto")[
+            "coordinate"] == moved[1]
+        assert maven.lookup_hash(net, BOUNCY, "bc.jar")["coordinate"] == OLD_BOUNCY
+
+
+def test_without_the_index_the_groupid_the_packages_are_in_then_the_alphabet_decide(tmp_path):
+    # A longer groupId is a moved project as often as a republication: Oracle's is the longer one.
+    oracle = [("com.oracle.ojdbc", "ojdbc8", "19.3.0.0"), ("com.oracle.database.jdbc", "ojdbc8", "19.3.0.0")]
+    # Sharing org.example with the package is not being its groupId.
+    bundled = [("org.example.bundles", "widget", "1.0"), ("org.example.widget", "widget", "1.0")]
+    cases = ((oracle, "ojdbc8-19.3.0.0.jar", "oracle.jdbc", oracle[1]),
+             (bundled, "widget-1.0.jar", "org.example.widget.core", bundled[1]),
+             (bundled, "widget-1.0.jar", "org.example.other", bundled[0]))
+    for number, (listed, filename, package, expected) in enumerate(cases):
+        for order in (listed, listed[::-1]):
+            net = Net(cache_dir=tmp_path / str(number) / order[0][0], sleep=lambda s: None,
+                      transport=ScriptedTransport({"api.deps.dev": deps_dev_answer(*order)}))
+            assert maven.lookup_hash(net, REPUBLISHED, filename, package=lambda: package)["coordinate"] == expected

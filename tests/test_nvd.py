@@ -17,7 +17,7 @@ from binwitness.cli import main
 from binwitness.crosscheck import crosscheck, load_other
 from binwitness.localdb import LocalDb
 from binwitness.mcp_server import Config, Refused, Service
-from binwitness.net import Net
+from binwitness.net import Net, NetError
 from binwitness.nvd import Match, matches, split_cpe
 from binwitness.output import render_summary, write_all
 from binwitness.scan import Options, scan
@@ -475,6 +475,99 @@ def test_candidates_are_the_unattributed_records_of_a_linked_cpe_that_cover_the_
     assert set(summary["data_as_of"]) == {"nvd", "osv-maven"}
 
 
+# org.example:lib moved to org.newhome:lib, which OSV has nothing on; org.older:solo, which OSV has nothing on
+# either, moved to org.lonely:solo. org.stranger:lib shares an artifactId and nothing else; org.unread:lib's POM
+# cannot be read.
+MOVES = {"org.example:lib": ("org.newhome:lib", "the POM of org.example:lib 1.2"),
+         "org.older:solo": ("org.lonely:solo", "the POM of org.older:solo 2.0")}
+MOVED_ITEMS = [item("org.newhome:lib"), item("org.older:solo"), item("org.stranger:lib"), item("org.unread:lib"),
+               item("org.example:lib")]
+
+
+def moves_asked(asked):
+    def moved_to(name):
+        asked.append(name)
+        if name == "org.unread:lib":
+            raise NetError("no answer")
+        return MOVES.get(name)
+    return moved_to
+
+
+def test_a_cpe_learned_for_an_artifact_stands_for_the_coordinates_it_is_relocated_to_or_from(world):
+    asked = []
+    table, links, summary = nvd.attach(world, MOVED_ITEMS, {}, {}, {"maven": "osv-maven"}, None,
+                                       moved_to=moves_asked(asked))
+    newhome, older = "pkg:maven/org.newhome/lib@1.0", "pkg:maven/org.older/solo@1.0"
+    assert sorted(c for c, record in table.items() if newhome in record["affects"]) == [
+        "CVE-2023-0001", "CVE-2025-0004", "CVE-2025-0007", "CVE-2025-0008"]
+    assert {k: table["CVE-2025-0004"]["affects"][newhome][k] for k in ("cpe", "basis", "learned_for", "relocated_by")} == {
+        "cpe": "example:lib", "basis": "relocated", "learned_for": "org.example:lib",
+        "relocated_by": "the POM of org.example:lib 1.2"}
+    assert table["CVE-2025-0004"]["affects"]["pkg:maven/org.example/lib@1.0"]["basis"] == "learned"
+    assert sorted(c for c, record in table.items() if older in record["affects"]) == ["CVE-2025-0302", "CVE-2025-0402"]
+    assert table["CVE-2025-0302"]["affects"][older]["relocated_by"] == "the POM of org.older:solo 2.0"
+    assert links[newhome]["example:lib"]["learned_for"] == "org.example:lib"
+    assert not any("pkg:maven/org.stranger/lib@1.0" in r["affects"] or "pkg:maven/org.unread/lib@1.0" in r["affects"]
+                   for r in table.values())
+    # Each POM is read once, whichever item asks, the others' before the items' own.
+    assert sorted(asked[:2]) == ["org.example:lib", "org.lonely:solo"]
+    assert sorted(asked[2:]) == ["org.older:solo", "org.stranger:lib", "org.unread:lib"]
+    assert summary["links_shared_by_relocation"] == [
+        {"component": newhome, "learned_for": "org.example:lib", "relocated_by": "the POM of org.example:lib 1.2"},
+        {"component": older, "learned_for": "org.lonely:solo", "relocated_by": "the POM of org.older:solo 2.0"}]
+    assert summary["relocations_not_read"] == 1
+    assert summary["components"] == {"with_link": 3, "without_link": 2, "not_checked": 0}
+    assert summary["pairs_by_basis"]["relocated"] == 6
+
+
+def test_the_poms_that_tell_a_relocation_are_read_at_once(world):
+    # Read one at a time, the first would wait out the barrier.
+    together = threading.Barrier(2, timeout=10)
+
+    def moved_to(name):
+        if name in ("org.example:lib", "org.lonely:solo"):
+            together.wait()
+        return MOVES.get(name)
+
+    summary = nvd.attach(world, [item("org.newhome:lib"), item("org.older:solo")], {}, {}, {"maven": "osv-maven"},
+                         None, moved_to=moved_to)[2]
+    assert len(summary["links_shared_by_relocation"]) == 2
+
+
+def test_an_artifact_is_relocated_from_one_whose_last_word_it_shortens(tmp_path, monkeypatch):
+    # acme-connector-j took over from acme-connector-java; acme-connector-net is another library, and so is acme,
+    # whose one word is no stem of acme-a's. acme-driver-j took over from acme-driver-java too, but an advisory
+    # names both, so each has the CPE already and no POM is read.
+    monkeypatch.setattr(nvd, "FIRST_YEAR", YEAR)
+    db = LocalDb(tmp_path / "db")
+    transport = ScriptedTransport({
+        "/Maven/all.zip": osv_zip(osv("GHSA-j1", "CVE-2024-0501", "org.acme:acme-connector-java"),
+                                  osv("GHSA-n1", "CVE-2024-0601", "org.acme:acme-connector-net"),
+                                  osv("GHSA-x1", "CVE-2024-0701", "org.acme:acme"),
+                                  osv("GHSA-d1", "CVE-2024-0801", "org.acme:acme-driver-java"),
+                                  osv("GHSA-d2", "CVE-2024-0801", "com.acme:acme-driver-j")),
+        **feed_routes(f"nvdcve-2.0-{YEAR}", record("CVE-2024-0501", cpe("acme", "connector", versionEndExcluding="0.5")),
+                      record("CVE-2024-0601", cpe("acme", "connector_net", versionEndExcluding="0.5")),
+                      record("CVE-2024-0701", cpe("acme", "acme", versionEndExcluding="0.5")),
+                      record("CVE-2024-0801", cpe("acme", "driver", versionEndExcluding="0.5")),
+                      record("CVE-2025-0502", cpe("acme", "connector", versionEndExcluding="9.0")),
+                      record("CVE-2025-0602", cpe("acme", "connector_net", versionEndExcluding="9.0")))})
+    db.sync(["osv-maven", "nvd"], fetcher=fetcher(transport), log=lambda m: None)
+    asked = []
+
+    def moved_to(name):
+        asked.append(name)
+        return {"org.acme:acme-connector-java": ("com.acme:acme-connector-j", "the POM of 8.0")}.get(name)
+
+    items = [item("com.acme:acme-connector-j", "8.1"), item("com.acme:acme-a", "8.1"), item("com.acme:acme-driver-j")]
+    table, _, summary = nvd.attach(LocalDb.open(tmp_path / "db"), items, {}, {}, {"maven": "osv-maven"}, None,
+                                   moved_to=moved_to)
+    assert list(table) == ["CVE-2025-0502"]
+    assert asked == ["org.acme:acme-connector-java"]
+    assert summary["components"]["with_link"] == 2  # acme-connector-j by the relocation, acme-driver-j by its own
+    assert summary["relocations_not_read"] == 0
+
+
 def test_no_candidates_without_the_datasets(world, tmp_path):
     table, links, summary = nvd.attach(world, [item("org.example:lib")], {}, {}, {}, None)
     assert table == {} and summary["checked"] is False
@@ -900,6 +993,10 @@ def test_a_fix_that_changed_classes_the_jar_lacks_flags_the_pair(fix_world):
         "candidates_by_classes_from": {"commits not tagged as the patch": 1, "patch-tagged commits": 1},
         "pairs_flagged_by_classes_from": {"commits not tagged as the patch": 2, "patch-tagged commits": 1}}
     assert summary["data_as_of"]["fixes"] == fix_world.data_as_of("nvd")
+    # Installed but not read, as no candidate cites a commit: not among the copies the candidates are as of.
+    _, _, none_cited = nvd.attach(LocalDb(fix_world.directory), [], {}, {}, {"maven": "osv-maven"}, None,
+                                  FIX_LISTINGS)
+    assert "nvd" in none_cited["data_as_of"] and "fixes" not in none_cited["data_as_of"]
 
     class Shaded(Listings):
         """web-core as a library shaded into a host: of the host's classes, the decoder is no one library's."""
@@ -1027,6 +1124,34 @@ def test_mcp_on_a_result_from_before_candidates(tmp_path, delivery, world):  # n
         service.get_candidate(scan_id, "CVE-2025-0004")
     assert "candidates" not in service.get_component(scan_id, "org.example:lib")["component"]
     assert render_summary(result).count("candidates") == 0
+
+
+def test_links_shared_by_relocation_reach_the_files_and_the_mcp_tools(tmp_path, delivery, world):  # noqa: F811
+    result = online_scan(tmp_path, delivery, world)
+    table, links, summary = nvd.attach(world, MOVED_ITEMS, {}, {}, {"maven": "osv-maven"}, None,
+                                       moved_to=moves_asked([]))
+    result["candidates"], result["candidate_links"], result["summary"]["candidates"] = table, links, summary
+    out = tmp_path / "out"
+    write_all(result, out)
+    rows = {(r["id"], r["component"]): r for r in csv.DictReader((out / "candidates.csv").open(encoding="utf-8-sig"))}
+    assert rows[("CVE-2025-0004", "pkg:maven/org.example/lib@1.0")]["reached by"] == "learned link"
+    assert rows[("CVE-2025-0004", "pkg:maven/org.newhome/lib@1.0")]["reached by"] == \
+        "link learned for org.example:lib, relocated by the POM of org.example:lib 1.2"
+    assert [r["reached by"] for (_, ref), r in rows.items() if ref == "pkg:maven/org.older/solo@1.0"] == [
+        "link learned for org.lonely:solo, relocated by the POM of org.older:solo 2.0"] * 2
+    assert "(reached by learned link 4, link learned for relocated coordinates 6)" in render_summary(result)
+    assert "; 1 POMs not read to tell whether an artifact was relocated" in render_summary(result)
+    service = Service(Config(results=tmp_path / "results", lookup="local"),
+                      net=Net(cache_dir=tmp_path / "c", offline=True, transport=ScriptedTransport({"": never})))
+    scan_id = service.open_result(str(out))["scan_id"]
+    state = service.overview(scan_id)["candidates"]
+    assert state["relocations_not_read"] == 1 and len(state["links_shared_by_relocation"]) == 2
+    detail = service.get_candidate(scan_id, "CVE-2025-0302")
+    assert [(a["basis"], a["relocated_by"]) for a in detail["affects"]] == [("relocated", "the POM of org.older:solo 2.0")]
+    # (The items attached are not among the scan's components, so the component goes unnamed.)
+    assert detail["links"][0]["meaning"].startswith(
+        "learned for org.lonely:solo, which the POM of org.older:solo 2.0 relocates to or from the package: "
+        "1 of the 1 CVEs OSV attributes to org.lonely:solo")
 
 
 def test_flags_reach_the_files_and_the_mcp_tools(tmp_path, delivery, world, family_world):  # noqa: F811

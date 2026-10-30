@@ -749,14 +749,17 @@ class Service:
         if not summary.get("checked"):
             return {"checked": False, "not_checked": summary.get("not_checked")}
         keep = ("total", "pairs", "by_severity", "disputed", "known_exploited", "only_from_single_cve_links",
-                "pairs_flagged", "pairs_reached_by_name", "pairs_left_out", "links_refused", "components",
+                "pairs_flagged", "pairs_reached_by_name", "pairs_left_out", "links_refused",
+                "links_shared_by_relocation", "relocations_not_read", "components",
                 "components_not_checked_because", "nvd_records_without_cpe", "data_as_of")
         return {"checked": True, **{k: summary.get(k) for k in keep}}
 
     @staticmethod
     def _link_meaning(component: dict, link: dict) -> str:
-        name = component.get("name", "the package")
-        return (f"{link['shared']} of the {link['package_cves']} CVEs OSV attributes to {name} that NVD gives a CPE "
+        name = link.get("learned_for") or component.get("name", "the package")
+        return (("" if "learned_for" not in link else f"learned for {name}, which {link['relocated_by']} relocates "
+                 f"to or from {component.get('name', 'the package')}: ")
+                + f"{link['shared']} of the {link['package_cves']} CVEs OSV attributes to {name} that NVD gives a CPE "
                 f"carry {link['cpe']}; of that CPE's CVEs OSV attributes to any package, {link['product_same_project']}"
                 f" of {link['product_attributed']} are of the same project or a subproject of it; "
                 f"{link['project_shared']} of the "

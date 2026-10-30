@@ -11,6 +11,7 @@ from binwitness import archive
 from binwitness.archive import Walker
 
 from helpers import make_image, make_jar, make_tar, make_zip
+from test_parsing import listed_twice
 
 
 def walk(tmp_path, name, data, **options):
@@ -26,6 +27,14 @@ def test_fat_jar_yields_itself_and_nested_libraries(tmp_path):
     _, items = walk(tmp_path, "app.jar", app)
     assert items == [("jar", "app.jar"), ("jar", "app.jar!/BOOT-INF/lib/lib-1.0.jar"),
                      ("js", "app.jar!/BOOT-INF/classes/static/app.js")]
+
+
+def test_a_library_listed_twice_over_the_same_data_is_walked_once(tmp_path):
+    app = listed_twice(make_zip({"BOOT-INF/lib/lib-1.0.jar": make_jar("org.example", "lib", "1.0")}),
+                       "BOOT-INF/lib/lib-1.0.jar")
+    walker, items = walk(tmp_path, "app.jar", app)
+    assert items == [("jar", "app.jar"), ("jar", "app.jar!/BOOT-INF/lib/lib-1.0.jar")]
+    assert walker.warnings == []
 
 
 def test_zip_in_zip_and_tar_in_zip(tmp_path):

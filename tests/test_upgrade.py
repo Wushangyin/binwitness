@@ -384,8 +384,10 @@ def relocation_scan(tmp_path, relocated_to):
                record("CVE-2026-0011", "org.example:connector", [{"introduced": "0"}]),
                record("GHSA-new1-0011", "org.moved:connector", [{"introduced": "0"}, {"fixed": "1.3"}])]
     records[2]["aliases"] = ["CVE-2026-0011"]
-    versions = {"org.example:connector": ["1.0", "1.1", "1.2"], "org.moved:connector": ["1.2", "1.3", "2.0"]}
-    transport = ScriptedTransport({"org/example/connector/1.2/connector-1.2.pom": pom(relocated_to)})
+    # The hash index has jars only: not 1.2, a POM that relocates the artifact. The repository lists it.
+    versions = {"org.example:connector": ["1.0", "1.1"], "org.moved:connector": ["1.2", "1.3", "2.0"]}
+    transport = ScriptedTransport({"org/example/connector/maven-metadata.xml": metadata("1.0", "1.1", "1.2"),
+                                   "org/example/connector/1.2/connector-1.2.pom": pom(relocated_to)})
     items = [item("org.example:connector", "1.0", ["CVE-2026-0010", "CVE-2026-0011"])]
     upgrades.attach(Net(cache_dir=tmp_path, transport=transport), Store(records, versions), items, table_for(items))
     return items[0]["upgrade"]
