@@ -353,6 +353,22 @@ class LocalDb:
                                          "JOIN records r ON r.id = a.id JOIN cves c ON c.id = a.id "
                                          f"WHERE {where} AND r.withdrawn = 0", parameters)}
 
+    def osv_names(self, ecosystem: str, prefix: str) -> list[str]:
+        """Names of the packages OSV has advisories for that begin with a prefix, withdrawn ones included."""
+        return [n for (n,) in self._rows(OSV_DATASET[ecosystem], "SELECT DISTINCT name FROM affected "
+                                         "WHERE name >= ? AND name < ? ORDER BY name",
+                                         (prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1)))]
+
+    def maven_groups(self, artifact: str) -> list[str]:
+        """The groupIds that publish an artifactId, as far as the hash index knows; none when it is not installed."""
+        if not self.has("maven-hashes"):
+            return []
+        rows = self._rows("maven-hashes", "SELECT group_id FROM artifacts WHERE artifact_id = ?", (artifact,))
+        if self._recent():
+            rows += self._rows("maven-hashes", "SELECT DISTINCT group_id FROM hashes WHERE artifact_id = ?",
+                               (artifact,), self._recent())
+        return sorted({g for (g,) in rows})
+
     def osv_attribution(self, cves) -> dict[str, set[tuple[str, str]]]:
         """CVE id -> the packages (ecosystem, name) any installed OSV dataset attributes it to, withdrawn
         advisories included: a withdrawal is a judgement on that package, not a lead for another."""

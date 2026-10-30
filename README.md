@@ -240,11 +240,17 @@ an alias, or when its CPE is for another language runtime (`target_sw` such as `
 package). Records NVD marks as disputed are kept and flagged. A CPE that NVD lists only together with
 another product (a platform) is marked as conditional.
 
-The record's text is read for what it names. When it names Maven modules (`groupId:artifactId`) of the
-package's project, the candidate is kept to them: it reaches those modules even where no CPE could be
-learned for them, and leaves out the project's other modules, except a jar that holds a class the record
-names (an all-in-one jar). The summary counts the pairs left out. Three more things are flagged, never
-acted on:
+The record's text is read for what it names. When it names Maven modules of the package's project, by
+coordinates (`groupId:artifactId`) or by an artifactId that carries a build (`bcpkix-fips`,
+`bcpkix-jdk18on`), the candidate is kept to those modules, in whichever build the scan has: it reaches
+them even where no CPE could be learned for them, and leaves out the project's other modules, except a
+jar that holds a class the record names (an all-in-one jar). A build named on its own is placed by the
+groupIds that OSV and the jars at hand know for its module, and the hash index when it is installed; one
+that cannot be placed is ignored. A module that the package's own name begins with still counts for it
+(`bc-fips`, the provider of the FIPS edition, for `bcprov`), so a near miss keeps a pair rather than
+drops it. An artifactId named without a build (`camel-http`) takes nothing out: such a record often names
+the path a flaw is reached through, while the flaw lives in a shared module. The summary counts the pairs
+left out. Three more things are flagged, never acted on:
 
 - same flaw as a finding: the record cites a CVE of one of the component's findings, or that finding's
   record cites the candidate (a copy of a flaw in another product gets a CVE of its own);

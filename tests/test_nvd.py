@@ -268,6 +268,25 @@ def test_naming_reads_the_modules_classes_languages_and_cves_a_record_names():
     assert facts.modules_of("maven", "org.example:") == set()
 
 
+def test_a_build_named_without_its_group_is_read_as_its_module():
+    assert [nvd.module_of(a) for a in ("acpkix-jdk18on", "acpkix-fips", "acprov-jdk15to18", "acprov-lts8on",
+                                       "acprov-ext-jdk15on", "acmail-jdk14", "web-core")] == \
+        ["acpkix", "acpkix", "acprov", "acprov", "acprov-ext", "acmail", "web-core"]
+    facts = nvd.Naming.of({"description": "Acme Crypto FIPS before acpkix-fips 1.0.12 (1.0.X series), like the "
+                                          "x-forwarded-for header and org.acme.crypto:acmail-jdk14, is affected."})
+    # A word without a build (x-forwarded-for) is not a module; a coordinate is one already.
+    assert facts.builds == ("acpkix-fips",) and facts.modules == ("org.acme.crypto:acmail-jdk14",)
+    groups = {"acpkix-fips": "org.acme.crypto"}.get
+    assert facts.modules_of("maven", "org.acme.crypto:", groups) == {"org.acme.crypto:acmail-jdk14",
+                                                                     "org.acme.crypto:acpkix-fips"}
+    assert facts.modules_of("maven", "org.acme.crypto:") == {"org.acme.crypto:acmail-jdk14"}
+    # A build of the package's module speaks for it, and so does a module its name begins with: the
+    # provider of a FIPS edition (ac-fips) is acprov's counterpart.
+    prov = "org.acme.crypto:acprov-jdk18on"
+    assert nvd.speaks_for({"org.acme.crypto:acprov-fips"}, prov) and nvd.speaks_for({"org.acme.crypto:ac-fips"}, prov)
+    assert not nvd.speaks_for({"org.acme.crypto:acpkix-fips"}, prov)
+
+
 @pytest.mark.parametrize("text, ecosystem, other", [
     ("The Go client leaks tokens.", "maven", True),
     ("The Go and Java clients leak tokens.", "maven", False),
@@ -441,6 +460,71 @@ def test_candidates_carry_what_their_records_name(family_world):
     assert summary["pairs_reached_by_name"] == 1 and summary["pairs_left_out"] == {"names_another_module": 2}
     assert summary["links_refused"] == {"version_ranges_apart": 3}
     assert "bundler:suite" not in links[core]
+
+
+# A library published in builds (acprov-jdk18on, acpkix-jdk15on) and in a FIPS edition whose modules OSV knows
+# (acpkix-fips, ac-fips), all under one CPE. Its records name the FIPS module the flaw is in.
+CRYPTO_OSV = [*[osv(f"GHSA-c{n}", f"CVE-2024-200{n}", "org.acme.crypto:acprov-jdk18on") for n in (1, 2, 3)],
+              osv("GHSA-c4", "CVE-2024-2004", "org.acme.crypto:acpkix-fips"),
+              osv("GHSA-c5", "CVE-2024-2005", "org.acme.crypto:ac-fips")]
+CRYPTO_NVD = [
+    *[record(f"CVE-2024-200{n}", cpe("acme", "crypto", versionEndExcluding="0.5")) for n in (1, 2, 3)],
+    *[record(ident, cpe("acme", "crypto", versionEndExcluding="2.0"),
+             description=f"{what} in Acme Crypto before 2.0. This also affects Acme Crypto FIPS before {module} 1.0.12.")
+      for ident, what, module in [("CVE-2025-2101", "CMS SignedData without signers verifies", "acpkix-fips"),
+                                  ("CVE-2025-2102", "A weak key is accepted", "ac-fips"),
+                                  ("CVE-2025-2103", "An S/MIME part is not bound", "acmail-fips"),
+                                  ("CVE-2025-2104", "OER decoding overflows", "acutil-fips"),
+                                  ("CVE-2025-2105", "AuthEnvelopedData skips the tag length", "acpkix-fips")]],
+]
+CRYPTO_ITEMS = [item("org.acme.crypto:acprov-jdk18on"), item("org.acme.crypto:acpkix-jdk15on"),
+                item("org.acme.crypto:acmail-jdk14")]
+CRYPTO_LISTINGS = Listings({
+    "org.acme.crypto:acprov-jdk18on": {"org/acme/crypto/asn1/cms/AuthEnvelopedData.class"},
+    "org.acme.crypto:acpkix-jdk15on": {"org/acme/crypto/cms/CMSSignedData.class"},
+})
+
+
+@pytest.fixture
+def crypto_world(tmp_path, monkeypatch):
+    monkeypatch.setattr(nvd, "FIRST_YEAR", YEAR)
+    db = LocalDb(tmp_path / "crypto")
+    transport = ScriptedTransport({"/Maven/all.zip": osv_zip(*CRYPTO_OSV),
+                                   **feed_routes(f"nvdcve-2.0-{YEAR}", *CRYPTO_NVD)})
+    db.sync(["osv-maven", "nvd"], fetcher=fetcher(transport), log=lambda m: None)
+    return LocalDb.open(tmp_path / "crypto")
+
+
+def test_a_record_naming_another_build_of_a_module_goes_to_that_module(crypto_world, monkeypatch):
+    assert nvd.Linker(crypto_world).modules("org.acme.crypto:") == {
+        "ac-fips": "org.acme.crypto", "acpkix-fips": "org.acme.crypto", "acprov-jdk18on": "org.acme.crypto"}
+    prov, pkix, mail = (i["purl"] for i in CRYPTO_ITEMS)
+
+    def attached():
+        table, _, summary = nvd.attach(crypto_world, CRYPTO_ITEMS, {}, {}, {"maven": "osv-maven"}, None,
+                                       CRYPTO_LISTINGS)
+        return {ident: {ref: a["basis"] for ref, a in c["affects"].items()} for ident, c in table.items()}, \
+            {ident: c["modules_named"] for ident, c in table.items()}, summary
+
+    affects, named, summary = attached()
+    # acpkix-fips is OSV's, acmail-fips is known as a build of the acmail jar at hand; their records leave the
+    # provider for the module's builds at hand, which no CPE was learned for. One whose named class the
+    # provider's jar holds stays on it. ac-fips is the provider's counterpart; acutil-fips is no module known.
+    assert affects == {"CVE-2025-2101": {pkix: "named"}, "CVE-2025-2102": {prov: "learned"},
+                       "CVE-2025-2103": {mail: "named"}, "CVE-2025-2104": {prov: "learned"},
+                       "CVE-2025-2105": {prov: "learned", pkix: "named"}}
+    assert named == {"CVE-2025-2101": ["org.acme.crypto:acpkix-fips"], "CVE-2025-2102": ["org.acme.crypto:ac-fips"],
+                     "CVE-2025-2103": ["org.acme.crypto:acmail-fips"], "CVE-2025-2104": [],
+                     "CVE-2025-2105": ["org.acme.crypto:acpkix-fips"]}
+    assert summary["pairs_left_out"] == {"names_another_module": 2} and summary["pairs_reached_by_name"] == 3
+
+    # The hash index of Maven Central knows the rest, of this family or of another.
+    index = {"acutil-fips": ["org.acme.crypto"]}
+    monkeypatch.setattr(crypto_world, "maven_groups", lambda artifact: index.get(artifact, []))
+    affects, named, summary = attached()
+    assert "CVE-2025-2104" not in affects and summary["pairs_left_out"] == {"names_another_module": 3}
+    index["acutil-fips"] = ["org.other.crypto"]
+    assert attached()[0]["CVE-2025-2104"] == {prov: "learned"}
 
 
 # ---- scans, files, MCP ------------------------------------------------------------------------------------

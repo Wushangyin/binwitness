@@ -54,8 +54,8 @@ CANDIDATE_JUDGING = [
     "(a platform), and the record applies only there.",
     "links show how each CPE was learned. single_cve means one CVE of the package carries it: a weak link. "
     "packages above 1 means the CPE stands for several packages, so the record may concern another of them. "
-    "basis named means the record names this module (groupId:artifactId), and the CPE was learned for others of "
-    "its project.",
+    "basis named means the record names this module (groupId:artifactId, or an artifactId with a build such as "
+    "-fips or -jdk18on, in any build), and the CPE was learned for others of its project.",
     "flags are facts for the reviewer, not verdicts: same_flaw_as lists findings of the component whose record "
     "refers to this CVE or the other way round (a copy of a flaw in another product gets its own CVE); "
     "other_language_only means the record names bindings for other languages and not the component's; "

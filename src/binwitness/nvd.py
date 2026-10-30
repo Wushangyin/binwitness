@@ -16,7 +16,7 @@ import io
 import json
 import re
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
 
 from binwitness.versions import compare
@@ -400,6 +400,7 @@ class Linker:
         self._products: dict[str, tuple[list[str], dict[str, set]]] = {}
         self._projects: dict[tuple[str, str], tuple[Counter, int]] = {}
         self._records: dict[str, dict | None] = {}
+        self._modules: dict[str, dict[str, str]] = {}
 
     def record(self, ident: str) -> dict | None:
         if ident not in self._records:
@@ -466,12 +467,24 @@ class Linker:
         names = sorted({n for c in ids for e, n in attributed.get(c, ()) if e == ecosystem})
         return sum(1 for n in names if cpe in self.links(ecosystem, n))
 
+    def modules(self, home: str) -> dict[str, str]:
+        """artifactId -> groupId of the Maven packages of a family (see :func:`family`) that OSV has advisories for."""
+        if home not in self._modules:
+            base = home[:-1]
+            names = self.db.osv_names("maven", base + ":") + self.db.osv_names("maven", base + ".")
+            self._modules[home] = {n.split(":", 1)[1]: n.split(":", 1)[0] for n in names
+                                   if ":" in n and family("maven", n) == home}
+        return self._modules[home]
+
 
 # ---- what a record's text names -------------------------------------------------------------------------
 
 _CVE = re.compile(r"\bCVE-\d{4}-\d{4,}\b")
 # groupId:artifactId, the way some CNAs name the one module of a project a record is about.
 _COORDINATE = re.compile(r"(?<![\w.:/-])([a-z][\w-]*(?:\.[\w-]+)+):([A-Za-z][\w.-]*[A-Za-z0-9])(?![\w:])")
+# A module is published in several builds, told apart by a suffix: bcpkix-jdk18on and bcpkix-fips are both bcpkix.
+_BUILD = re.compile(r"(?:-(?:fips|jdk\d+(?:on|to\d+)?|lts\d+on|jre\d+))+$")
+_ARTIFACT = re.compile(r"(?<![\w./:@-])([a-z][a-z0-9]*(?:[-_.][a-z0-9]+)+)(?![\w-])")
 _QUALIFIED_CLASS = re.compile(r"(?<![\w.$/])((?:[a-z_][a-z0-9_]*\.){2,}[A-Z][\w$]*)")
 _WORD = re.compile(r"(?<![\w.$])([A-Z][A-Za-z0-9]*[a-z][A-Za-z0-9]*)(?![\w$])")
 _HUMP = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+")
@@ -494,6 +507,19 @@ NEUTRAL_LANGUAGES = {"maven": {"JavaScript", "Node.js"}, "npm": set()}
 CLASS_WORD_HUMPS = 3
 
 
+def module_of(artifact: str) -> str:
+    """An artifactId without the build it names."""
+    return _BUILD.sub("", artifact) or artifact
+
+
+def speaks_for(named: set[str], name: str) -> bool:
+    """Whether a record that names these modules (``groupId:artifactId``) speaks for a package: one of them is
+    a build of it, or names a module the package's own name begins with (bc-fips, the provider of the FIPS
+    edition, for bcprov). A near miss keeps a module rather than leaving it out."""
+    own = module_of(name.split(":", 1)[-1])
+    return any(own.startswith(module_of(m.split(":", 1)[-1])) for m in named)
+
+
 def _humps(word: str) -> int:
     """Words a camel-case name is made of: IESEngine has two, UrlFilenameViewController four."""
     return sum(1 for part in _HUMP.findall(word) if not part.isdigit())
@@ -501,8 +527,10 @@ def _humps(word: str) -> int:
 
 @dataclass(frozen=True)
 class Naming:
-    """What a record's description names: Maven modules, languages, Java classes, other CVEs."""
+    """What a record's description names: Maven modules, languages, Java classes, other CVEs. ``builds`` are
+    artifactIds named with a build (bcpkix-fips) and no groupId: whose they are is up to the family at hand."""
     modules: tuple[str, ...]
+    builds: tuple[str, ...]
     languages: tuple[str, ...]
     classes: tuple[str, ...]
     cves: frozenset
@@ -513,6 +541,7 @@ class Naming:
         two-word name (CertificatePinner) count; without it only longer names do."""
         text = (record or {}).get("description") or ""
         modules = tuple(dict.fromkeys(f"{g}:{a}" for g, a in _COORDINATE.findall(text)))
+        builds = tuple(dict.fromkeys(a for a in _ARTIFACT.findall(text) if module_of(a) != a))
         languages = tuple(label for label, pattern in _LANGUAGE_PATTERNS.items() if pattern.search(text))
         qualified = list(dict.fromkeys(_QUALIFIED_CLASS.findall(text)))
         tails = {q.rsplit(".", 1)[1] for q in qualified}
@@ -520,14 +549,19 @@ class Naming:
         # jar at hand; WebFlux or GitHub could as well be a product or a concept.
         words = [w for w in dict.fromkeys(_WORD.findall(text)) if w not in tails and (
                  _humps(w) >= CLASS_WORD_HUMPS or _humps(w) == 2 and is_class is not None and is_class(w))]
-        return cls(modules, languages, tuple(qualified + words),
+        return cls(modules, builds, languages, tuple(qualified + words),
                    frozenset(_CVE.findall(text)) - {(record or {}).get("id")})
 
-    def modules_of(self, ecosystem: str, home: str) -> set[str]:
-        """The modules named that belong to a family: the record is about those, not the family's others."""
+    def modules_of(self, ecosystem: str, home: str, group_of=None) -> set[str]:
+        """The modules named that belong to a family: the record is about those, not the family's others.
+        ``group_of(artifact)``: the groupId of the family's module by that artifactId or another build of it, None
+        when the family has no such module; builds are read only with it."""
         if ecosystem != "maven":
             return set()
-        return {m for m in self.modules if family(ecosystem, m) == home}
+        named = {m for m in self.modules if family(ecosystem, m) == home}
+        if group_of:
+            named |= {f"{group}:{a}" for a in self.builds for group in [group_of(a)] if group}
+        return named
 
     def other_language_only(self, ecosystem: str) -> bool:
         named = set(self.languages) - NEUTRAL_LANGUAGES.get(ecosystem, set())
@@ -574,10 +608,18 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
     refused: set = set()
     packages: dict[tuple[str, str], int] = {}
     namings: dict[str, Naming] = {}
-    by_name: dict[tuple[str, str], list[dict]] = {}
+    # Every build of a module, by family: a record that names one reaches the others.
+    by_module: dict[tuple[str, str], list[dict]] = {}
+    at_hand: dict[str, dict[str, str]] = {}
     for item in items:
-        by_name.setdefault((item["ecosystem"], item["name"]), []).append(item)
+        if item["ecosystem"] == "maven" and ":" in item["name"]:
+            home = family("maven", item["name"])
+            group, artifact = item["name"].split(":", 1)
+            by_module.setdefault((home, module_of(artifact)), []).append(item)
+            at_hand.setdefault(home, {})[artifact] = group
     named_modules: set = set()
+    groups: dict[str, Callable[[str], str | None]] = {}
+    named_in: dict[tuple[str, str], set[str]] = {}
 
     held: dict[str, set | None] = {}
 
@@ -585,6 +627,21 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
         if ident not in namings:
             namings[ident] = Naming.of(linker.record(ident), listings.has_class if listings else None)
         return namings[ident]
+
+    def group_of(home: str):
+        """Finds the groupId of a family's module by artifactId, or by another build of it: among the packages OSV
+        has advisories for, the jars at hand and, when installed, the hash index of Maven Central."""
+        if home not in groups:
+            known = {**linker.modules(home), **at_hand.get(home, {})}
+            builds = {module_of(a): g for a, g in sorted(known.items())}
+            groups[home] = lambda a: known.get(a) or builds.get(module_of(a)) or next(
+                (g for g in db.maven_groups(a) if family("maven", f"{g}:{a}") == home), None)
+        return groups[home]
+
+    def modules_named(ident: str, ecosystem: str, home: str) -> set[str]:
+        if (ident, home) not in named_in:
+            named_in[(ident, home)] = naming(ident).modules_of(ecosystem, home, group_of(home))
+        return named_in[(ident, home)]
 
     def placed(ident: str, item: dict) -> tuple[list | None, list | None]:
         facts = naming(ident)
@@ -631,19 +688,20 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
                 hit = hit_of(ident, cpe, ecosystem, item["version"])
                 if hit is None:
                     continue
-                modules = naming(ident).modules_of(ecosystem, home)
+                modules = modules_named(ident, ecosystem, home)
                 if modules:
                     named_modules.add((ident, cpe, ecosystem, home))
                     # An all-in-one jar that holds the named module's classes stays.
-                    if item["name"] not in modules and not placed(ident, item)[0]:
+                    if not speaks_for(modules, item["name"]) and not placed(ident, item)[0]:
                         left_out["names_another_module"] += 1
                         continue
                 add(ident, item, cpe, hit, "learned", link.single)
-    # A record that names its module reaches that module even where no CPE could be learned for it (a module
-    # without CVEs of its own, or one inside an all-in-one jar), through the CPE learned for the others.
+    # A record that names its module reaches that module, in any build, even where no CPE could be learned for
+    # it (a module without CVEs of its own, or one inside an all-in-one jar), through the CPE learned for the
+    # others.
     for ident, cpe, ecosystem, home in sorted(named_modules):
-        for name in sorted(naming(ident).modules_of(ecosystem, home)):
-            for item in by_name.get((ecosystem, name), []):
+        for name in sorted(modules_named(ident, ecosystem, home)):
+            for item in by_module.get((home, module_of(name.split(":", 1)[1])), []):
                 if not item["version"] or item["purl"] in table.get(ident, {}).get("affects", {}) \
                         or ident in _own_ids(item, vulnerabilities):
                     continue
@@ -653,7 +711,8 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
     named = {item["purl"]: item for item in items}
     for ident, entry in table.items():
         facts = naming(ident)
-        entry["modules_named"], entry["languages_named"] = list(facts.modules), list(facts.languages)
+        modules = sorted({m for (i, _), found in named_in.items() if i == ident for m in found} - set(facts.modules))
+        entry["modules_named"], entry["languages_named"] = [*facts.modules, *modules], list(facts.languages)
         entry["classes_named"] = list(facts.classes)
         for ref, affected in entry["affects"].items():
             item = named[ref]

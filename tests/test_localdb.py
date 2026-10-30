@@ -430,6 +430,8 @@ def test_central_additions_extend_the_base(tmp_path):
     assert db.coordinates_for_sha1(native) == [("g", "late", "2")]
     assert db.coordinates_for_sha1(late) == [("g", "late", "2")]
     assert [db.coordinates_for_sha1(x * 40) for x in "96a"] == [[], [], []]
+    assert [db.maven_groups(a) for a in ("base", "early", "nothing")] == [["g"], ["g"], []]
+    assert LocalDb(tmp_path / "none").maven_groups("base") == []
     entry = db.state["maven-hashes"]
     assert (entry["chunk"], entry["chain"], entry["data_as_of"]) == (12, "7", iso(BASE + timedelta(days=4)))
     assert (entry["base_records"], entry["recent_records"], entry["records"]) == (3, 4, 7)
