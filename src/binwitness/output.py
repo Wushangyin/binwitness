@@ -224,9 +224,10 @@ CANDIDATE_COLUMNS = ["id", "severity", "cvss score", "cvss vector", "cvss source
                      "known exploited (CISA KEV)", "published", "component", "cpe", "affected versions (NVD)",
                      "only together with another product", "learned link (package / product / project)",
                      "link learned from", "link rests on one CVE", "packages linked with this cpe", "reached by",
+                     "modules the vendor's advisory names", "advisory names another module",
                      "same flaw as finding", "names only another language", "named classes in this jar",
                      "named classes not in this jar", "cwe", "description", "url", "data as of"]
-REACHED_BY = {"learned": "learned link", "named": "named in the record"}
+REACHED_BY = {"learned": "learned link", "named": "named in the record", "advisory": "named in the vendor's advisory"}
 
 
 def candidates_csv(result: dict, path: Path):
@@ -252,6 +253,8 @@ def candidates_csv(result: dict, path: Path):
                              ref, a["cpe"], a["versions"], "yes" if a["conditional"] else "", _link_text(link),
                              " ".join(link.get("learned_from") or []), "yes" if a["single_cve_link"] else "",
                              link.get("packages", ""), REACHED_BY.get(a.get("basis", "learned"), ""),
+                             " ".join(c.get("advisory_modules") or []),
+                             "yes" if a.get("advisory_names_another_module") else "",
                              " ".join(a.get("related_findings") or []), "yes" if a.get("other_language_only") else "",
                              _classes_text(a.get("classes_in_jar"), c), _classes_text(a.get("classes_not_in_jar"), c),
                              " ".join(c["cwe"]), c["description"], c["url"], dates])
@@ -366,7 +369,10 @@ def _candidate_lines(summary: dict | None) -> list[str]:
         lines.append(f"             {summary['pairs']} component pairs, flagged for review: " + _listing(
             [("same flaw as a finding", flagged["same_flaw_as_a_finding"]),
              ("record names only another language", flagged["other_language_only"]),
-             ("named classes not in the jar", flagged["named_classes_not_in_jar"])])
+             ("named classes not in the jar", flagged["named_classes_not_in_jar"]),
+             ("the vendor's advisory names another module", flagged.get("advisory_names_another_module", 0))])
+            + (f"; {summary['pairs_reached_by_advisory']} pairs reached through the vendor's advisory"
+               if summary.get("pairs_reached_by_advisory") else "")
             + (f"; {left_out} pairs left out: the record names another module" if left_out else "")
             + (f"; {refused} CPE links refused: NVD's versions never meet OSV's" if refused else ""))
     return lines

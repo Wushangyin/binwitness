@@ -404,7 +404,8 @@ def test_candidates_are_the_unattributed_records_of_a_linked_cpe_that_cover_the_
     lib = "pkg:maven/org.example/lib@1.0"
     assert table["CVE-2025-0004"]["affects"] == {lib: {
         "cpe": "example:lib", "versions": "< 2.0", "conditional": False, "basis": "learned", "single_cve_link": False,
-        "related_findings": [], "other_language_only": False, "classes_in_jar": [], "classes_not_in_jar": []}}
+        "related_findings": [], "other_language_only": False, "classes_in_jar": [], "classes_not_in_jar": [],
+        "advisory_names_another_module": False}}
     assert table["CVE-2025-0004"]["kev_date_added"] == "2025-07-01"
     assert table["CVE-2025-0007"]["affects"][lib]["conditional"] is True
     assert table["CVE-2025-0008"]["disputed"] is True and table["CVE-2025-0008"]["severity"] == "LOW"
@@ -456,7 +457,7 @@ def test_candidates_carry_what_their_records_name(family_world):
                        everything: (["UrlFileNameViewController", "CertPinner"], []), embed: (None, None)}
     assert summary["pairs"] == 14 and summary["components"]["with_link"] == 3
     assert summary["pairs_flagged"] == {"same_flaw_as_a_finding": 2, "other_language_only": 3,
-                                        "named_classes_not_in_jar": 1}
+                                        "named_classes_not_in_jar": 1, "advisory_names_another_module": 0}
     assert summary["pairs_reached_by_name"] == 1 and summary["pairs_left_out"] == {"names_another_module": 2}
     assert summary["links_refused"] == {"version_ranges_apart": 3}
     assert "bundler:suite" not in links[core]
@@ -525,6 +526,75 @@ def test_a_record_naming_another_build_of_a_module_goes_to_that_module(crypto_wo
     assert "CVE-2025-2104" not in affects and summary["pairs_left_out"] == {"names_another_module": 3}
     index["acutil-fips"] = ["org.other.crypto"]
     assert attached()[0]["CVE-2025-2104"] == {prov: "learned"}
+
+
+def spring_page(*advisories):
+    """As spring.io serves its security page's data: each advisory's affected modules are a JSON string."""
+    return {"componentChunkName": "component---security", "path": "/security", "result": {"data": {"cves": {"nodes": [
+        {"fields": {"slug": ident.lower(), "severity": "HIGH", "publishedAt": published, "project": "Acme Web",
+                    "projectSlug": "acme-web",
+                    "affected": None if modules is None else json.dumps({"artifacts": modules, "versions": []})}}
+        for ident, published, modules in advisories]}}}}
+
+
+SPRING_ROUTE = "/page-data/security/page-data.json"
+
+
+def test_vendor_advisories_sync_and_a_layout_not_known_is_refused(tmp_path):
+    db = LocalDb(tmp_path / "db")
+    page = spring_page(("CVE-2026-0001", "August 20, 2026", ["org.acme:a", "not a module"]),
+                       ("CVE-2026-0002", "July 1, 2026", None))
+    page["result"]["data"]["cves"]["nodes"].append({"fields": {"slug": "end-of-support-notice"}})
+    assert db.sync(["spring"], fetcher=fetcher(ScriptedTransport({SPRING_ROUTE: page})), log=lambda m: None) == {
+        "spring": "downloaded 2 advisories, 1 of them naming modules"}
+    assert [db.advisory_modules(c) for c in ("CVE-2026-0001", "CVE-2026-0002", "CVE-2026-0003")] == \
+        [["org.acme:a"], [], None]
+    assert db.state["spring"]["data_as_of"] == "2026-08-20"
+    assert db.sync(["spring"], fetcher=fetcher(ScriptedTransport({SPRING_ROUTE: page})), log=lambda m: None) == {
+        "spring": "up to date"}
+    # An advisory amended without a new date is taken up, also by a database already reading the old copy.
+    page["result"]["data"]["cves"]["nodes"][1]["fields"]["affected"] = json.dumps({"artifacts": ["org.acme:b"]})
+    assert db.sync(["spring"], fetcher=fetcher(ScriptedTransport({SPRING_ROUTE: page})), log=lambda m: None) == {
+        "spring": "downloaded 2 advisories, 2 of them naming modules"}
+    assert db.advisory_modules("CVE-2026-0002") == ["org.acme:b"]
+    # The page's data serves the site: laid out otherwise, it is refused, and the copy at hand stays.
+    moved = ScriptedTransport({SPRING_ROUTE: {"result": {"pageContext": {}}}})
+    assert db.sync(["spring"], fetcher=fetcher(moved), log=lambda m: None) == {
+        "spring": "failed: spring.io: the security page's data is not laid out as expected"}
+    empty = ScriptedTransport({SPRING_ROUTE: spring_page()})
+    assert db.sync(["spring"], fetcher=fetcher(empty), log=lambda m: None) == {
+        "spring": "failed: spring.io: the security page's data lists no advisories"}
+    assert LocalDb(tmp_path / "db").advisory_modules("CVE-2026-0001") == ["org.acme:a"]
+    assert LocalDb(tmp_path / "none").advisory_modules("CVE-2026-0001") is None
+
+
+def test_a_vendor_advisory_reaches_the_modules_it_names_and_flags_the_others(family_world):
+    page = spring_page(("CVE-2025-1305", "June 3, 2025", ["org.acme.web:web-socks"]),
+                       ("CVE-2025-1304", "May 1, 2025", ["org.acme.web:web-core"]),
+                       ("CVE-2025-1302", "May 1, 2025", ["org.other:thing"]), ("CVE-2025-1303", "April 30, 2025", []))
+    family_world.sync(["spring"], fetcher=fetcher(ScriptedTransport({SPRING_ROUTE: page})), log=lambda m: None)
+    table, _, summary = nvd.attach(family_world, FAMILY_ITEMS, FAMILY_FINDINGS, {}, {"maven": "osv-maven"}, None,
+                                   FAMILY_LISTINGS)
+    core, everything, embed, socks = (i["purl"] for i in FAMILY_ITEMS)
+
+    def pairs(ident):
+        return {ref: (a["basis"], a["advisory_names_another_module"]) for ref, a in table[ident]["affects"].items()}
+
+    # A vendor can name the module a feature is used through while the flaw is in a shared one, so nothing is
+    # left out for it: the modules it names are reached, the others flagged.
+    assert pairs("CVE-2025-1305") == {core: ("learned", True), everything: ("learned", True),
+                                      embed: ("learned", True), socks: ("advisory", False)}
+    assert pairs("CVE-2025-1304") == {core: ("learned", False), everything: ("learned", True),
+                                      embed: ("learned", True)}
+    # A module of another project, or none, says nothing of this one.
+    assert not any(a["advisory_names_another_module"] for ident in ("CVE-2025-1302", "CVE-2025-1303")
+                   for a in table[ident]["affects"].values())
+    assert table["CVE-2025-1305"]["advisory_modules"] == ["org.acme.web:web-socks"]
+    assert table["CVE-2025-1301"]["advisory_modules"] == []
+    assert summary["pairs"] == 15 and summary["pairs_reached_by_advisory"] == 1
+    assert summary["pairs_flagged"]["advisory_names_another_module"] == 5 and summary["pairs_left_out"] == {
+        "names_another_module": 2}
+    assert summary["data_as_of"]["spring"] == "2025-06-03"
 
 
 # ---- scans, files, MCP ------------------------------------------------------------------------------------
@@ -672,3 +742,30 @@ def test_flags_reach_the_files_and_the_mcp_tools(tmp_path, delivery, world, fami
     assert [(a["component"].split("/")[-1], a["flags"]) for a in detail["affects"]] == [
         ("web-embed@1.0", []), ("web-all@1.0", []), ("web-core@1.0", ["same_flaw_as_a_finding"])]
     assert detail["affects"][-1]["same_flaw_as"] == ["GHSA-f"] and len(detail["links"]) == 3
+
+
+def test_a_vendor_advisory_reaches_the_files_and_the_mcp_tools(tmp_path, delivery, world, family_world):  # noqa: F811
+    page = spring_page(("CVE-2025-1305", "June 3, 2025", ["org.acme.web:web-socks"]))
+    family_world.sync(["spring"], fetcher=fetcher(ScriptedTransport({SPRING_ROUTE: page})), log=lambda m: None)
+    result = online_scan(tmp_path, delivery, world)
+    table, links, summary = nvd.attach(family_world, FAMILY_ITEMS, FAMILY_FINDINGS, {}, {"maven": "osv-maven"}, None,
+                                       FAMILY_LISTINGS)
+    result["candidates"], result["candidate_links"], result["summary"]["candidates"] = table, links, summary
+    out = tmp_path / "out"
+    write_all(result, out)
+    rows = {(r["id"], r["component"].split("/")[-1]): r
+            for r in csv.DictReader((out / "candidates.csv").open(encoding="utf-8-sig"))}
+    socks, core = rows[("CVE-2025-1305", "web-socks@1.0")], rows[("CVE-2025-1305", "web-core@1.0")]
+    assert (socks["reached by"], socks["advisory names another module"]) == ("named in the vendor's advisory", "")
+    assert (core["reached by"], core["advisory names another module"]) == ("learned link", "yes")
+    assert core["modules the vendor's advisory names"] == "org.acme.web:web-socks"
+    assert "the vendor's advisory names another module 3; 1 pairs reached through the vendor's advisory; 2 pairs " \
+           "left out: the record names another module" in render_summary(result)
+    service = Service(Config(results=tmp_path / "results", lookup="local"),
+                      net=Net(cache_dir=tmp_path / "c", offline=True, transport=ScriptedTransport({"": never})))
+    detail = service.get_candidate(service.open_result(str(out))["scan_id"], "CVE-2025-1305")
+    assert [(a["component"].split("/")[-1], a["basis"], a["flags"]) for a in detail["affects"]] == [
+        ("web-socks@1.0", "advisory", []), ("web-embed@1.0", "learned", ["advisory_names_another_module"]),
+        ("web-all@1.0", "learned", ["advisory_names_another_module"]),
+        ("web-core@1.0", "learned", ["same_flaw_as_a_finding", "advisory_names_another_module"])]
+    assert detail["candidate"]["advisory_modules"] == ["org.acme.web:web-socks"]

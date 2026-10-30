@@ -140,17 +140,18 @@ binwitness scan INPUT... -o OUTDIR [options]
 
 以下记录不列入：NVD 已驳回（Rejected）的；任何一个已安装的 OSV 数据集把该 CVE 归到某个包名下的（含已撤回的公告）；本次扫描已经报告的，不论用的是它自己的编号还是别名；CPE 属于其他语言运行时的（Maven 包上的 `target_sw` 为 `node.js` 之类）。NVD 标为有争议的记录保留并标出。NVD 只在与另一产品（平台）同时出现时才列出的 CPE，标为有条件。
 
-记录正文点名了什么，也会读出来。正文点名了该包所在项目的 Maven 模块时，无论用的是坐标（`groupId:artifactId`）还是带构建后缀的 artifactId（`bcpkix-fips`、`bcpkix-jdk18on`），候选都只落在这些模块上，扫描里是它的哪个构建都算：这些模块即使学不到 CPE 也会落到，项目的其他模块则不列入，除非其 jar 里有记录点名的类（合集 jar）。只点了构建名的，按 OSV 和手边 jar 所知的该模块 groupId 定位，装了哈希索引时也查它；定位不了的不予理会。包名以所点模块名开头的照样算（`bc-fips` 是 FIPS 版的 provider，对应 `bcprov`），拿不准时宁留不删。只点了不带构建后缀的 artifactId（如 `camel-http`）不据此剔除任何组件对：这类记录点的常常是漏洞的触发路径，缺陷本身在共享模块里。摘要给出因此不列入的组件对数。另有三项只做标记，不据此取舍：
+记录正文点名了什么，也会读出来。正文点名了该包所在项目的 Maven 模块时，无论用的是坐标（`groupId:artifactId`）还是带构建后缀的 artifactId（`bcpkix-fips`、`bcpkix-jdk18on`），候选都只落在这些模块上，扫描里是它的哪个构建都算：这些模块即使学不到 CPE 也会落到，项目的其他模块则不列入，除非其 jar 里有记录点名的类（合集 jar）。只点了构建名的，按 OSV 和手边 jar 所知的该模块 groupId 定位，装了哈希索引时也查它；定位不了的不予理会。包名以所点模块名开头的照样算（`bc-fips` 是 FIPS 版的 provider，对应 `bcprov`），拿不准时宁留不删。只点了不带构建后缀的 artifactId（如 `camel-http`）不据此剔除任何组件对：这类记录点的常常是漏洞的触发路径，缺陷本身在共享模块里。摘要给出因此不列入的组件对数。另有四项只做标记，不据此取舍：
 
 - 与发现同一缺陷：记录引用了该组件某条发现的 CVE，或那条发现的记录引用了这条候选（同一缺陷复制到别的产品里会另编一个 CVE）；
 - 只点名其他语言：记录点名的是其他语言的绑定（Go 客户端、C 库），没有点名该包自己语言的；
-- 点名的类不在此 jar 中：记录点名了类（`org.example.Foo`，或由三个及以上单词组成的名字，如 `UrlFilenameViewController`），而该 jar 一个都没有。比对不分大小写，重定位（shade）后的副本也算。两个单词的名字只有在本次扫描的某个 jar 里确有同名类时才算类名，而且缺了也从不标记：`BigInteger` 是 JDK 的。类缺失也可能另有原因：记录点名的是别的库的类（反序列化漏洞里的 gadget），或者该类在比当前更晚的版本才加入，这时当前版本里也就没有这个缺陷。
+- 点名的类不在此 jar 中：记录点名了类（`org.example.Foo`，或由三个及以上单词组成的名字，如 `UrlFilenameViewController`），而该 jar 一个都没有。比对不分大小写，重定位（shade）后的副本也算。两个单词的名字只有在本次扫描的某个 jar 里确有同名类时才算类名，而且缺了也从不标记：`BigInteger` 是 JDK 的。类缺失也可能另有原因：记录点名的是别的库的类（反序列化漏洞里的 gadget），或者该类在比当前更晚的版本才加入，这时当前版本里也就没有这个缺陷；
+- 厂商公告点名了别的模块：装了 `spring` 数据集时，Spring 自己对该 CVE 的公告点名了该项目的模块，却没有点这一个。公告点名的模块按名落到，如同记录点了它们；但不据此剔除任何组件对：厂商点的可能是功能的使用入口，而不是修复实际改动的共享模块（CVE-2025-41232 的修复只改了 `spring-security-core`，公告点的是 `spring-security-aspects`）。点名了模块且 OSV 也有归属的 Spring 公告中，有 23/137 条与 OSV 所列的包一个都不重合（2026 年 10 月）。
 
-候选是供人工复核的线索。CPE 指的是产品，产品可能比组件宽：一个 CPE 可能代表一个框架的所有模块（如上面的 netty），也可能代表某厂商多种语言的驱动。候选不计入发现，不参与 `--fail-on`，也不写进 `sbom.cdx.json` 和 `vulnerabilities.csv`。它们写在 `binwitness.json`（`candidates`，每条关联的依据在 `candidate_links`）和 `candidates.csv` 中。`candidates.csv` 的「学到的关联」列形如 `3/6 / 3/4 / 3/6; versions meet on 3 of 3`：该包带此 CPE 的 CVE 数 / 带任意 CPE 的 CVE 数，该 CPE 已归属 CVE 中同一项目的数量 / 已归属 CVE 总数，按整个项目算的第一组数，以及学习所依据、两边都给出版本的 CVE 中有几个版本相交。下一列列出学到这条关联所依据的 CVE。后面几列给出该组件对是怎么来的（学到的关联，或记录点名）以及上述三项标记。
+候选是供人工复核的线索。CPE 指的是产品，产品可能比组件宽：一个 CPE 可能代表一个框架的所有模块（如上面的 netty），也可能代表某厂商多种语言的驱动。候选不计入发现，不参与 `--fail-on`，也不写进 `sbom.cdx.json` 和 `vulnerabilities.csv`。它们写在 `binwitness.json`（`candidates`，每条关联的依据在 `candidate_links`）和 `candidates.csv` 中。`candidates.csv` 的「学到的关联」列形如 `3/6 / 3/4 / 3/6; versions meet on 3 of 3`：该包带此 CPE 的 CVE 数 / 带任意 CPE 的 CVE 数，该 CPE 已归属 CVE 中同一项目的数量 / 已归属 CVE 总数，按整个项目算的第一组数，以及学习所依据、两边都给出版本的 CVE 中有几个版本相交。下一列列出学到这条关联所依据的 CVE。后面几列给出该组件对是怎么来的（学到的关联、记录点名或厂商公告点名）、厂商公告点名的模块，以及上述各项标记。
 
 新 CVE 也往往先出现在候选里。CVE 带着 CPE 发布后，常常要过几周甚至几个月才有公告指名到包。在一份约 1,100 个 jar 的交付物（2026 年 10 月下旬扫描）的候选中，复核判为对至少一个组件成立或可能成立的记录有 37 条，其中 30 条发布于 2026 年 6 月以后，36 条只有 GitHub 未审核的公告。
 
-不论哪种查询方式，候选都只来自本地副本：`nvd` 数据集和各生态的 OSV 数据集（`binwitness db sync nvd vulns`）。联网扫描的发现来自在线服务，候选仍来自这些副本。副本的日期写在摘要里，也写在 `candidates.csv` 的每一行。没有这些副本时，摘要写明候选未检查，从不说没有候选。NVD 尚在等待分析的记录还没有 CPE，摘要按状态给出其数量。
+不论哪种查询方式，候选都只来自本地副本：`nvd` 数据集和各生态的 OSV 数据集（`binwitness db sync nvd vulns`），装了时还有 `spring` 公告。联网扫描的发现来自在线服务，候选仍来自这些副本。副本的日期写在摘要里，也写在 `candidates.csv` 的每一行。没有这些副本时，摘要写明候选未检查，从不说没有候选。NVD 尚在等待分析的记录还没有 CPE，摘要按状态给出其数量。
 
 ### 升级建议
 
@@ -197,10 +198,11 @@ binwitness db remove osv-npm
 | `kev` | CISA 已知被利用漏洞目录 | 2 MB |
 | `maven-hashes` | Maven Central 上每个 jar 的 SHA-1（以 [Trivy java-db](https://github.com/aquasecurity/trivy-java-db) 打底，再加上中央仓自身索引的新增部分） | 下载 1 GB，占用 1.5 GB；之后每一两周 10-50 MB |
 | `nvd` | 指名了应用（CPE）的 NVD CVE 记录，用于[候选](#nvd-候选) | 下载 235 MB，占用 225 MB；之后每天 15 MB |
+| `spring` | Spring 各项目的安全公告（[spring.io](https://spring.io/security)），取每条点名的模块，用于[候选](#nvd-候选) | 下载 260 kB，占用 50 kB |
 
-分组：`vulns`（两个 OSV 数据集和 `kev`）、`java`（`osv-maven`、`kev`、`maven-hashes`）、`all`（以上全部再加 `nvd`）。数据集保存在 `~/.cache/binwitness/datasets`（可用 `--db-dir` 或 `$BINWITNESS_DB` 指定）。
+分组：`vulns`（两个 OSV 数据集和 `kev`）、`java`（`osv-maven`、`kev`、`maven-hashes`）、`all`（以上全部再加 `nvd` 和 `spring`）。数据集保存在 `~/.cache/binwitness/datasets`（可用 `--db-dir` 或 `$BINWITNESS_DB` 指定）。
 
-发布方允许的地方都做增量更新。OSV 维护一份按修改时间排列的记录清单，所以每次更新只取上次以来改动过的记录。改动超过 5,000 条，或距上次完整下载已满一个月时，改为重新下载整个压缩包，这样也会去掉上游已删除的记录。KEV 目录很小，每次整份获取。
+发布方允许的地方都做增量更新。OSV 维护一份按修改时间排列的记录清单，所以每次更新只取上次以来改动过的记录。改动超过 5,000 条，或距上次完整下载已满一个月时，改为重新下载整个压缩包，这样也会去掉上游已删除的记录。KEV 目录和 Spring 公告都很小，每次整份获取；spring.io 修订公告时不注明修订日期，所以按内容比对，有变化就整份替换。
 
 NVD 每年发布一份数据，另有一份最近八天改动过的记录。第一次同步读取每一年的数据；之后只要副本不超过七天，就只读改动记录，其摘要没变时连它也跳过。更旧的副本从各年的数据重新建。每份数据都用 NVD 在旁边公布的 SHA-256 校验。
 
@@ -224,7 +226,7 @@ Maven Central 限制单个地址能下载的索引量。所以同步最多每周
 
 结果中记录了哪些数据集参与回答以及它们的时效（`data_sources.local`）。数据集超过七天未同步会产生警告。
 
-每个数据集都由你的机器直接从发布方下载，并遵守发布方的条款：OSV 来自 Google 的公共存储桶（每条记录带有其来源数据库的许可证），哈希索引来自 Aqua Security 在 ghcr.io 上的 `trivy-java-db` 镜像和 Maven Central 的索引，KEV 目录来自 CISA，CVE 记录来自 NVD 的数据源。binwitness 使用 NVD 的数据，但未经 NVD 认可或认证。
+每个数据集都由你的机器直接从发布方下载，并遵守发布方的条款：OSV 来自 Google 的公共存储桶（每条记录带有其来源数据库的许可证），哈希索引来自 Aqua Security 在 ghcr.io 上的 `trivy-java-db` 镜像和 Maven Central 的索引，KEV 目录来自 CISA，CVE 记录来自 NVD 的数据源，Spring 公告来自 spring.io。binwitness 使用 NVD 的数据，但未经 NVD 认可或认证。
 
 ## 核对其他扫描工具的结果
 
@@ -330,6 +332,7 @@ binwitness 会向公共服务发送以下内容：
 | [ghcr.io](https://github.com/aquasecurity/trivy-java-db) | Maven Central 哈希索引的 `db sync` |
 | [Maven Central 索引](https://repo1.maven.org/maven2/.index/) | `db sync`：哈希索引的每周新增 |
 | [NVD 数据源](https://nvd.nist.gov/vuln/data-feeds) | `nvd` 数据集的 `db sync` |
+| [Spring 安全公告](https://spring.io/security) | `spring` 数据集的 `db sync` |
 | [GitHub 安全公告](https://github.com/advisories) | 仅 `crosscheck` |
 
 ## 局限

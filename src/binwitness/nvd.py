@@ -620,6 +620,7 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
     named_modules: set = set()
     groups: dict[str, Callable[[str], str | None]] = {}
     named_in: dict[tuple[str, str], set[str]] = {}
+    advisory_in: dict[tuple[str, str], set[str]] = {}
 
     held: dict[str, set | None] = {}
 
@@ -642,6 +643,15 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
         if (ident, home) not in named_in:
             named_in[(ident, home)] = naming(ident).modules_of(ecosystem, home, group_of(home))
         return named_in[(ident, home)]
+
+    def advisory_named(ident: str, ecosystem: str, home: str) -> set[str]:
+        """The family's modules that the vendor's own advisory names. A vendor may name the module a feature is
+        used through rather than the shared one the flaw is in: they reach those modules, and only flag the
+        others."""
+        if (ident, home) not in advisory_in:
+            modules = (db.advisory_modules(ident) or []) if ecosystem == "maven" else []
+            advisory_in[(ident, home)] = {m for m in modules if family("maven", m) == home}
+        return advisory_in[(ident, home)]
 
     def placed(ident: str, item: dict) -> tuple[list | None, list | None]:
         facts = naming(ident)
@@ -689,8 +699,9 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
                 if hit is None:
                     continue
                 modules = modules_named(ident, ecosystem, home)
-                if modules:
+                if modules or advisory_named(ident, ecosystem, home):
                     named_modules.add((ident, cpe, ecosystem, home))
+                if modules:
                     # An all-in-one jar that holds the named module's classes stays.
                     if not speaks_for(modules, item["name"]) and not placed(ident, item)[0]:
                         left_out["names_another_module"] += 1
@@ -698,24 +709,30 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
                 add(ident, item, cpe, hit, "learned", link.single)
     # A record that names its module reaches that module, in any build, even where no CPE could be learned for
     # it (a module without CVEs of its own, or one inside an all-in-one jar), through the CPE learned for the
-    # others.
+    # others; so does the vendor's advisory of it.
     for ident, cpe, ecosystem, home in sorted(named_modules):
-        for name in sorted(modules_named(ident, ecosystem, home)):
+        stated = modules_named(ident, ecosystem, home)
+        for name in sorted(stated | advisory_named(ident, ecosystem, home)):
             for item in by_module.get((home, module_of(name.split(":", 1)[1])), []):
                 if not item["version"] or item["purl"] in table.get(ident, {}).get("affects", {}) \
                         or ident in _own_ids(item, vulnerabilities):
                     continue
                 hit = hit_of(ident, cpe, ecosystem, item["version"])
                 if hit is not None:
-                    add(ident, item, cpe, hit, "named", False)
+                    add(ident, item, cpe, hit, "named" if name in stated else "advisory", False)
     named = {item["purl"]: item for item in items}
     for ident, entry in table.items():
         facts = naming(ident)
         modules = sorted({m for (i, _), found in named_in.items() if i == ident for m in found} - set(facts.modules))
         entry["modules_named"], entry["languages_named"] = [*facts.modules, *modules], list(facts.languages)
         entry["classes_named"] = list(facts.classes)
+        entry["advisory_modules"] = db.advisory_modules(ident) or []
         for ref, affected in entry["affects"].items():
             item = named[ref]
+            advised = {module_of(m.split(":", 1)[1])
+                       for m in advisory_named(ident, item["ecosystem"], family(item["ecosystem"], item["name"]))}
+            affected["advisory_names_another_module"] = bool(advised) and \
+                module_of(item["name"].split(":", 1)[-1]) not in advised
             affected["related_findings"] = _related(item, ident, facts, vulnerabilities, linker)
             affected["other_language_only"] = facts.other_language_only(item["ecosystem"])
             affected["classes_in_jar"], affected["classes_not_in_jar"] = placed(ident, item)
@@ -736,15 +753,17 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
             "same_flaw_as_a_finding": sum(1 for a in pairs if a["related_findings"]),
             "other_language_only": sum(1 for a in pairs if a["other_language_only"]),
             "named_classes_not_in_jar": sum(1 for a in pairs if a["classes_not_in_jar"] and not a["classes_in_jar"]),
+            "advisory_names_another_module": sum(1 for a in pairs if a["advisory_names_another_module"]),
         },
         "pairs_reached_by_name": sum(1 for a in pairs if a["basis"] == "named"),
+        "pairs_reached_by_advisory": sum(1 for a in pairs if a["basis"] == "advisory"),
         "pairs_left_out": dict(left_out),
         "links_refused": {"version_ranges_apart": len(refused)},
         "components": {"with_link": linked, "without_link": without, "not_checked": sum(not_checked.values())},
         "components_not_checked_because": dict(not_checked),
         "nvd_records_without_cpe": db.nvd_without_cpe(),
         # An online scan's findings are as of the scan; its candidates are as of these copies.
-        "data_as_of": {n: db.data_as_of(n) for n in ["nvd", *sorted(set(datasets.values()))] if db.has(n)},
+        "data_as_of": {n: db.data_as_of(n) for n in ["nvd", *sorted(set(datasets.values())), "spring"] if db.has(n)},
     }
     return table, links_of, summary
 

@@ -55,13 +55,16 @@ CANDIDATE_JUDGING = [
     "links show how each CPE was learned. single_cve means one CVE of the package carries it: a weak link. "
     "packages above 1 means the CPE stands for several packages, so the record may concern another of them. "
     "basis named means the record names this module (groupId:artifactId, or an artifactId with a build such as "
-    "-fips or -jdk18on, in any build), and the CPE was learned for others of its project.",
+    "-fips or -jdk18on, in any build), and the CPE was learned for others of its project. basis advisory means "
+    "the vendor's own advisory of the CVE names this module (advisory_modules lists the modules it names).",
     "flags are facts for the reviewer, not verdicts: same_flaw_as lists findings of the component whose record "
     "refers to this CVE or the other way round (a copy of a flaw in another product gets its own CVE); "
     "other_language_only means the record names bindings for other languages and not the component's; "
     "classes_in_jar and classes_not_in_jar compare the classes the record names with the component's jar (a "
     "deserialization record names other libraries' classes, and a class added in a later version is missing from "
-    "an earlier one).",
+    "an earlier one); advisory_names_another_module means the vendor's advisory names other modules of the "
+    "project and not this one. A vendor may name the module a feature is used through while the flaw is in a "
+    "shared module it depends on, so the pair is kept: check which module holds the code the fix changed.",
     "status is NVD's analysis state; disputed means the record says the CVE is disputed.",
     "Say which way you judged and why, that it is a first pass from the record's text, and that candidates are "
     "not counted in the findings.",
@@ -878,6 +881,8 @@ def _flags(affected: dict) -> list[str]:
         flags.append("other_language_only")
     if affected.get("classes_not_in_jar") and not affected.get("classes_in_jar"):
         flags.append("named_classes_not_in_jar")
+    if affected.get("advisory_names_another_module"):
+        flags.append("advisory_names_another_module")
     return flags
 
 

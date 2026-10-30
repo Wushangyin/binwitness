@@ -75,6 +75,11 @@ CENTRAL_CHECK_DAYS = 7
 CSV_CHUNK = 64 * 1024
 # NVD's modified feed holds the changes of the last eight days; a day is kept spare.
 NVD_MODIFIED_DAYS = 7
+# The data behind spring.io/security: every advisory of the Spring projects, in one file.
+SPRING_ADVISORIES = "https://spring.io/page-data/security/page-data.json"
+MONTHS = {month: number for number, month in enumerate(
+    ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November",
+     "December"], 1)}
 # Rows per SQL statement when looking up a list of ids: SQLite allows a few hundred parameters at most.
 ID_BATCH = 500
 
@@ -95,6 +100,8 @@ DATASETS = {
                             "1 GB download, then 10-50 MB every week or two", "maven-hashes.db"),
     "nvd": Dataset("NVD CVE records that name an application (CPE), for candidates",
                    "235 MB download, then 15 MB a day", "nvd.sqlite"),
+    "spring": Dataset("Spring security advisories (spring.io), for the modules each names, for candidates",
+                      "260 kB download, 50 kB on disk", "spring.json"),
 }
 GROUPS = {"vulns": ("osv-maven", "osv-npm", "kev"), "java": ("osv-maven", "kev", "maven-hashes"),
           "all": tuple(DATASETS)}
@@ -280,6 +287,7 @@ class LocalDb:
         self._lock = threading.Lock()
         self._connections: dict[str, sqlite3.Connection] = {}
         self._kev: dict[str, str] | None = None
+        self._advisories: dict[str, dict] | None = None
         self.used: set[str] = set()
         self.state = self._read_state()
 
@@ -424,6 +432,18 @@ class LocalDb:
             self.used.add("kev")
             return self._kev
 
+    def advisory_modules(self, cve: str) -> list[str] | None:
+        """The modules (``groupId:artifactId``) the vendor's own advisory of a CVE names; None when no installed
+        dataset has an advisory of it, an empty list when the advisory names none."""
+        if not self.has("spring"):
+            return None
+        with self._lock:
+            if self._advisories is None:
+                self._advisories = json.loads(self.path("spring").read_text("utf-8"))["advisories"]
+            self.used.add("spring")
+        entry = self._advisories.get(cve)
+        return list(entry["modules"]) if entry else None
+
     def provenance(self) -> dict:
         return {n: {"data_as_of": self.state[n].get("data_as_of"), "synced": self.state[n].get("synced")}
                 for n in sorted(self.used)}
@@ -490,6 +510,8 @@ class LocalDb:
                     entry, outcome = self._sync_kev(fetcher)
                 elif name == "nvd":
                     entry, outcome = self._sync_nvd(full, fetcher, log)
+                elif name == "spring":
+                    entry, outcome = self._sync_spring(fetcher)
                 else:
                     entry, outcome = self._sync_maven_hashes(full, hashes_every, fetcher, log)
             except (SyncError, OSError, ValueError, KeyError, sqlite3.Error, zipfile.BadZipFile,
@@ -687,6 +709,29 @@ class LocalDb:
         with self._lock:
             self._kev = None
         return entry, f"downloaded {count} entr{'y' if count == 1 else 'ies'}"
+
+    # ---- Spring ---------------------------------------------------------------------------------------
+
+    def _sync_spring(self, fetcher):
+        status, body = fetcher.read(SPRING_ADVISORIES)
+        if status != 200:
+            raise SyncError(f"{SPRING_ADVISORIES}: HTTP {status}")
+        advisories = spring_advisories(json.loads(body))
+        text = json.dumps({"advisories": advisories}, sort_keys=True)
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        entry = {"data_as_of": max((a["published"] for a in advisories.values()), default=""),
+                 "records": len(advisories), "digest": digest}
+        held = self.state.get("spring", {}) if self.has("spring") else {}
+        # spring.io amends advisories without dating the change, so the content tells whether anything changed.
+        if held.get("digest") == digest:
+            return entry, "up to date"
+        temporary = self.path("spring").with_name("spring.json.tmp")
+        temporary.write_text(text, "utf-8")
+        os.replace(temporary, self.path("spring"))
+        with self._lock:
+            self._advisories = None
+        named = sum(1 for a in advisories.values() if a["modules"])
+        return entry, f"downloaded {len(advisories)} advisories, {named} of them naming modules"
 
     # ---- NVD ------------------------------------------------------------------------------------------
 
@@ -1052,3 +1097,33 @@ def _drop(connection, record_id: str) -> int:
     connection.execute("DELETE FROM affected WHERE id = ?", (record_id,))
     connection.execute("DELETE FROM cves WHERE id = ?", (record_id,))
     return connection.execute("DELETE FROM records WHERE id = ?", (record_id,)).rowcount
+
+
+def spring_advisories(page: dict) -> dict[str, dict]:
+    """CVE id -> the modules, project and publication date of its advisory, from the data behind spring.io's
+    security page. That data serves the site, not clients: a layout this does not know is refused rather than
+    read as no advisories."""
+    try:
+        nodes = page["result"]["data"]["cves"]["nodes"]
+    except (KeyError, TypeError):
+        raise SyncError("spring.io: the security page's data is not laid out as expected") from None
+    out = {}
+    for node in nodes:
+        fields = (node or {}).get("fields") or {}
+        slug = (fields.get("slug") or "").upper()
+        if not slug.startswith("CVE-"):
+            continue
+        affected = fields.get("affected")
+        try:
+            affected = json.loads(affected) if isinstance(affected, str) and affected else affected or {}
+        except ValueError:
+            affected = {}
+        modules = [a for a in (affected.get("artifacts") or []) if isinstance(a, str) and a.count(":") == 1]
+        month, _, rest = (fields.get("publishedAt") or "").partition(" ")
+        day, _, year = rest.partition(", ")
+        published = f"{year}-{MONTHS[month]:02d}-{int(day):02d}" if month in MONTHS and day.isdigit() \
+            and year.isdigit() else ""
+        out[slug] = {"modules": modules, "project": fields.get("project") or "", "published": published}
+    if not out:
+        raise SyncError("spring.io: the security page's data lists no advisories")
+    return out
