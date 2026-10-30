@@ -17,6 +17,7 @@ day; a copy is brought up to date from the changes of the days it lacks, and dow
 """
 from __future__ import annotations
 
+import glob
 import gzip
 import hashlib
 import http.client
@@ -84,6 +85,11 @@ NVD_WORKERS = 4
 # GitHub serves a commit's diff to anyone, within limits per address: a few at a time, and stop when it refuses.
 FIX_WORKERS = 4
 FIX_BATCH = 40
+# One connection can be held far below what the line gives: the same file, an hour apart, at 140 kB/s and at 2.7 MB/s;
+# of four at once, three fetched their 4 MB in seconds and one in minutes. A large file is fetched in pieces of
+# PART_SIZE over so many connections at once, so that a slow one holds up a piece, not the file.
+DOWNLOAD_CONNECTIONS = 4
+PART_SIZE = 8 << 20
 FIX_FAILURES_TO_STOP = 8
 # cvelistV5 keeps each day's changes as a release for at least seven weeks (seen in October 2026); a copy further
 # behind is downloaded again.
@@ -112,6 +118,8 @@ MONTHS = {month: number for number, month in enumerate(
      "December"], 1)}
 # Rows per SQL statement when looking up a list of ids: SQLite allows a few hundred parameters at most.
 ID_BATCH = 500
+# Rows read at a time when going through all of a table: their texts are not all held at once.
+RECORD_PAGE = 1000
 
 
 @dataclass(frozen=True)
@@ -220,10 +228,16 @@ class Fetcher:
         return self._retry(url, attempt)
 
     def download(self, url: str, target: Path, headers: dict | Callable[[], dict] | None = None,
-                 sha256: str | None = None, progress: Callable[[int, int | None], None] | None = None):
+                 sha256: str | None = None, progress: Callable[[int, int | None], None] | None = None,
+                 connections: int = 1):
         """Stream ``url`` into ``target``. A connection that drops resumes where it stopped; ``If-Range``
         makes the server send the whole file instead if it changed in the meantime. ``headers`` may be a
-        function, called before every attempt, for credentials that expire during a long download."""
+        function, called before every attempt, for credentials that expire during a long download.
+        ``connections``: a file the server sends by ranges is fetched in pieces over so many at once."""
+        if connections > 1 and not target.exists() and self._download_parts(url, target, headers, progress,
+                                                                              connections):
+            self._check_digest(url, target, sha256)
+            return
         validator = {}
 
         def size():
@@ -267,6 +281,10 @@ class Fetcher:
         status, _ = self._retry(url, attempt, progressed)
         if status != 200:
             raise HttpStatusError(url, status)
+        self._check_digest(url, target, sha256)
+
+    @staticmethod
+    def _check_digest(url: str, target: Path, sha256: str | None):
         if sha256:
             algorithm, _, expected = sha256.partition(":")
             digest = hashlib.sha256()
@@ -276,6 +294,116 @@ class Fetcher:
             if digest.hexdigest() != expected:
                 target.unlink()
                 raise SyncError(f"{url}: downloaded file does not match its {algorithm} digest")
+
+    def _download_parts(self, url, target: Path, headers, progress, connections: int) -> bool:
+        """Fetch ``url`` in pieces over several connections, each piece resuming where it stopped, also in a
+        later sync; join them into ``target``. False, having fetched nothing, when the server does not send
+        ranges or the file is no larger than a piece; and when the file changed under pieces fetched before."""
+        def sent():
+            return dict((headers() if callable(headers) else headers) or {})
+
+        def probe():
+            status, answer, stream = self.opener(url, {**sent(), "Range": "bytes=0-0"})
+            with closing(stream):
+                _refuse_if_limited(url, status, answer)
+                if status != 206:
+                    return status, None
+                return status, (_total_size(answer, status, 0),
+                                _header(answer, "ETag") or _header(answer, "Last-Modified"))
+        status, found = self._retry(url, probe)
+        if status not in (200, 206, 416):
+            raise HttpStatusError(url, status)
+        if found is None or found[0] is None:
+            return False
+        total, etag = found
+        count = -(-total // PART_SIZE)
+        if count < 2:
+            return False
+        layout = {"total": total, "etag": etag, "piece": PART_SIZE}
+        plan = target.with_name(target.name + ".parts")
+        pieces = [target.with_name(f"{target.name}.{k + 1}-of-{count}") for k in range(count)]
+        try:
+            resumed = json.loads(plan.read_text("utf-8")) == layout
+        except (OSError, ValueError):
+            resumed = False
+        if not resumed:
+            for stale in target.parent.glob(f"{glob.escape(target.name)}.*-of-*"):
+                stale.unlink()
+            plan.write_text(json.dumps(layout), "utf-8")
+        bounds = [(k * PART_SIZE, min(total, (k + 1) * PART_SIZE) - 1) for k in range(count)]
+        lock = threading.Lock()
+        stopped = threading.Event()
+
+        def size(path):
+            return path.stat().st_size if path.exists() else 0
+        done = [size(piece) for piece in pieces]
+
+        def fetch(k):
+            start, end = bounds[k]
+            piece, wanted = pieces[k], end - start + 1
+
+            def attempt():
+                have = size(piece)
+                if have >= wanted:
+                    return 206, None
+                asked = {**sent(), "Range": f"bytes={start + have}-{end}"}
+                if etag:
+                    asked["If-Range"] = etag
+                status, answer, stream = self.opener(url, asked)
+                with closing(stream):
+                    _refuse_if_limited(url, status, answer)
+                    if status != 206:
+                        # 200: the whole file, as it is now; it changed since the other pieces were fetched.
+                        return status, None
+                    with piece.open("ab") as out:
+                        while have < wanted and (chunk := stream.read(min(1 << 20, wanted - have))):
+                            out.write(chunk)
+                            have += len(chunk)
+                            with lock:
+                                done[k] = have
+                                if progress:
+                                    progress(sum(done), total)
+                if have < wanted:
+                    raise ConnectionError(f"connection closed after {have} of {wanted} bytes of piece {k + 1}")
+                return 206, None
+            reached = [size(piece)]
+
+            def progressed():
+                now = size(piece)
+                moved, reached[0] = now > reached[0], now
+                return moved
+            # A piece that fails or finds the file changed starts no more; those under way finish, and are kept
+            # for the next sync.
+            if stopped.is_set():
+                return None
+            try:
+                status = self._retry(url, attempt, progressed)[0]
+            except SyncError as error:
+                status = error
+            if status != 206:
+                stopped.set()
+            return status
+        statuses = map_parallel(fetch, range(count), min(connections, count))
+        if 200 in statuses:
+            for piece in pieces:
+                piece.unlink(missing_ok=True)
+            plan.unlink(missing_ok=True)
+            return False
+        failed = next((s for s in statuses if s not in (206, None)), None)
+        if isinstance(failed, SyncError):
+            raise failed
+        if failed is not None:
+            raise HttpStatusError(url, failed)
+        joining = target.with_name(target.name + ".joining")
+        with joining.open("wb") as out:
+            for piece in pieces:
+                with piece.open("rb") as stream:
+                    shutil.copyfileobj(stream, out, 1 << 20)
+        os.replace(joining, target)
+        for piece in pieces:
+            piece.unlink()
+        plan.unlink()
+        return True
 
     def _retry(self, url, attempt, progressed: Callable[[], bool] = lambda: False):
         failures, last = 0, None
@@ -676,6 +804,14 @@ class LocalDb:
             self.state[name] = {**self.state.get(name, {}), **entry, "synced": _now()}
             self._write_state()
             outcomes[name] = outcome
+        # Which commits fixes reads follows the records of these: new ones may cite commits it has not read.
+        moved = [n for n in ("osv-maven", "nvd", "cvelist")
+                 if not outcomes.get(n, "up to date").startswith(("up to date", "failed"))]
+        if moved and "fixes" not in outcomes and self.has("fixes"):
+            unread = self._fixes_unread()
+            if unread:
+                outcomes["fixes"] = (f"not synced: {unread} commit{'' if unread == 1 else 's'} the records now cite "
+                                     "not read yet (sync fixes)")
         # A failed download stays, so that the next sync resumes it instead of starting over.
         if not any(o.startswith("failed") for o in outcomes.values()):
             shutil.rmtree(self.directory / ".download", ignore_errors=True)
@@ -749,7 +885,7 @@ class LocalDb:
         archive_path.unlink(missing_ok=True)
         url = f"{OSV_BUCKET}/{folder}/all.zip"
         log(f"{name}: downloading {url}")
-        fetcher.download(url, archive_path, progress=self._progress(log, name))
+        fetcher.download(url, archive_path, progress=self._progress(log, name), connections=DOWNLOAD_CONNECTIONS)
         building = self.path(name).with_name(self.path(name).name + ".building")
         building.unlink(missing_ok=True)
         newest, count = "", 0
@@ -936,7 +1072,8 @@ class LocalDb:
     def _cvelist_install(self, tag, day, fetcher, log):
         name = f"{day}_all_CVEs_at_midnight.zip.zip"
         target = self._scratch() / name
-        fetcher.download(f"{cna.CVELIST}/releases/download/{tag}/{name}", target, progress=self._progress(log, name))
+        fetcher.download(f"{cna.CVELIST}/releases/download/{tag}/{name}", target, progress=self._progress(log, name),
+                         connections=DOWNLOAD_CONNECTIONS)
         building = self.path("cvelist").with_name(self.path("cvelist").name + ".building")
         building.unlink(missing_ok=True)
         stored = 0
@@ -967,15 +1104,28 @@ class LocalDb:
                 f"{finished['links']} product names learned{_fetch_note(finished)}")
 
     def _cvelist_delta(self, connection, tag: str, name: str, fetcher) -> int:
-        """Apply one release's changed records; how many."""
+        """Apply one release's changed records; how many differ from those stored. An hourly release holds every
+        change of its day so far, and a day's end the hours already applied: most may be stored already."""
         target = self._scratch() / name
         fetcher.download(f"{cna.CVELIST}/releases/download/{tag}/{name}", target)
         changed = 0
         with zipfile.ZipFile(target) as archive:
             for info in archive.infolist():
-                if CVE_FILE.search(info.filename):
-                    changed += 1
-                    _cna_apply(connection, archive.read(info))
+                if not CVE_FILE.search(info.filename):
+                    continue
+                try:
+                    data = json.loads(archive.read(info))
+                except ValueError:
+                    continue
+                record = cna.trim(data) if isinstance(data, dict) else None
+                if record is None:
+                    continue
+                held = connection.execute("SELECT updated FROM records WHERE id = ?", (record["id"],)).fetchone()
+                if record["state"] == "PUBLISHED":
+                    changed += held is None or held[0] != record["updated"]
+                else:
+                    changed += held is not None
+                _cna_apply(connection, data)
         target.unlink()
         return changed
 
@@ -1093,8 +1243,10 @@ class LocalDb:
         pending = len(cited - commits.keys())
         entry = {"data_as_of": self.state["nvd"].get("data_as_of", ""), "records": len(records),
                  "commits": len(commits), "commits_not_read": pending}
+        # The CNAs' records cite commits too, of CVEs NVD has given no CPE yet: often the newest.
+        alone = "" if self.has("cvelist") else "; without cvelist, the commits the CNAs' records cite are not read"
         if not wanted:
-            return entry, f"up to date: {len(commits)} commits cited by {len(records)} records"
+            return entry, f"up to date: {len(commits)} commits cited by {len(records)} records{alone}"
         fetched = len(wanted) - pending
         outcome = f"fetched {fetched} commit{'' if fetched == 1 else 's'}; {len(commits)} of the {len(cited)} cited " \
                   f"by {len(records)} records held"
@@ -1102,7 +1254,18 @@ class LocalDb:
             outcome += (f"; {pending} not fetched ("
                         + ("GitHub stopped answering" if failures[0] >= FIX_FAILURES_TO_STOP else "downloads failed")
                         + "): sync fixes again later")
-        return entry, outcome
+        return entry, outcome + alone
+
+    def _fixes_unread(self) -> int:
+        """How many of the commits the records cite now the fixes dataset has not read."""
+        try:
+            stored = json.loads(self.path("fixes").read_text("utf-8"))
+            records = self._fix_records(stored.get("pages") or {})
+        except (OSError, ValueError, KeyError, sqlite3.Error):
+            return 0
+        held = stored.get("commits") or {}
+        cited = {key for entry in records.values() for key in entry["commits"]}
+        return sum(1 for key in cited if key not in held or fixes.stale(held[key]))
 
     def _read_fix(self, fetcher, key: str) -> dict | None:
         """A commit as ``fixes.read_diff`` reads it; ``{"unread": "not found"}`` when GitHub has no such commit,
@@ -1147,21 +1310,24 @@ class LocalDb:
         read; the others are kept apart, since a record may cite the fix of another product (one that bundles the
         library). A vendor's security page gives the commits of its own product: they count as the patch."""
         attributed = {c for (c,) in self._rows("osv-maven", "SELECT DISTINCT cve FROM cves", ())}
-        cpes_of: dict[str, set[str]] = {}
-        for ident, vendor, product in self._rows("nvd", "SELECT id, vendor, product FROM cpes", ()):
-            cpes_of.setdefault(ident, set()).add(f"{vendor}:{product}")
+        # Only the CPEs of attributed CVEs, and the records that carry one of them, are read: all of NVD's CPEs
+        # held at once took some 170 MB.
+        attributed_cpes = self.nvd_cpes(attributed)
         repositories: dict[str, set[str]] = {}
-        for ident in sorted(attributed & cpes_of.keys()):
+        for ident in sorted(attributed_cpes):
             record = self.nvd_record(ident) or {}
             cited = fixes.repositories_cited([*record.get("references", []),
                                               *(url for url, _ in record.get("fix_refs") or [])])
-            for cpe in cpes_of[ident]:
+            for cpe in attributed_cpes[ident]:
                 repositories.setdefault(cpe, set()).update(cited)
+        linked_cpes: dict[str, list[str]] = {}
+        for cpe in sorted(repositories):
+            for ident in self.nvd_ids(cpe):
+                if ident not in attributed:
+                    linked_cpes.setdefault(ident, []).append(cpe)
         out = {}
-        for ident, cpes in sorted(cpes_of.items()):
-            linked = [repositories[cpe] for cpe in sorted(cpes) if cpe in repositories]
-            if ident in attributed or not linked:
-                continue
+        for ident in sorted(linked_cpes):
+            linked = [repositories[cpe] for cpe in linked_cpes[ident]]
             record = self.nvd_record(ident) or {}
             # Records stored before 0.4.4 keep the first references only, and not the tags NVD gave them.
             refs = record.get("fix_refs")
@@ -1176,7 +1342,7 @@ class LocalDb:
                 entry["patch"] = [key for key in entry["commits"] if key in tagged]
             out[ident] = entry
         if self.has("cvelist"):
-            self._cna_fix_records(attributed, cpes_of, out)
+            self._cna_fix_records(attributed, out)
         for found in (pages or {}).values():
             for ident, keys in sorted(found.items()):
                 if ident in attributed:
@@ -1186,23 +1352,30 @@ class LocalDb:
                 entry["patch"] = list(dict.fromkeys([*(entry["patch"] or []), *keys]))
         return out
 
-    def _cna_fix_records(self, attributed: set[str], cpes_of: dict[str, set[str]], out: dict):
+    def _cna_fix_records(self, attributed: set[str], out: dict):
         """The commits the CNAs' records of CVEs NVD has given no CPE cite, in the repositories that the CVEs OSV
         attributes and whose records name the same product or package refer to."""
         repositories: dict[str, set[str]] = {}
         backlog: list[dict] = []
-        for (body,) in self._rows("cvelist", "SELECT body FROM records WHERE body IS NOT NULL", ()):
-            record = json.loads(zlib.decompress(body))
-            keys, packages, _ = cna.facets(record)
-            names = keys | {cna.module_key(p) for p, _ in packages}
-            if record["id"] in attributed:
-                cited = fixes.repositories_cited(record["references"]) | fixes.repositories_cited(
-                    (self.nvd_record(record["id"]) or {}).get("references", []))
-                for name in names:
-                    repositories.setdefault(name, set()).update(cited)
-            elif record["id"] not in cpes_of and record["id"] not in out and record["commits"] and names:
-                backlog.append({"id": record["id"], "names": names, "commits": record["commits"]})
+        last = 0
+        while rows := self._rows("cvelist", "SELECT rowid, body FROM records WHERE body IS NOT NULL AND rowid > ? "
+                                 "ORDER BY rowid LIMIT ?", (last, RECORD_PAGE)):
+            last = rows[-1][0]
+            for _, body in rows:
+                record = json.loads(zlib.decompress(body))
+                keys, packages, _ = cna.facets(record)
+                names = keys | {cna.module_key(p) for p, _ in packages}
+                if record["id"] in attributed:
+                    cited = fixes.repositories_cited(record["references"]) | fixes.repositories_cited(
+                        (self.nvd_record(record["id"]) or {}).get("references", []))
+                    for name in names:
+                        repositories.setdefault(name, set()).update(cited)
+                elif record["id"] not in out and record["commits"] and names:
+                    backlog.append({"id": record["id"], "names": names, "commits": record["commits"]})
+        with_cpe = self.nvd_cpes([record["id"] for record in backlog])
         for record in backlog:
+            if record["id"] in with_cpe:
+                continue
             known = set().union(*(repositories.get(n, set()) for n in record["names"]))
             if not known:
                 continue
@@ -1288,7 +1461,8 @@ class LocalDb:
         for attempt in (1, 2):
             meta = meta or self._nvd_meta(name, fetcher)
             if not (fetched and attempt == 1):
-                fetcher.download(f"{nvd.NVD_FEEDS}/{name}.json.gz", target, progress=self._progress(log, name))
+                fetcher.download(f"{nvd.NVD_FEEDS}/{name}.json.gz", target, progress=self._progress(log, name),
+                                 connections=DOWNLOAD_CONNECTIONS)
             loaded, digest = _nvd_load(connection, target, replace)
             if not meta.get("sha256") or digest.upper() == meta["sha256"].upper():
                 connection.commit()
@@ -1348,7 +1522,7 @@ class LocalDb:
                 stale.unlink()
         log(f"maven-hashes: downloading {layer['size'] / 2**20:.0f} MB from ghcr.io/{JAVA_DB}")
         fetcher.download(f"{GHCR}/v2/{JAVA_DB}/blobs/{layer['digest']}", archive_path, auth, sha256=layer["digest"],
-                         progress=self._progress(log, "maven-hashes"))
+                         progress=self._progress(log, "maven-hashes"), connections=DOWNLOAD_CONNECTIONS)
         building = self.path("maven-hashes").with_name(DATASETS["maven-hashes"].file + ".building")
         with tarfile.open(archive_path, "r:gz") as archive:
             member = next((m for m in archive if m.isfile() and posixpath.basename(m.name) == "trivy-java.db"), None)

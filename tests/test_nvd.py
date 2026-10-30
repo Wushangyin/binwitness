@@ -696,10 +696,11 @@ def cites(record_, *references):
     return {**record_, "references": [{"url": url, "tags": list(tags)} for url, tags in references]}
 
 
-# The family's records, citing commits: the attributed ones only pages of acme/web, which tells that it is the
-# project's repository; the candidates its commits, tagged or not as the patch, and one of another project.
+# The family's records, citing commits: the attributed ones pages and a commit of acme/web, which tell that it is the
+# project's repository (an attributed CVE's own commits are not read: only candidates are flagged by their fix); the
+# candidates its commits, tagged or not as the patch, and one of another project.
 FIX_CITED = {
-    "CVE-2024-1001": [(f"{WEB}/releases/tag/v0.5", [])],
+    "CVE-2024-1001": [(f"{WEB}/releases/tag/v0.5", []), (f"{WEB}/commit/{E}", ["Patch"])],
     "CVE-2025-1302": [(f"{WEB}/commit/{D}", ["Patch"])],
     "CVE-2025-1303": [(f"{WEB}/commit/{E}", ["Patch"])],
     "CVE-2025-1304": [(f"{WEB}/commit/{B}", []), ("https://github.com/bundler/suite/commit/2222222", ["Patch"])],
@@ -804,6 +805,10 @@ def commits_asked(transport) -> list[str]:
     return [url for url in asked(transport) if url not in fixes.VENDOR_PAGES]
 
 
+# Without the CNAs' records, fixes says what it leaves out.
+ALONE = "; without cvelist, the commits the CNAs' records cite are not read"
+
+
 def test_fix_commits_sync_from_github_and_go_on_where_they_stopped(fix_world, tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(localdb, "FIX_WORKERS", 1)
     limited = [2]
@@ -819,7 +824,7 @@ def test_fix_commits_sync_from_github_and_go_on_where_they_stopped(fix_world, tm
     assert fix_world.sync(["fixes"], fetcher=localdb.Fetcher(opener=opener(first), sleep=slept.append),
                           log=lambda m: None) == {
         "fixes": "fetched 4 commits; 4 of the 5 cited by 4 records held; 1 not fetched (downloads failed): "
-                 "sync fixes again later"}
+                 f"sync fixes again later{ALONE}"}
     # GitHub's 429 passes: it is waited out, as a server error is, rather than ending the sync.
     assert slept == [2, 4, 2, 4, 8, 16]
     # Besides the commits, only the vendor's security pages are asked for: here none can be fetched.
@@ -835,11 +840,11 @@ def test_fix_commits_sync_from_github_and_go_on_where_they_stopped(fix_world, tm
     fix_world._write_state()
     rest = ScriptedTransport(DIFF_ROUTES)
     assert fix_world.sync(["fixes"], fetcher=fetcher(rest), log=lambda m: None) == {
-        "fixes": "fetched 1 commit; 5 of the 5 cited by 4 records held"}
+        "fixes": f"fetched 1 commit; 5 of the 5 cited by 4 records held{ALONE}"}
     assert [url.rsplit("/", 1)[1] for url in commits_asked(rest)] == [f"{C}.diff"]
     again = ScriptedTransport(DIFF_ROUTES)
     assert fix_world.sync(["fixes"], fetcher=fetcher(again), log=lambda m: None) == {
-        "fixes": "up to date: 5 commits cited by 4 records"}
+        "fixes": f"up to date: 5 commits cited by 4 records{ALONE}"}
     assert commits_asked(again) == []
     # When GitHub keeps refusing, the sync stops asking, and is not a failure: the next one goes on.
     fix_world.remove(["fixes"])
@@ -847,7 +852,7 @@ def test_fix_commits_sync_from_github_and_go_on_where_they_stopped(fix_world, tm
     refused = ScriptedTransport({"github.com": (429, b"")})
     assert fix_world.sync(["fixes"], fetcher=fetcher(refused), log=lambda m: None) == {
         "fixes": "fetched 0 commits; 0 of the 5 cited by 4 records held; 5 not fetched (GitHub stopped answering): "
-                 "sync fixes again later"}
+                 f"sync fixes again later{ALONE}"}
     assert len(commits_asked(refused)) == 2 * localdb.Fetcher.retries
     assert LocalDb(tmp_path / "none").sync(["fixes"], fetcher=fetcher(refused), log=lambda m: None) == {
         "fixes": "failed: fixes are read from the NVD records of Maven packages: install nvd and osv-maven first "
@@ -924,6 +929,9 @@ def test_an_online_scan_has_candidates_apart_from_its_findings(tmp_path, deliver
     assert result["summary"]["vulnerabilities"]["total"] == len(result["vulnerabilities"])
     assert "CVE-2025-0004" not in result["vulnerabilities"]
     assert set(result["candidate_links"]) == {lib["purl"]}
+    assert result["options"]["lookup"] == "online"
+    assert set(result["data_sources"]["local"]) == {"nvd", "osv-maven"}
+    assert result["data_sources"]["local"]["nvd"]["data_as_of"] == world.data_as_of("nvd")
     out = tmp_path / "out"
     write_all(result, out)
     assert "CVE-2025-0004" not in (out / "sbom.cdx.json").read_text("utf-8")
@@ -1038,8 +1046,8 @@ def test_flags_reach_the_files_and_the_mcp_tools(tmp_path, delivery, world, fami
     assert rows[("CVE-2025-1304", "web-embed@1.0")]["named classes in this jar"] == "jar contents unknown"
     assert rows[("CVE-2025-1305", "web-core@1.0")]["learned link (package / product / project)"] == \
         "3/3 / 3/3 / 3/3; versions meet on 3 of 3"
-    assert ("14 component pairs, flagged for review: same flaw as a finding 2, record names only another language 3, "
-            "named classes not in the jar 1; pairs left out: the record names another module 2; 3 CPE links refused: "
+    assert ("14 component pairs (reached by learned link 13, named in the record 1), flagged for review: same flaw as a "
+            "finding 2, record names only another language 3, named classes not in the jar 1; pairs left out: the record names another module 2; 3 CPE links refused: "
             "NVD's versions never meet OSV's") in render_summary(result)
     service = Service(Config(results=tmp_path / "results", lookup="local"),
                       net=Net(cache_dir=tmp_path / "c", offline=True, transport=ScriptedTransport({"": never})))
@@ -1070,8 +1078,16 @@ def test_a_vendor_advisory_reaches_the_files_and_the_mcp_tools(tmp_path, deliver
     assert (socks["reached by"], socks["advisory names another module"]) == ("named in the vendor's advisory", "")
     assert (core["reached by"], core["advisory names another module"]) == ("learned link", "yes")
     assert core["modules the vendor's advisory names"] == "org.acme.web:web-socks"
+    assert ("15 component pairs (reached by learned link 13, named in the record 1, named in the vendor's advisory 1), "
+            "flagged for review: same flaw as a finding 2, record names only another language 3, named classes not in "
+            "the jar 1, the vendor's advisory names another module 3; pairs left out: the record names another module "
+            "2") in render_summary(result)
+    # Results of 0.4.3 and 0.4.4 count the pairs by basis nowhere but those the advisory reached.
+    earlier = {**result, "summary": {**result["summary"], "candidates": {
+        k: v for k, v in summary.items() if k != "pairs_by_basis"}}}
+    assert "15 component pairs, flagged for review: " in render_summary(earlier)
     assert "the vendor's advisory names another module 3; 1 pairs reached through the vendor's advisory; pairs left " \
-           "out: the record names another module 2" in render_summary(result)
+           "out: the record names another module 2" in render_summary(earlier)
     service = Service(Config(results=tmp_path / "results", lookup="local"),
                       net=Net(cache_dir=tmp_path / "c", offline=True, transport=ScriptedTransport({"": never})))
     detail = service.get_candidate(service.open_result(str(out))["scan_id"], "CVE-2025-1305")

@@ -19,7 +19,7 @@ from binwitness.output import render_summary, write_all
 from helpers import ScriptedTransport, Served, make_zip
 from test_localdb import fetcher, never, osv_zip
 from test_nvd import (DIFF_ROUTES, FAMILY_FINDINGS, FAMILY_ITEMS, FAMILY_LISTINGS, FAMILY_NVD, FAMILY_OSV, SPRING_ROUTE,
-                      WEB, YEAR, A, B, C, cpe, feed_routes, online_scan, osv, record, spring_page)
+                      WEB, YEAR, A, B, C, D, E, cpe, feed_routes, online_scan, osv, record, spring_page)
 from test_scan import delivery  # noqa: F401 (a fixture)
 
 COMMIT = "https://github.com/acme/web/commit/" + "a" * 40
@@ -43,10 +43,10 @@ def affected(vendor="Acme", product="Acme Web", *versions, default=None, **field
 
 
 def cve5(ident, *entries, state="PUBLISHED", description=None, references=(), metrics=(), adp=(), tags=(),
-         cwe="CWE-79", assigner="acme"):
+         cwe="CWE-79", assigner="acme", updated="2026-10-02T00:00:00Z"):
     """A CVE JSON 5 record."""
     meta = {"cveId": ident, "state": state, "assignerShortName": assigner, "datePublished": "2026-10-01T00:00:00Z",
-            "dateUpdated": "2026-10-02T00:00:00Z"}
+            "dateUpdated": updated}
     if state != "PUBLISHED":
         return {"dataType": "CVE_RECORD", "cveMetadata": meta, "containers": {"cna": {"rejectedReasons": []}}}
     container = {"title": f"A flaw in {ident}", "affected": list(entries),
@@ -290,8 +290,8 @@ def test_a_product_name_is_learned_from_the_cves_osv_attributes():
 
 # ---- the cvelist dataset and its candidates --------------------------------------------------------------
 
-def web(ident, *versions, description=None, **fields):
-    return cve5(ident, affected("Acme", "Acme Web", *versions, **fields), description=description)
+def web(ident, *versions, description=None, updated="2026-10-02T00:00:00Z", **fields):
+    return cve5(ident, affected("Acme", "Acme Web", *versions, **fields), description=description, updated=updated)
 
 
 UP_TO_2 = v("0", lessThan="2.0")
@@ -311,7 +311,8 @@ SNAPSHOT = [
     cve5("CVE-2026-2009", affected("Acme", "Acme Spring Thing", v("0", lessThan="9.0"))),
     web("CVE-2026-2010", UP_TO_2),
 ]
-TWO_LINES = web("CVE-2026-2003", v("0", lessThan="1.2.5"), v("2.0.0", lessThan="2.0.3"))
+TWO_LINES = web("CVE-2026-2003", v("0", lessThan="1.2.5"), v("2.0.0", lessThan="2.0.3"),
+                updated="2026-10-29T12:00:00Z")
 FETCHED = cve5("CVE-2026-2009", affected("Acme", "Acme Spring Thing", v("0", lessThan="9.0")),
                description="Acme Spring Thing lets a header through.")
 
@@ -395,7 +396,8 @@ def cna_world(tmp_path, monkeypatch):
 def test_cvelist_installs_follows_the_days_changes_and_fetches_the_texts_it_comes_to_need(cna_world):
     db, transport, sync, logged = cna_world
     asked = [url for _, url, _ in transport.calls]
-    assert [u.rsplit("/", 1)[1] for u in asked if "/releases/download/" in u] == [
+    # The snapshot is first asked for one byte, to learn whether it can be fetched in parts.
+    assert [u.rsplit("/", 1)[1] for u in dict.fromkeys(asked) if "/releases/download/" in u] == [
         "2026-10-29_all_CVEs_at_midnight.zip.zip", "2026-10-29_delta_CVEs_at_2300Z.zip",
         "2026-10-29_delta_CVEs_at_end_of_day.zip", "2026-10-30_delta_CVEs_at_0100Z.zip"]
     assert f"{cna.CVELIST}/releases/download/cve_2026-10-29_at_end_of_day/2026-10-29_delta_CVEs_at_end_of_day.zip" \
@@ -566,16 +568,21 @@ def test_main_code_is_where_a_build_keeps_it(path, found):
     assert fixes.main_source(path) == found
 
 
-def test_fixes_are_read_for_the_cnas_records_and_from_a_vendors_page(cna_world):
+def test_fixes_are_read_for_the_cnas_records_and_from_a_vendors_page(cna_world, monkeypatch):
     db, transport, sync, logged = cna_world
+    monkeypatch.setattr(localdb, "RECORD_PAGE", 2)
     # An attributed CVE's record refers to acme/web: the project's repository, for its product name.
     transport.routes["/releases.atom"] = releases("cve_2026-10-30_0400Z")
     transport.routes["/2026-10-30_delta_CVEs_at_0400Z.zip"] = delta(
         cve5("CVE-2024-1001", affected("Acme", "Acme Web", v("0", lessThan="0.5")),
-             references=[f"{WEB}/releases/tag/v0.5"]),
+             references=[f"{WEB}/releases/tag/v0.5"], updated="2026-10-30T03:10:00Z"),
         cve5("CVE-2026-2003", affected("Acme", "Acme Web", v("0", lessThan="1.2.5")),
-             references=[f"{WEB}/commit/{A}", f"https://github.com/other/bundle/commit/{'f' * 40}"]))
-    assert sync("cvelist")["cvelist"].startswith("updated: 2 records changed")
+             references=[f"{WEB}/commit/{A}", f"https://github.com/other/bundle/commit/{'f' * 40}"],
+             updated="2026-10-30T03:20:00Z"),
+        # NVD gave it a CPE of another product: what it is about is not read from the product its CNA names.
+        cve5("CVE-2026-2007", affected("Acme", "Acme Web", UP_TO_2), references=[f"{WEB}/commit/{E}"],
+             updated="2026-10-30T03:30:00Z"))
+    assert sync("cvelist")["cvelist"].startswith("updated: 3 records changed")
     transport.routes.update(DIFF_ROUTES)
     transport.routes["/security-9.html"] = security_page(("Important: cookies", "CVE-2026-2001", [B, C]))
     outcome = sync("fixes")["fixes"]
@@ -585,8 +592,40 @@ def test_fixes_are_read_for_the_cnas_records_and_from_a_vendors_page(cna_world):
     from_cna = db.fix_of("CVE-2026-2003")
     assert from_cna["classes"] == ["org.acme.web.socks.SocksHandshakeDecoder"]
     assert from_cna["elsewhere"] == [f"https://github.com/other/bundle/commit/{'f' * 40}"]
+    assert db.fix_of("CVE-2026-2007") is None
     # The vendor's page names the fix of a record that cites none: its commits are the patch.
     from_page = db.fix_of("CVE-2026-2001")
     assert (from_page["classes"], from_page["classes_from"]) == (
         ["org.acme.web.core.Server", "org.acme.web.servlet.UrlFilenameViewController"], "patch-tagged commits")
+    # A record published since cites a commit fixes has not read: the sync that brought it says so.
+    transport.routes["/releases.atom"] = releases("cve_2026-10-30_0500Z")
+    transport.routes["/2026-10-30_delta_CVEs_at_0500Z.zip"] = delta(cve5(
+        "CVE-2026-2013", affected("Acme", "Acme Web", v("0", lessThan="1.2.5")), references=[f"{WEB}/commit/{D}"],
+        updated="2026-10-30T04:30:00Z"))
+    assert sync("cvelist")["fixes"] == "not synced: 1 commit the records now cite not read yet (sync fixes)"
+    assert sync("fixes")["fixes"].startswith("fetched 1 commit")
+    transport.routes["/releases.atom"] = releases("cve_2026-10-30_0600Z")
+    transport.routes["/2026-10-30_delta_CVEs_at_0600Z.zip"] = delta(cve5("CVE-2026-2014", updated="2026-10-30T05:30:00Z"))
+    assert "fixes" not in sync("cvelist")
+
+
+def test_cvelist_counts_the_records_that_changed_not_those_a_release_repeats(cna_world):
+    _, transport, sync, _ = cna_world
+    new = web("CVE-2026-2012", UP_TO_2, updated="2026-10-30T01:30:00Z")
+    transport.routes["/releases.atom"] = releases("cve_2026-10-30_0200Z")
+    transport.routes["/2026-10-30_delta_CVEs_at_0200Z.zip"] = delta(new)
+    assert sync("cvelist")["cvelist"].startswith("updated: 1 record changed;")
+    # An hour's release holds every change of its day so far: those stored already are not counted again; a
+    # record withdrawn is.
+    changed = web("CVE-2026-2003", v("0", lessThan="1.2.6"), updated="2026-10-30T02:30:00Z")
+    withdrawn = cve5("CVE-2026-2002", state="REJECTED", updated="2026-10-30T02:40:00Z")
+    transport.routes["/releases.atom"] = releases("cve_2026-10-30_0300Z")
+    transport.routes["/2026-10-30_delta_CVEs_at_0300Z.zip"] = delta(new, changed, withdrawn)
+    assert sync("cvelist")["cvelist"].startswith("updated: 2 records changed;")
+    # The day's end repeats its hours; the next day's first hour brings one more.
+    transport.routes["/releases.atom"] = releases("cve_2026-10-31_0000Z")
+    transport.routes["/2026-10-30_delta_CVEs_at_end_of_day.zip"] = delta(new, changed, withdrawn)
+    transport.routes["/2026-10-31_delta_CVEs_at_0000Z.zip"] = delta(
+        web("CVE-2026-2004", UP_TO_2, updated="2026-10-31T00:10:00Z"))
+    assert sync("cvelist")["cvelist"].startswith("updated: 1 record changed;")
 

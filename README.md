@@ -452,7 +452,7 @@ binwitness db remove osv-npm
 | `nvd` | NVD CVE records that name an application (CPE), for [candidates](#nvd-candidates) | 235 MB download, 225 MB on disk; then 15 MB a day |
 | `cvelist` | CVE records as their CNAs published them ([cvelistV5](https://github.com/CVEProject/cvelistV5)), for [candidates NVD has given no CPE yet](#before-nvd-the-cnas-records); needs `osv-maven` | 650 MB download, 130 MB on disk; then about 5 MB a day |
 | `spring` | The Spring projects' security advisories ([spring.io](https://spring.io/security)), for the modules and versions each names, for [candidates](#nvd-candidates) | 260 kB download, 140 kB on disk |
-| `fixes` | The classes changed by the GitHub commits that CVE records cite as their fix, or that Apache Tomcat's security pages list, for [candidates](#nvd-candidates); needs `nvd` and `osv-maven` | about 430 commits from github.com: 8 MB download, 0.35 MB on disk |
+| `fixes` | The classes changed by the GitHub commits that CVE records cite as their fix, or that Apache Tomcat's security pages list, for [candidates](#nvd-candidates); needs `nvd` and `osv-maven`, and `cvelist` for the commits the CNAs' records cite | about 430 commits from github.com: 8 MB download, 0.35 MB on disk |
 
 Groups: `vulns` (both OSV datasets and `kev`), `java` (`osv-maven`, `kev`, `maven-hashes`), `all` (these,
 `nvd`, `cvelist`, `spring` and `fixes`).
@@ -464,7 +464,9 @@ changed, or the last full download is a month old, the archive is downloaded aga
 drops records deleted upstream. The KEV catalog and the Spring advisories are small and fetched whole;
 spring.io amends advisories without dating the change, so the Spring copy is replaced whenever its
 content differs. A commit does not change once made, so each one is fetched once; a later sync fetches
-only the commits cited by records new since. GitHub limits what one address may fetch: the commits are
+only the commits cited by records new since. The commits the CNAs' records cite are read only when
+`cvelist` is installed: sync it before `fixes` (`all` does). A sync that brings new records of `osv-maven`,
+`nvd` or `cvelist` without syncing `fixes` says how many commits they cite that `fixes` has not read. GitHub limits what one address may fetch: the commits are
 read a few at a time, and when GitHub stops answering, the sync keeps what it has and the next one goes
 on from there. The Tomcat security pages are read whole at each sync.
 
@@ -477,7 +479,7 @@ sync (about 235 MB); the copy held stays in use until that is done, and whenever
 
 The CVE Program publishes cvelistV5 as a snapshot of every record each midnight, the changes of each day,
 and those of each hour since midnight. The first sync of `cvelist` downloads the latest snapshot (about
-650 MB, one file that resumes where a dropped connection stopped) and the hour's changes; later ones
+650 MB) and the hour's changes; later ones
 apply the changes of each day the copy lacks (about 5 MB a day) and the latest hour's. The daily changes
 are kept for at least seven weeks: a copy more than 40 days behind, or one that lacks a day no longer
 published, is downloaded again. Of about 400,000 records, the text is kept only of those that may reach
@@ -500,8 +502,10 @@ additions at most once a week, and saves its progress after each one it applies.
 that the limit is reached (HTTP 429), the sync stops at once and says when to try again: retrying earlier
 only extends the block.
 
-A dropped connection resumes where it stopped, and a sync that gives up resumes on the next run. If a
-sync fails, the copy already installed is kept. Only one `db sync` or `db remove` runs on a directory at a
+A large file (the OSV archives, the cvelist snapshot, the hash base) is fetched in pieces of 8 MB over four
+connections when its server sends ranges: one connection is often held far below what the line gives, and
+a slow one then holds up a piece, not the file. A dropped connection resumes where it stopped, and a sync
+that gives up resumes on the next run, unless the file has changed in between. If a sync fails, the copy already installed is kept. Only one `db sync` or `db remove` runs on a directory at a
 time; a second one is refused rather than left waiting behind a download that can take an hour on a slow
 line.
 
@@ -527,8 +531,9 @@ asks deps.dev (or the cache) as well. For a jar that declares nothing, the two s
 different coordinates of the same file, so a `local` and an `online` scan may differ in a component's
 name; with `auto`, the index answers first, as in `local`.
 
-The result records which datasets answered and how current they were (`data_sources.local`). A dataset
-last synced more than seven days ago produces a warning.
+The result records which local datasets were read and how current they were (`data_sources.local`),
+also in an `online` scan, whose candidates come from them; where the findings came from is `options.lookup`.
+A dataset last synced more than seven days ago produces a warning.
 
 Each dataset is downloaded by your machine directly from its publisher, under the publisher's terms: OSV
 from Google's public bucket (each record carries the license of the database it comes from), the hash

@@ -16,7 +16,7 @@ import pytest
 
 from binwitness import localdb, maven
 from binwitness.cli import main
-from binwitness.localdb import Fetcher, LocalDb, expand
+from binwitness.localdb import Fetcher, LocalDb, SyncError, expand
 from binwitness.net import Net
 from binwitness.scan import OFFLINE_UNKNOWN, Options, scan
 from binwitness.vulns import affects
@@ -262,6 +262,117 @@ def test_download_resumes_a_connection_closed_early(tmp_path):
     assert slept == []
 
 
+class RangeServer:
+    """A file served as a CDN serves it: ranges with Content-Range, an ETag, and ``If-Range`` honoured."""
+
+    def __init__(self, data: bytes, ranges: bool = True):
+        self.data, self.etag, self.ranges = data, '"v1"', ranges
+        self.asked, self.served = [], []  # served: the ranges sent whole
+        self.cut = {}  # where a range starts: bytes sent before the connection drops
+        self.refused = set()  # ranges answered 503
+
+    def __call__(self, url, headers):
+        span = headers.get("Range")
+        self.asked.append(span)
+        if not (self.ranges and span) or headers.get("If-Range", self.etag) != self.etag:
+            return 200, {"Content-Length": str(len(self.data)), "ETag": self.etag}, io.BytesIO(self.data)
+        start, _, end = span[len("bytes="):].partition("-")
+        if span in self.refused:
+            return 503, {}, io.BytesIO(b"")
+        start, end = int(start), int(end) if end else len(self.data) - 1
+        body = self.data[start:end + 1][:self.cut.pop(start, None)]
+        if len(body) == end + 1 - start:
+            self.served.append(span)
+        return 206, {"Content-Range": f"bytes {start}-{end}/{len(self.data)}", "ETag": self.etag}, io.BytesIO(body)
+
+
+PARTS = ["bytes=0-1279", "bytes=1280-2559", "bytes=2560-3839", "bytes=3840-5119"]
+
+
+def test_a_large_download_is_fetched_in_pieces_and_a_dropped_piece_resumes(tmp_path, monkeypatch):
+    monkeypatch.setattr(localdb, "PART_SIZE", 1280)
+    data = bytes(range(256)) * 20
+    server = RangeServer(data)
+    server.cut[1280] = 500
+    seen, slept = [], []
+    target = tmp_path / "file"
+    Fetcher(opener=server, sleep=slept.append).download(
+        "https://x/f", target, sha256=f"sha256:{hashlib.sha256(data).hexdigest()}",
+        progress=lambda done, total: seen.append((done, total)), connections=2)
+    assert target.read_bytes() == data
+    assert server.asked[0] == "bytes=0-0"
+    assert sorted(server.asked[1:]) == sorted([*PARTS, "bytes=1780-2559"])
+    assert (max(seen), slept) == ((len(data), len(data)), [])
+    assert [p.name for p in tmp_path.iterdir()] == ["file"]
+
+
+def test_a_piece_that_fails_is_resumed_alone_by_the_next_download(tmp_path, monkeypatch):
+    monkeypatch.setattr(localdb, "PART_SIZE", 1280)
+    data = bytes(range(256)) * 20
+    server = RangeServer(data)
+    server.refused.add(PARTS[2])
+    target = tmp_path / "file"
+    with pytest.raises(SyncError, match="HTTP 503 after 2 attempts"):
+        Fetcher(opener=server, retries=2, sleep=lambda s: None).download("https://x/f", target, connections=4)
+    assert not target.exists()
+    fetched = set(server.served)
+    assert PARTS[2] not in fetched
+    server.refused.clear()
+    server.asked.clear()
+    Fetcher(opener=server, sleep=lambda s: None).download("https://x/f", target, connections=4)
+    assert target.read_bytes() == data
+    assert sorted(server.asked) == sorted(["bytes=0-0", *(p for p in PARTS if p not in fetched)])
+    assert [p.name for p in tmp_path.iterdir()] == ["file"]
+    # Once a piece has failed, none is started: a server refusing them all is asked for those under way only.
+    target.unlink()
+    server.refused.update(PARTS)
+    server.asked.clear()
+    with pytest.raises(SyncError):
+        Fetcher(opener=server, retries=2, sleep=lambda s: None).download("https://x/f", target, connections=2)
+    assert server.asked[0] == "bytes=0-0" and set(server.asked[1:]) <= set(PARTS[:2])
+
+
+def test_pieces_of_a_file_that_changed_are_not_joined(tmp_path, monkeypatch):
+    monkeypatch.setattr(localdb, "PART_SIZE", 1280)
+    data, changed = bytes(range(256)) * 20, bytes(range(255, -1, -1)) * 20
+    server = RangeServer(data)
+    server.refused.add(PARTS[2])
+    target = tmp_path / "file"
+    with pytest.raises(SyncError):
+        Fetcher(opener=server, retries=1, sleep=lambda s: None).download("https://x/f", target, connections=4)
+    # Changed between two syncs: the pieces kept are dropped.
+    server.data, server.etag = changed, '"v2"'
+    server.refused.clear()
+    server.asked.clear()
+    Fetcher(opener=server, sleep=lambda s: None).download("https://x/f", target, connections=4)
+    assert target.read_bytes() == changed
+    assert sorted(server.asked) == sorted(["bytes=0-0", *PARTS])
+    # Changed during the download: the pieces asked by the old ETag come whole; it is fetched again, in one.
+    target.unlink()
+    server.asked.clear()
+
+    def changing(url, headers):
+        answer = server(url, headers)
+        if headers.get("Range") == "bytes=0-0":
+            server.data, server.etag = data, '"v3"'
+        return answer
+    Fetcher(opener=changing, sleep=lambda s: None).download("https://x/f", target, connections=2)
+    assert target.read_bytes() == data
+    assert (server.asked[0], server.asked[-1]) == ("bytes=0-0", None) and set(server.asked[1:-1]) <= set(PARTS)
+    assert [p.name for p in tmp_path.iterdir()] == ["file"]
+
+
+@pytest.mark.parametrize("ranges, size", [(False, 5120), (True, 1280)])
+def test_a_file_is_fetched_in_one_when_the_server_sends_no_ranges_or_it_is_small(tmp_path, monkeypatch, ranges, size):
+    monkeypatch.setattr(localdb, "PART_SIZE", 1280)
+    data = bytes(range(256)) * 20
+    server = RangeServer(data[:size], ranges)
+    target = tmp_path / "file"
+    Fetcher(opener=server, sleep=lambda s: None).download("https://x/f", target, connections=4)
+    assert target.read_bytes() == data[:size]
+    assert server.asked == ["bytes=0-0", None]
+
+
 def java_db_layer(tmp_path, rows):
     path = tmp_path / "trivy-java.db"
     path.unlink(missing_ok=True)
@@ -385,7 +496,7 @@ def test_maven_hashes_download_asks_for_a_new_token_when_resuming(tmp_path):
         if token in spent:
             return 401, {}, io.BytesIO(b"")
         spent.add(token)
-        start = int(headers["Range"][len("bytes="):-1]) if "Range" in headers else 0
+        start = int(headers["Range"][len("bytes="):].partition("-")[0]) if "Range" in headers else 0
         piece = io.BytesIO(layer[start:start + len(layer) // 3 + 1])
         if start:
             return 206, {"Content-Range": f"bytes {start}-{len(layer) - 1}/{len(layer)}"}, piece

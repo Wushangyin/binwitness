@@ -595,7 +595,11 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None, cand
                     "maven_repos": list(options.maven_repos), "offline": net.offline,
                     "lookup": options.lookup or ("online" if db is None else "local" if net.offline else "auto"),
                     "mirrors": dict(net.mirrors)},
-        "data_sources": {"online": net.provenance(), "local": db.provenance() if db else {}},
+        # The local copies an online scan's candidates were read from are recorded as well: their dates are what
+        # the candidates are as of.
+        "data_sources": {"online": net.provenance(),
+                         "local": dict(sorted({**(db.provenance() if db else {}),
+                                               **(store.provenance() if store is not None else {})}.items()))},
         "summary": {},
         "components": items,
         "first_party": sorted(first_party, key=lambda x: x["filename"]),

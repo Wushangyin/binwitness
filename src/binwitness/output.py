@@ -386,15 +386,20 @@ def _candidate_lines(summary: dict | None) -> list[str]:
     flagged, left_out = summary.get("pairs_flagged"), summary.get("pairs_left_out") or {}
     refused = sum((summary.get("links_refused") or {}).values())
     if flagged is not None:
-        lines.append(f"             {summary['pairs']} component pairs, flagged for review: " + _listing(
+        by_basis = summary.get("pairs_by_basis")
+        lines.append(f"             {summary['pairs']} component pairs"
+                     + (" (reached by " + _listing([(REACHED_BY[b], by_basis[b]) for b in REACHED_BY if b in by_basis])
+                        + ")" if by_basis else "")
+                     + ", flagged for review: " + _listing(
             [("same flaw as a finding", flagged["same_flaw_as_a_finding"]),
              ("record names only another language", flagged["other_language_only"]),
              ("named classes not in the jar", flagged["named_classes_not_in_jar"]),
              ("the vendor's advisory names another module", flagged.get("advisory_names_another_module", 0)),
              ("none of the classes its fix changed in the jar", flagged.get("fixed_classes_not_in_jar", 0)),
              ("only on a line below those the vendor lists", flagged.get("below_listed_lines", 0))])
+            # Results of 0.4.3 and 0.4.4 count only the pairs the advisory reached.
             + (f"; {summary['pairs_reached_by_advisory']} pairs reached through the vendor's advisory"
-               if summary.get("pairs_reached_by_advisory") else "")
+               if summary.get("pairs_reached_by_advisory") and not by_basis else "")
             + ("; pairs left out: " + _listing([(LEFT_OUT.get(k, k), n) for k, n in sorted(left_out.items())])
                if sum(left_out.values()) else "")
             + (f"; {refused} CPE links refused: NVD's versions never meet OSV's" if refused else ""))
