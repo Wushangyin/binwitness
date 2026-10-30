@@ -65,6 +65,14 @@ CANDIDATE_JUDGING = [
     "an earlier one); advisory_names_another_module means the vendor's advisory names other modules of the "
     "project and not this one. A vendor may name the module a feature is used through while the flaw is in a "
     "shared module it depends on, so the pair is kept: check which module holds the code the fix changed.",
+    "fixed_classes are the classes changed by the GitHub commits the record cites as its fix (fix_commits; those "
+    "NVD tagged as the patch when it tagged any, fixed_classes_from says which), by their names before the fix; "
+    "classes_added_by_fix were new in it, and an affected version does not hold them. fixed_classes_not_in_jar "
+    "means the component's jar holds none of them (fixed_classes_in_jar lists those it holds): the flaw is likely "
+    "in another module. It is not certain: a class may have had another name in an older version, one commit may "
+    "change several modules, and a commit a record cites is not always the fix. fix_source_directories names "
+    "where the changed sources were (java, or a build variant's own such as jdk1.4); fix_commits_elsewhere are "
+    "commits of other projects the record cites, not read.",
     "status is NVD's analysis state; disputed means the record says the CVE is disputed.",
     "Say which way you judged and why, that it is a first pass from the record's text, and that candidates are "
     "not counted in the findings.",
@@ -883,6 +891,8 @@ def _flags(affected: dict) -> list[str]:
         flags.append("named_classes_not_in_jar")
     if affected.get("advisory_names_another_module"):
         flags.append("advisory_names_another_module")
+    if affected.get("fixed_classes_not_in_jar"):
+        flags.append("fixed_classes_not_in_jar")
     return flags
 
 

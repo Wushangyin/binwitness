@@ -226,7 +226,8 @@ CANDIDATE_COLUMNS = ["id", "severity", "cvss score", "cvss vector", "cvss source
                      "link learned from", "link rests on one CVE", "packages linked with this cpe", "reached by",
                      "modules the vendor's advisory names", "advisory names another module",
                      "same flaw as finding", "names only another language", "named classes in this jar",
-                     "named classes not in this jar", "cwe", "description", "url", "data as of"]
+                     "named classes not in this jar", "classes the fix changed", "of them in this jar",
+                     "none of the fix's classes in this jar", "fix commits", "cwe", "description", "url", "data as of"]
 REACHED_BY = {"learned": "learned link", "named": "named in the record", "advisory": "named in the vendor's advisory"}
 
 
@@ -257,6 +258,9 @@ def candidates_csv(result: dict, path: Path):
                              "yes" if a.get("advisory_names_another_module") else "",
                              " ".join(a.get("related_findings") or []), "yes" if a.get("other_language_only") else "",
                              _classes_text(a.get("classes_in_jar"), c), _classes_text(a.get("classes_not_in_jar"), c),
+                             " ".join(c.get("fixed_classes") or []), _fixed_text(a.get("fixed_classes_in_jar", []), c),
+                             "yes" if a.get("fixed_classes_not_in_jar") else "",
+                             " ".join(f["url"] for f in c.get("fix_commits") or []),
                              " ".join(c["cwe"]), c["description"], c["url"], dates])
         rows.sort(key=lambda r: (SEVERITIES.index(r[1]), r[0], r[9]))
         writer.writerows(rows)
@@ -275,6 +279,12 @@ def _link_text(link: dict) -> str:
 def _classes_text(names: list[str] | None, candidate: dict) -> str:
     if names is None:
         return "jar contents unknown" if candidate.get("classes_named") else ""
+    return " ".join(names)
+
+
+def _fixed_text(names: list[str] | None, candidate: dict) -> str:
+    if names is None:
+        return "jar contents unknown" if candidate.get("fixed_classes") else ""
     return " ".join(names)
 
 
@@ -370,11 +380,24 @@ def _candidate_lines(summary: dict | None) -> list[str]:
             [("same flaw as a finding", flagged["same_flaw_as_a_finding"]),
              ("record names only another language", flagged["other_language_only"]),
              ("named classes not in the jar", flagged["named_classes_not_in_jar"]),
-             ("the vendor's advisory names another module", flagged.get("advisory_names_another_module", 0))])
+             ("the vendor's advisory names another module", flagged.get("advisory_names_another_module", 0)),
+             ("none of the classes its fix changed in the jar", flagged.get("fixed_classes_not_in_jar", 0))])
             + (f"; {summary['pairs_reached_by_advisory']} pairs reached through the vendor's advisory"
                if summary.get("pairs_reached_by_advisory") else "")
             + (f"; {left_out} pairs left out: the record names another module" if left_out else "")
             + (f"; {refused} CPE links refused: NVD's versions never meet OSV's" if refused else ""))
+    fixes = summary.get("fix_commits")
+    if fixes and fixes["candidates_citing_a_commit"]:
+        read = fixes["commits"]
+        lines.append(f"             fixes: {fixes['candidates_with_fixed_classes']} of the "
+                     f"{fixes['candidates_citing_a_commit']} candidates citing a GitHub commit have the classes it "
+                     "changed; commits " + _listing(
+                         [("read", read.get("main classes", 0)),
+                          ("without main-code classes", read.get("no main-code class", 0)),
+                          ("too large to read", read.get("too large", 0)), ("not found", read.get("not found", 0)),
+                          ("not read yet (sync fixes again)", read.get("not read", 0))])
+                     + (f", {fixes['commits_elsewhere']} of other projects not used" if fixes["commits_elsewhere"]
+                        else ""))
     return lines
 
 

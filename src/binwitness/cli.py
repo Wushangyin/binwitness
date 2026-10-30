@@ -89,6 +89,12 @@ def _database(args) -> int:
                       f"data as of {_minute(row['data_as_of'])}  synced {_minute(row['synced'])}")
                 if row["name"] == "maven-hashes":
                     print(f"  {'':13} {_hashes_detail(row, args.hashes_every)}")
+                if row["name"] == "nvd" and not row["layout_current"]:
+                    print(f"  {'':13} stored by an earlier version: the next sync downloads it again (about 235 MB)")
+                if row["name"] == "fixes":
+                    print(f"  {'':13} {row['commits'] or 0:,} commits read" + (
+                        f"; {row['commits_not_read']:,} not fetched yet: sync fixes again" if row["commits_not_read"]
+                        else ""))
             else:
                 print(f"  {row['name']:13} not installed ({row['download']}): {row['description']}")
         groups = "; ".join(f"{group} = {' '.join(members)}" for group, members in GROUPS.items())

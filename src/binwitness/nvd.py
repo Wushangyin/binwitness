@@ -19,6 +19,7 @@ from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
 
+from binwitness import fixes
 from binwitness.versions import compare
 from binwitness.vulns import SEVERITIES
 
@@ -33,6 +34,9 @@ PRODUCT_SHARE = 0.5
 PROJECT_SHARE = 0.25
 # Enough to tell which module or language binding a record is about; Oracle's quarterly records list hundreds.
 REFERENCES_KEPT = 20
+# What compact() stores: 2 adds the commit references with NVD's tags (0.4.4). A copy stored otherwise is
+# downloaded again, since only the records NVD changes since would be stored anew.
+LAYOUT = 2
 LEARNED_FROM_KEPT = 5
 SCHEMA = """
 CREATE TABLE records(id TEXT PRIMARY KEY, modified TEXT, status TEXT, body BLOB);
@@ -215,6 +219,16 @@ def score(cve: dict) -> dict | None:
     return None
 
 
+def _fix_refs(cve: dict) -> list[list]:
+    """The commit references, beyond the references kept, each with whether NVD tagged it as the patch."""
+    tagged: dict[str, bool] = {}
+    for reference in cve.get("references") or []:
+        url = reference.get("url") or ""
+        if fixes.COMMIT.match(url):
+            tagged[url] = tagged.get(url, False) or "Patch" in (reference.get("tags") or [])
+    return [[url, patch] for url, patch in tagged.items()]
+
+
 def compact(cve: dict) -> dict:
     """What a candidate needs of a record, a tenth of its size."""
     tags = {t for entry in cve.get("cveTags") or [] for t in entry.get("tags") or []}
@@ -227,6 +241,7 @@ def compact(cve: dict) -> dict:
         "kev_date_added": cve.get("cisaExploitAdd"),
         "references": list(dict.fromkeys(r["url"] for r in cve.get("references") or [] if r.get("url")))[
             :REFERENCES_KEPT],
+        "fix_refs": _fix_refs(cve),
         "matches": [m.as_dict() for m in matches(cve)],
     }
 
@@ -653,13 +668,14 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
             advisory_in[(ident, home)] = {m for m in modules if family("maven", m) == home}
         return advisory_in[(ident, home)]
 
-    def placed(ident: str, item: dict) -> tuple[list | None, list | None]:
-        facts = naming(ident)
-        if not facts.classes:
-            return [], []
+    def entries(item: dict) -> set | None:
         if item["purl"] not in held:
             held[item["purl"]] = listings.of(item) if listings else None
-        return facts.placed(held[item["purl"]])
+        return held[item["purl"]]
+
+    def placed(ident: str, item: dict) -> tuple[list | None, list | None]:
+        facts = naming(ident)
+        return facts.placed(entries(item)) if facts.classes else ([], [])
 
     def hit_of(ident: str, cpe: str, ecosystem: str, version: str) -> Match | None:
         return next((m for m in map(match_of, (linker.record(ident) or {}).get("matches", []))
@@ -727,6 +743,11 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
         entry["modules_named"], entry["languages_named"] = [*facts.modules, *modules], list(facts.languages)
         entry["classes_named"] = list(facts.classes)
         entry["advisory_modules"] = db.advisory_modules(ident) or []
+        fix = db.fix_of(ident) or {}
+        entry["fix_commits"], entry["fix_commits_elsewhere"] = fix.get("commits", []), fix.get("elsewhere", [])
+        entry["fixed_classes"], entry["classes_added_by_fix"] = fix.get("classes", []), fix.get("classes_added", [])
+        entry["fix_source_directories"], entry["fixed_classes_from"] = fix.get("source_directories", []), \
+            fix.get("classes_from")
         for ref, affected in entry["affects"].items():
             item = named[ref]
             advised = {module_of(m.split(":", 1)[1])
@@ -736,6 +757,10 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
             affected["related_findings"] = _related(item, ident, facts, vulnerabilities, linker)
             affected["other_language_only"] = facts.other_language_only(item["ecosystem"])
             affected["classes_in_jar"], affected["classes_not_in_jar"] = placed(ident, item)
+            # A jar of the affected versions holds what the fix changed, unless the flaw is in another module.
+            fixed = fixes.held(entry["fixed_classes"], entries(item)) if entry["fixed_classes"] else []
+            affected["fixed_classes_in_jar"] = fixed
+            affected["fixed_classes_not_in_jar"] = fixed == [] and bool(entry["fixed_classes"])
     table = dict(sorted(table.items()))
     pairs = [a for c in table.values() for a in c["affects"].values()]
     summary = {
@@ -754,7 +779,9 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
             "other_language_only": sum(1 for a in pairs if a["other_language_only"]),
             "named_classes_not_in_jar": sum(1 for a in pairs if a["classes_not_in_jar"] and not a["classes_in_jar"]),
             "advisory_names_another_module": sum(1 for a in pairs if a["advisory_names_another_module"]),
+            "fixed_classes_not_in_jar": sum(1 for a in pairs if a["fixed_classes_not_in_jar"]),
         },
+        "fix_commits": _fix_counts(table) if db.has("fixes") else None,
         "pairs_reached_by_name": sum(1 for a in pairs if a["basis"] == "named"),
         "pairs_reached_by_advisory": sum(1 for a in pairs if a["basis"] == "advisory"),
         "pairs_left_out": dict(left_out),
@@ -763,9 +790,25 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
         "components_not_checked_because": dict(not_checked),
         "nvd_records_without_cpe": db.nvd_without_cpe(),
         # An online scan's findings are as of the scan; its candidates are as of these copies.
-        "data_as_of": {n: db.data_as_of(n) for n in ["nvd", *sorted(set(datasets.values())), "spring"] if db.has(n)},
+        "data_as_of": {n: db.data_as_of(n) for n in ["nvd", *sorted(set(datasets.values())), "spring", "fixes"]
+                       if db.has(n)},
     }
     return table, links_of, summary
+
+
+def _fix_counts(table: dict) -> dict:
+    """How far the fixes the candidates cite were read: commits by what reading them gave, and candidates by the
+    commits their fixed classes come from."""
+    commits = {c["url"]: c["read"] for entry in table.values() for c in entry["fix_commits"]}
+    flagged = Counter(entry["fixed_classes_from"] for entry in table.values()
+                      for a in entry["affects"].values() if a["fixed_classes_not_in_jar"])
+    return {"candidates_citing_a_commit": sum(1 for e in table.values() if e["fix_commits"] or e["fix_commits_elsewhere"]),
+            "candidates_with_fixed_classes": sum(1 for e in table.values() if e["fixed_classes"]),
+            "commits": dict(sorted(Counter(commits.values()).items())),
+            "commits_elsewhere": len({u for e in table.values() for u in e["fix_commits_elsewhere"]}),
+            "candidates_by_classes_from": dict(sorted(Counter(e["fixed_classes_from"] for e in table.values()
+                                                              if e["fixed_classes_from"]).items())),
+            "pairs_flagged_by_classes_from": dict(sorted(flagged.items()))}
 
 
 def _own_ids(item: dict, vulnerabilities: dict) -> set[str]:

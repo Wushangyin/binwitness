@@ -6,12 +6,14 @@ import hashlib
 import io
 import json
 import sqlite3
+import threading
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from binwitness import localdb, nvd
+from binwitness import fixes, localdb, nvd
+from binwitness.cli import main
 from binwitness.crosscheck import crosscheck, load_other
 from binwitness.localdb import LocalDb
 from binwitness.mcp_server import Config, Refused, Service
@@ -21,7 +23,7 @@ from binwitness.output import render_summary, write_all
 from binwitness.scan import Options, scan
 
 from helpers import ScriptedTransport, Served, make_zip
-from test_localdb import fetcher, never, osv_zip
+from test_localdb import fetcher, never, opener, osv_zip
 from test_scan import delivery, routes  # noqa: F401 (delivery is a fixture)
 
 NOW = datetime.now(timezone.utc)
@@ -321,6 +323,24 @@ def test_nvd_sync_leaves_out_rejected_records_and_counts_those_without_a_cpe(wor
     assert world.state["nvd"]["records"] == len(NVD_RECORDS) - 3
 
 
+def test_a_full_download_fetches_the_yearly_feeds_a_few_at_a_time_and_each_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(nvd, "FIRST_YEAR", YEAR - 1)
+    routes = {**feed_routes(f"nvdcve-2.0-{YEAR - 1}", *NVD_RECORDS[:4]), **feed_routes(f"nvdcve-2.0-{YEAR}", *NVD_RECORDS[4:])}
+    both = threading.Barrier(2, timeout=5)
+
+    def together(served):
+        def answer(method, url, body):
+            both.wait()  # a feed fetched alone does not get past this
+            return bytes(served)
+        return answer
+    transport = ScriptedTransport({name: together(answer) if name.endswith(".json.gz") else answer
+                                   for name, answer in routes.items()})
+    assert LocalDb(tmp_path / "db").sync(["nvd"], fetcher=fetcher(transport), log=lambda m: None) == {
+        "nvd": f"downloaded {len(NVD_RECORDS) - 3} records with a CPE"}
+    assert sorted(url.rsplit("/", 1)[1] for _, url, _ in transport.calls if url.endswith(".json.gz")) == [
+        f"nvdcve-2.0-{YEAR - 1}.json.gz", f"nvdcve-2.0-{YEAR}.json.gz"]
+
+
 def test_nvd_sync_updates_from_the_modified_feed_then_is_up_to_date(world):
     changed = [record("CVE-2025-0004", cpe("example", "lib", versionEndExcluding="0.8")),
                record("CVE-2025-0008", cpe("example", "lib"), status="Rejected"),
@@ -405,7 +425,7 @@ def test_candidates_are_the_unattributed_records_of_a_linked_cpe_that_cover_the_
     assert table["CVE-2025-0004"]["affects"] == {lib: {
         "cpe": "example:lib", "versions": "< 2.0", "conditional": False, "basis": "learned", "single_cve_link": False,
         "related_findings": [], "other_language_only": False, "classes_in_jar": [], "classes_not_in_jar": [],
-        "advisory_names_another_module": False}}
+        "advisory_names_another_module": False, "fixed_classes_in_jar": [], "fixed_classes_not_in_jar": False}}
     assert table["CVE-2025-0004"]["kev_date_added"] == "2025-07-01"
     assert table["CVE-2025-0007"]["affects"][lib]["conditional"] is True
     assert table["CVE-2025-0008"]["disputed"] is True and table["CVE-2025-0008"]["severity"] == "LOW"
@@ -457,7 +477,8 @@ def test_candidates_carry_what_their_records_name(family_world):
                        everything: (["UrlFileNameViewController", "CertPinner"], []), embed: (None, None)}
     assert summary["pairs"] == 14 and summary["components"]["with_link"] == 3
     assert summary["pairs_flagged"] == {"same_flaw_as_a_finding": 2, "other_language_only": 3,
-                                        "named_classes_not_in_jar": 1, "advisory_names_another_module": 0}
+                                        "named_classes_not_in_jar": 1, "advisory_names_another_module": 0,
+                                        "fixed_classes_not_in_jar": 0}
     assert summary["pairs_reached_by_name"] == 1 and summary["pairs_left_out"] == {"names_another_module": 2}
     assert summary["links_refused"] == {"version_ranges_apart": 3}
     assert "bundler:suite" not in links[core]
@@ -595,6 +616,237 @@ def test_a_vendor_advisory_reaches_the_modules_it_names_and_flags_the_others(fam
     assert summary["pairs_flagged"]["advisory_names_another_module"] == 5 and summary["pairs_left_out"] == {
         "names_another_module": 2}
     assert summary["data_as_of"]["spring"] == "2025-06-03"
+
+
+# ---- fix commits ------------------------------------------------------------------------------------------
+
+WEB = "https://github.com/acme/web"
+A, B, C, D, E = (letter * 7 for letter in "abcde")
+
+
+def diff_of(*files):
+    """A commit's diff as GitHub serves it, from (change, path before, path after) per file."""
+    lines = []
+    for change, old, new in files:
+        lines.append(f"diff --git a/{old} b/{new}")
+        if change == "added":
+            lines.append("new file mode 100644")
+        elif change == "deleted":
+            lines.append("deleted file mode 100644")
+        elif change == "renamed":
+            lines += ["similarity index 90%", f"rename from {old}", f"rename to {new}"]
+        # A changed line can begin like a file's header; only a header begins a line with it.
+        lines += [f"--- a/{old}", f"+++ b/{new}", "@@ -1,2 +1,2 @@", "-diff --git a/x/src/main/java/X.java b/y", "+ok"]
+    return ("\n".join(lines) + "\n").encode()
+
+
+def changed(*paths):
+    return diff_of(*(("modified", path, path) for path in paths))
+
+
+SOURCES = "web/src/main/java/org/acme/web"
+DIFFS = {A: diff_of(("modified", f"{SOURCES}/socks/SocksHandshakeDecoder.java", f"{SOURCES}/socks/SocksHandshakeDecoder.java"),
+                    ("added", f"{SOURCES}/socks/SocksLimits.java", f"{SOURCES}/socks/SocksLimits.java")),
+         B: changed(f"{SOURCES}/servlet/UrlFilenameViewController.java"),
+         C: changed(f"{SOURCES}/core/Server.java"),
+         E: changed("docs/index.html")}
+DIFF_ROUTES = {f"/acme/web/commit/{sha}.diff": DIFFS.get(sha) for sha in (A, B, C, D, E)}
+
+
+def cites(record_, *references):
+    """The record with these references: (url, NVD's tags)."""
+    return {**record_, "references": [{"url": url, "tags": list(tags)} for url, tags in references]}
+
+
+# The family's records, citing commits: the attributed ones only pages of acme/web, which tells that it is the
+# project's repository; the candidates its commits, tagged or not as the patch, and one of another project.
+FIX_CITED = {
+    "CVE-2024-1001": [(f"{WEB}/releases/tag/v0.5", [])],
+    "CVE-2025-1302": [(f"{WEB}/commit/{D}", ["Patch"])],
+    "CVE-2025-1303": [(f"{WEB}/commit/{E}", ["Patch"])],
+    "CVE-2025-1304": [(f"{WEB}/commit/{B}", []), ("https://github.com/bundler/suite/commit/2222222", ["Patch"])],
+    "CVE-2025-1305": [(f"{WEB}/commit/{A}", ["Patch"]), (f"{WEB}/commit/{C}#diff-1", ["Issue Tracking"])],
+}
+FIX_NVD = [cites(r, *FIX_CITED[r["id"]]) if r["id"] in FIX_CITED else r for r in FAMILY_NVD]
+
+
+@pytest.fixture
+def fix_world(tmp_path, monkeypatch):
+    monkeypatch.setattr(nvd, "FIRST_YEAR", YEAR)
+    db = LocalDb(tmp_path / "fixes")
+    transport = ScriptedTransport({"/Maven/all.zip": osv_zip(*FAMILY_OSV),
+                                   **feed_routes(f"nvdcve-2.0-{YEAR}", *FIX_NVD)})
+    db.sync(["osv-maven", "nvd"], fetcher=fetcher(transport), log=lambda m: None)
+    return LocalDb.open(tmp_path / "fixes")
+
+
+def test_a_fix_commit_is_read_for_the_main_classes_it_changes():
+    renamed = ("renamed", f"{SOURCES}/socks/Decoder.java", f"{SOURCES}/socks/FrameDecoder.java")
+    diff = diff_of(("modified", f"{SOURCES}/core/Server.java", f"{SOURCES}/core/Server.java"),
+                   ("added", f"{SOURCES}/core/Limits.java", f"{SOURCES}/core/Limits.java"),
+                   ("deleted", f"{SOURCES}/core/Gone.java", f"{SOURCES}/core/Gone.java"), renamed,
+                   ("modified", "web/src/main/jdk1.4/org/acme/web/core/Server.java",
+                    "web/src/main/jdk1.4/org/acme/web/core/Server.java"),
+                   ("modified", "web/src/test/java/org/acme/web/core/ServerTest.java",
+                    "web/src/test/java/org/acme/web/core/ServerTest.java"),
+                   ("modified", "docs/releasenotes.html", "docs/releasenotes.html"))
+    # A renamed class by its name before: the name an affected version has.
+    assert fixes.read_diff(io.BytesIO(diff)) == {
+        "main": [["added", "java", "org.acme.web.core.Limits"], ["deleted", "java", "org.acme.web.core.Gone"],
+                 ["modified", "java", "org.acme.web.core.Server"], ["modified", "jdk1.4", "org.acme.web.core.Server"],
+                 ["renamed", "java", "org.acme.web.socks.Decoder"]],
+        "java_elsewhere": 1, "other": 1}
+    assert fixes.read_diff(io.BytesIO(diff), limit=len(diff) - 1) == {"unread": "too large"}
+    assert fixes.read_diff(io.BytesIO(b"")) == {"main": [], "java_elsewhere": 0, "other": 0}
+
+
+def test_the_commits_a_record_cites_and_what_its_fix_changed():
+    references = [f"https://github.com/Acme/Web/commit/{A.upper()}#diff-1", f"{WEB}/commits/{A}",
+                  f"{WEB}/pull/7/commits/{B}", "https://github.com/advisories/GHSA-xxxx-yyyy-zzzz",
+                  f"{WEB}/commit/notasha", "https://github.com/bundler/suite/commit/2222222", f"{WEB}.git",
+                  f"https://gitlab.com/acme/web/-/commit/{C}"]
+    assert fixes.commits_cited(references) == [("acme/web", A), ("bundler/suite", "2222222")]
+    assert fixes.repositories_cited(references) == {"acme/web", "bundler/suite"}
+    read = {f"acme/web@{A}": {"main": [["modified", "java", "org.acme.web.socks.Decoder"],
+                                       ["added", "java", "org.acme.web.socks.Limits"]], "java_elsewhere": 0, "other": 1},
+            f"acme/web@{B}": {"main": [["modified", "jdk1.4", "org.acme.web.core.Server"]], "java_elsewhere": 0,
+                              "other": 0}}
+    entry = {"commits": [f"acme/web@{A}", f"acme/web@{B}", f"acme/web@{C}"],
+             "elsewhere": ["https://github.com/bundler/suite/commit/2222222"], "patch": [f"acme/web@{A}"]}
+    fix = fixes.fix_of(entry, read)
+    # The commits NVD tagged as the patch when it tagged any: another may be the one that brought the flaw in.
+    assert (fix["classes"], fix["classes_added"], fix["classes_from"]) == (
+        ["org.acme.web.socks.Decoder"], ["org.acme.web.socks.Limits"], "patch-tagged commits")
+    assert [(c["url"], c["patch_tag"], c["read"]) for c in fix["commits"]] == [
+        (f"{WEB}/commit/{A}", True, "main classes"), (f"{WEB}/commit/{B}", False, "main classes"),
+        (f"{WEB}/commit/{C}", False, "not read")]
+    assert fix["elsewhere"] == ["https://github.com/bundler/suite/commit/2222222"]
+    untagged = fixes.fix_of({**entry, "patch": []}, read)
+    assert (untagged["classes"], untagged["classes_from"], untagged["source_directories"]) == (
+        ["org.acme.web.core.Server", "org.acme.web.socks.Decoder"], "commits not tagged as the patch",
+        ["java", "jdk1.4"])
+    unknown = fixes.fix_of({**entry, "patch": None}, read)
+    assert (unknown["classes_from"], [c["patch_tag"] for c in unknown["commits"]]) == (
+        "commits, tags not known", [None, None, None])
+    assert fixes.fix_of({"commits": [], "elsewhere": [], "patch": None}, read) is None
+    # A multi-release jar's version folders and a relocated copy hold a class too; a name that only ends alike
+    # does not.
+    entries = {"META-INF/versions/11/org/acme/web/socks/Decoder.class", "shaded/org/acme/web/core/Server.class",
+               "org/acme/web/core/MyServer.class"}
+    assert fixes.held(["org.acme.web.socks.Decoder", "org.acme.web.core.Server"], entries) == [
+        "org.acme.web.socks.Decoder", "org.acme.web.core.Server"]
+    assert fixes.held(["org.acme.web.core.Server"], {"org/acme/web/core/MyServer.class"}) == []
+    assert fixes.held(["org.acme.web.core.Server"], None) is None
+
+
+def test_commit_references_are_kept_with_their_tags_and_a_copy_stored_without_is_downloaded_again(world, capsys):
+    many = {**record("CVE-2025-0099", cpe("example", "lib")),
+            "references": [{"url": f"https://example.org/{n}"} for n in range(30)]
+            + [{"url": f"{WEB}/commit/{A}", "tags": ["Patch"]}, {"url": f"{WEB}/commit/{A}"}, {"url": f"{WEB}/commit/{B}"}]}
+    stored = nvd.compact(many)
+    assert len(stored["references"]) == nvd.REFERENCES_KEPT
+    assert stored["fix_refs"] == [[f"{WEB}/commit/{A}", True], [f"{WEB}/commit/{B}", False]]
+    assert world.state["nvd"]["layout"] == nvd.LAYOUT
+    del world.state["nvd"]["layout"]
+    world._write_state()
+    assert main(["db", "status", "--db-dir", str(world.directory)]) == 0
+    assert "the next sync downloads it again (about 235 MB)" in capsys.readouterr().out
+    logged = []
+    transport = ScriptedTransport(feed_routes(f"nvdcve-2.0-{YEAR}", *NVD_RECORDS))
+    assert world.sync(["nvd"], fetcher=fetcher(transport), log=logged.append) == {
+        "nvd": f"downloaded {len(NVD_RECORDS) - 3} records with a CPE"}
+    assert any("earlier version" in line for line in logged) and world.state["nvd"]["layout"] == nvd.LAYOUT
+
+
+def test_fix_commits_sync_from_github_and_go_on_where_they_stopped(fix_world, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(localdb, "FIX_WORKERS", 1)
+    limited = [2]
+
+    def limited_twice(method, url, body):
+        if limited[0]:
+            limited[0] -= 1
+            return 429, b""
+        return DIFFS[A]
+    slept = []
+    first = ScriptedTransport({**DIFF_ROUTES, f"/acme/web/commit/{A}.diff": limited_twice,
+                               f"/acme/web/commit/{C}.diff": (503, b"")})
+    assert fix_world.sync(["fixes"], fetcher=localdb.Fetcher(opener=opener(first), sleep=slept.append),
+                          log=lambda m: None) == {
+        "fixes": "fetched 4 commits; 4 of the 5 cited by 4 records held; 1 not fetched (downloads failed): "
+                 "sync fixes again later"}
+    # GitHub's 429 passes: it is waited out, as a server error is, rather than ending the sync.
+    assert slept == [2, 4, 2, 4, 8, 16]
+    assert all(url.startswith("https://github.com/acme/web/commit/") for _, url, _ in first.calls)
+    assert fix_world.state["fixes"]["commits_not_read"] == 1
+    assert main(["db", "status", "--db-dir", str(fix_world.directory)]) == 0
+    assert "4 commits read; 1 not fetched yet: sync fixes again" in capsys.readouterr().out
+    assert [c["read"] for c in fix_world.fix_of("CVE-2025-1305")["commits"]] == ["main classes", "not read"]
+    assert [c["read"] for c in fix_world.fix_of("CVE-2025-1302")["commits"]] == ["not found"]
+    # What was fetched stays, also when the sync was cut short before it was recorded: only the rest is asked.
+    del fix_world.state["fixes"]
+    fix_world._write_state()
+    rest = ScriptedTransport(DIFF_ROUTES)
+    assert fix_world.sync(["fixes"], fetcher=fetcher(rest), log=lambda m: None) == {
+        "fixes": "fetched 1 commit; 5 of the 5 cited by 4 records held"}
+    assert [url.rsplit("/", 1)[1] for _, url, _ in rest.calls] == [f"{C}.diff"]
+    again = ScriptedTransport(DIFF_ROUTES)
+    assert fix_world.sync(["fixes"], fetcher=fetcher(again), log=lambda m: None) == {
+        "fixes": "up to date: 5 commits cited by 4 records"}
+    assert again.calls == []
+    # When GitHub keeps refusing, the sync stops asking, and is not a failure: the next one goes on.
+    fix_world.remove(["fixes"])
+    monkeypatch.setattr(localdb, "FIX_FAILURES_TO_STOP", 2)
+    refused = ScriptedTransport({"github.com": (429, b"")})
+    assert fix_world.sync(["fixes"], fetcher=fetcher(refused), log=lambda m: None) == {
+        "fixes": "fetched 0 commits; 0 of the 5 cited by 4 records held; 5 not fetched (GitHub stopped answering): "
+                 "sync fixes again later"}
+    assert len(refused.calls) == 2 * localdb.Fetcher.retries
+    assert LocalDb(tmp_path / "none").sync(["fixes"], fetcher=fetcher(refused), log=lambda m: None) == {
+        "fixes": "failed: fixes are read from the NVD records of Maven packages: install nvd and osv-maven first "
+                 "(binwitness db sync nvd osv-maven fixes)"}
+
+
+FIX_LISTINGS = Listings({**FAMILY_LISTINGS.entries, "org.acme.web.embed:web-embed": {
+    "META-INF/versions/11/org/acme/web/socks/SocksHandshakeDecoder.class"}})
+
+
+def test_a_fix_that_changed_classes_the_jar_lacks_flags_the_pair(fix_world):
+    def attached():
+        return nvd.attach(fix_world, FAMILY_ITEMS, FAMILY_FINDINGS, {}, {"maven": "osv-maven"}, None, FIX_LISTINGS)
+    before, _, _ = attached()
+    fix_world.sync(["fixes"], fetcher=fetcher(ScriptedTransport(DIFF_ROUTES)), log=lambda m: None)
+    table, _, summary = attached()
+    core, everything, embed, _ = (i["purl"] for i in FAMILY_ITEMS)
+    # Nothing is left out for it.
+    assert {(c, ref) for c, x in table.items() for ref in x["affects"]} == \
+        {(c, ref) for c, x in before.items() for ref in x["affects"]}
+
+    def pairs(ident):
+        return {ref: (a["fixed_classes_in_jar"], a["fixed_classes_not_in_jar"]) for ref, a in table[ident]["affects"].items()}
+    decoder = "org.acme.web.socks.SocksHandshakeDecoder"
+    # The patch-tagged commit's classes, not those of the other commit cited (web-core holds Server).
+    socks = table["CVE-2025-1305"]
+    assert (socks["fixed_classes"], socks["classes_added_by_fix"], socks["fixed_classes_from"]) == (
+        [decoder], ["org.acme.web.socks.SocksLimits"], "patch-tagged commits")
+    assert pairs("CVE-2025-1305") == {core: ([], True), everything: ([decoder], False), embed: ([decoder], False)}
+    servlet = table["CVE-2025-1304"]
+    assert (servlet["fixed_classes_from"], servlet["fix_commits_elsewhere"]) == (
+        "commits not tagged as the patch", ["https://github.com/bundler/suite/commit/2222222"])
+    viewer = "org.acme.web.servlet.UrlFilenameViewController"
+    assert pairs("CVE-2025-1304") == {core: ([], True), everything: ([viewer], False), embed: ([], True)}
+    # A commit not found, or one that changes no main code, says nothing of the jar.
+    for ident in ("CVE-2025-1302", "CVE-2025-1303"):
+        assert table[ident]["fixed_classes"] == [] and not any(a["fixed_classes_not_in_jar"]
+                                                               for a in table[ident]["affects"].values())
+    assert [c["read"] for c in table["CVE-2025-1303"]["fix_commits"]] == ["no main-code class"]
+    assert table["CVE-2025-1301"]["fix_commits"] == [] and table["CVE-2025-1301"]["fixed_classes_from"] is None
+    assert summary["pairs_flagged"]["fixed_classes_not_in_jar"] == 3
+    assert summary["fix_commits"] == {
+        "candidates_citing_a_commit": 4, "candidates_with_fixed_classes": 2,
+        "commits": {"main classes": 3, "no main-code class": 1, "not found": 1}, "commits_elsewhere": 1,
+        "candidates_by_classes_from": {"commits not tagged as the patch": 1, "patch-tagged commits": 1},
+        "pairs_flagged_by_classes_from": {"commits not tagged as the patch": 2, "patch-tagged commits": 1}}
+    assert summary["data_as_of"]["fixes"] == fix_world.data_as_of("nvd")
 
 
 # ---- scans, files, MCP ------------------------------------------------------------------------------------
@@ -769,3 +1021,46 @@ def test_a_vendor_advisory_reaches_the_files_and_the_mcp_tools(tmp_path, deliver
         ("web-all@1.0", "learned", ["advisory_names_another_module"]),
         ("web-core@1.0", "learned", ["same_flaw_as_a_finding", "advisory_names_another_module"])]
     assert detail["candidate"]["advisory_modules"] == ["org.acme.web:web-socks"]
+
+
+def test_fix_classes_reach_the_files_and_the_mcp_tools(tmp_path, delivery, world, fix_world):  # noqa: F811
+    fix_world.sync(["fixes"], fetcher=fetcher(ScriptedTransport(DIFF_ROUTES)), log=lambda m: None)
+    result = online_scan(tmp_path, delivery, world)
+    table, links, summary = nvd.attach(fix_world, FAMILY_ITEMS, FAMILY_FINDINGS, {}, {"maven": "osv-maven"}, None,
+                                       FAMILY_LISTINGS)
+    result["candidates"], result["candidate_links"], result["summary"]["candidates"] = table, links, summary
+    out = tmp_path / "out"
+    write_all(result, out)
+    rows = {(r["id"], r["component"].split("/")[-1]): r
+            for r in csv.DictReader((out / "candidates.csv").open(encoding="utf-8-sig"))}
+    decoder = "org.acme.web.socks.SocksHandshakeDecoder"
+    core = rows[("CVE-2025-1305", "web-core@1.0")]
+    assert (core["classes the fix changed"], core["of them in this jar"], core["none of the fix's classes in this jar"],
+            core["fix commits"]) == (decoder, "", "yes", f"{WEB}/commit/{A} {WEB}/commit/{C}")
+    assert (rows[("CVE-2025-1305", "web-all@1.0")]["of them in this jar"],
+            rows[("CVE-2025-1305", "web-all@1.0")]["none of the fix's classes in this jar"]) == (decoder, "")
+    assert rows[("CVE-2025-1305", "web-embed@1.0")]["of them in this jar"] == "jar contents unknown"
+    assert rows[("CVE-2025-1301", "web-socks@1.0")]["of them in this jar"] == ""
+    text = render_summary(result)
+    assert "none of the classes its fix changed in the jar 2;" in text
+    assert ("fixes: 2 of the 4 candidates citing a GitHub commit have the classes it changed; commits read 3, without "
+            "main-code classes 1, not found 1, 1 of other projects not used") in text
+    service = Service(Config(results=tmp_path / "results", lookup="local"),
+                      net=Net(cache_dir=tmp_path / "c", offline=True, transport=ScriptedTransport({"": never})))
+    detail = service.get_candidate(service.open_result(str(out))["scan_id"], "CVE-2025-1305")
+    flags = {a["component"].split("/")[-1]: a["flags"] for a in detail["affects"]}
+    assert flags["web-core@1.0"] == ["same_flaw_as_a_finding", "fixed_classes_not_in_jar"]
+    assert flags["web-all@1.0"] == [] and flags["web-embed@1.0"] == []
+    assert detail["candidate"]["fixed_classes"] == [decoder]
+    assert any("fixed_classes_not_in_jar" in line for line in detail["judging"])
+    # A result written before fixes were read opens as before.
+    for entry in table.values():
+        for key in ("fix_commits", "fix_commits_elsewhere", "fixed_classes", "classes_added_by_fix",
+                    "fix_source_directories", "fixed_classes_from"):
+            del entry[key]
+        for affected in entry["affects"].values():
+            del affected["fixed_classes_in_jar"], affected["fixed_classes_not_in_jar"]
+    del summary["pairs_flagged"]["fixed_classes_not_in_jar"], summary["fix_commits"]
+    write_all(result, tmp_path / "old")
+    old = list(csv.DictReader((tmp_path / "old" / "candidates.csv").open(encoding="utf-8-sig")))
+    assert {r["classes the fix changed"] for r in old} == {""} and "fixes:" not in render_summary(result)

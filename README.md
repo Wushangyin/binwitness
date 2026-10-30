@@ -250,7 +250,7 @@ that cannot be placed is ignored. A module that the package's own name begins wi
 (`bc-fips`, the provider of the FIPS edition, for `bcprov`), so a near miss keeps a pair rather than
 drops it. An artifactId named without a build (`camel-http`) takes nothing out: such a record often names
 the path a flaw is reached through, while the flaw lives in a shared module. The summary counts the pairs
-left out. Four more things are flagged, never acted on:
+left out. Five more things are flagged, never acted on:
 
 - same flaw as a finding: the record cites a CVE of one of the component's findings, or that finding's
   record cites the candidate (a copy of a flaw in another product gets a CVE of its own);
@@ -267,7 +267,16 @@ left out. Four more things are flagged, never acted on:
   if the record named them, but no pair is left out for it: a vendor may name the module a feature is used
   through rather than the shared one the fix changed (the fix of CVE-2025-41232 changed only
   `spring-security-core`; the advisory names `spring-security-aspects`). Of the Spring advisories that
-  name modules and that OSV attributes too, 23 of 137 name none of the packages OSV does (October 2026).
+  name modules and that OSV attributes too, 23 of 137 name none of the packages OSV does (October 2026);
+- none of the classes its fix changed in this jar: with the `fixes` dataset installed, the GitHub commits
+  the record cites in the project's own repository are read for the main-code classes they modified,
+  deleted or renamed (by their names before the fix; from the commits NVD tagged as the patch when it
+  tagged any), and the jar holds none of them. Multi-release and relocated copies count. Classes the fix
+  added are listed apart and not looked for, since an affected version lacks them. A jar that holds some
+  of the classes is not flagged: a fix often changes a class every module shares as well. A class can
+  also be missing because it had another name in an older version, and a commit cited as the fix is not
+  always the fix itself. In the candidates of the delivery below, 39 of 467 pairs were flagged and
+  none of them had been judged real or plausible on review.
 
 Candidates are leads for manual review. A CPE names a product, and a product can be wider than the
 component: one CPE may stand for every module of a framework, as with netty above, or for a vendor's
@@ -279,7 +288,8 @@ CPE out of those with any CPE, the CPE's attributed CVEs of the same project out
 ones, the same as the first for the whole project, and on how many of the CVEs it was learned from that
 give versions on both sides the versions meet. The next column lists the CVEs the link was learned from.
 Further columns say how the pair was reached (a learned link, named in the record, or named in the
-vendor's advisory), list the modules the vendor's advisory names, and give the flags.
+vendor's advisory), list the modules the vendor's advisory names and the classes the fix changed (with
+those the jar holds, and the commits they were read from), and give the flags.
 
 Candidates are also where a new CVE shows up first. A CVE is often published with a CPE weeks or months
 before an advisory names its package. In the candidates of one delivery of about 1,100 jars, scanned in
@@ -287,11 +297,11 @@ late October 2026, 37 records were judged real or plausible on review for at lea
 them were published from June 2026 on, and 36 had only an unreviewed GitHub advisory.
 
 Candidates come from local copies only, in every lookup mode: the `nvd` dataset and the OSV dataset of
-each ecosystem (`binwitness db sync nvd vulns`), and the `spring` advisories when installed. An online
-scan takes its findings from the online services and its candidates from these copies. Their dates are
-given in the summary and in every row of `candidates.csv`. Without the copies, the summary says
-candidates were not checked, never that there are none. NVD records still awaiting analysis have no
-CPE yet; the summary counts them by status.
+each ecosystem (`binwitness db sync nvd vulns`), and the `spring` advisories and `fixes` when installed.
+An online scan takes its findings from the online services and its candidates from these copies. Their
+dates are given in the summary and in every row of `candidates.csv`. Without the copies, the summary says
+candidates were not checked, never that there are none. NVD records still awaiting analysis have no CPE
+yet; the summary counts them by status.
 
 ### Upgrade advice
 
@@ -368,9 +378,10 @@ binwitness db remove osv-npm
 | `maven-hashes` | SHA-1 of every jar on Maven Central ([Trivy java-db](https://github.com/aquasecurity/trivy-java-db), then the additions to Central's own index) | 1 GB download, 1.5 GB on disk; then 10-50 MB every week or two |
 | `nvd` | NVD CVE records that name an application (CPE), for [candidates](#nvd-candidates) | 235 MB download, 225 MB on disk; then 15 MB a day |
 | `spring` | The Spring projects' security advisories ([spring.io](https://spring.io/security)), for the modules each names, for [candidates](#nvd-candidates) | 260 kB download, 50 kB on disk |
+| `fixes` | The classes changed by the GitHub commits that NVD records cite as their fix, for [candidates](#nvd-candidates); needs `nvd` and `osv-maven` | about 170 commits from github.com: 3 MB download, 0.2 MB on disk |
 
 Groups: `vulns` (both OSV datasets and `kev`), `java` (`osv-maven`, `kev`, `maven-hashes`), `all` (these,
-`nvd` and `spring`).
+`nvd`, `spring` and `fixes`).
 Datasets live in `~/.cache/binwitness/datasets` (`--db-dir`, or `$BINWITNESS_DB`).
 
 Updates are incremental where the publisher allows it. OSV keeps a list of records by modification time,
@@ -378,12 +389,17 @@ so an update fetches only the records changed since the previous one. If more th
 changed, or the last full download is a month old, the archive is downloaded again instead; that also
 drops records deleted upstream. The KEV catalog and the Spring advisories are small and fetched whole;
 spring.io amends advisories without dating the change, so the Spring copy is replaced whenever its
-content differs.
+content differs. A commit does not change once made, so each one is fetched once; a later sync fetches
+only the commits cited by records new since. GitHub limits what one address may fetch: the commits are
+read a few at a time, and when GitHub stops answering, the sync keeps what it has and the next one goes
+on from there.
 
 NVD publishes one feed per year and a feed of the records modified in the last eight days. The first sync
 reads every yearly feed; later ones read only the modified feed, as long as the copy is less than seven
 days old, and skip it when its digest has not changed. An older copy is built again from the yearly
-feeds. Each feed is checked against the SHA-256 that NVD publishes next to it.
+feeds. Each feed is checked against the SHA-256 that NVD publishes next to it. A copy stored by version
+0.4.3 or earlier lacks the tags NVD gives the fix commits, and is downloaded again in full at the next
+sync (about 235 MB); the copy held stays in use until that is done, and without a connection.
 
 The hash index starts from Trivy's java-db, which is rebuilt every day as one 1 GB file with no incremental
 form. After that, each sync applies the additions that Maven Central publishes to its own index every week
@@ -430,7 +446,8 @@ last synced more than seven days ago produces a warning.
 Each dataset is downloaded by your machine directly from its publisher, under the publisher's terms: OSV
 from Google's public bucket (each record carries the license of the database it comes from), the hash
 index from Aqua Security's `trivy-java-db` image on ghcr.io and from Maven Central's index, the KEV catalog
-from CISA, the CVE records from NVD's data feeds, the Spring advisories from spring.io. binwitness uses
+from CISA, the CVE records from NVD's data feeds, the Spring advisories from spring.io, the fix commits
+from github.com. binwitness uses
 NVD data but is not endorsed or certified by the NVD.
 
 ## Cross-checking another scanner
@@ -567,6 +584,7 @@ scan a machine with no internet access, copy the dataset directory and, optional
 | [Maven Central index](https://repo1.maven.org/maven2/.index/) | `db sync`: weekly additions to the hash index |
 | [NVD data feeds](https://nvd.nist.gov/vuln/data-feeds) | `db sync` of the `nvd` dataset |
 | [Spring security advisories](https://spring.io/security) | `db sync` of the `spring` dataset |
+| [GitHub commits](https://github.com) | `db sync` of the `fixes` dataset: the diff of each commit an NVD candidate's record cites |
 | [GitHub advisories](https://github.com/advisories) | `crosscheck` only |
 
 ## Limitations

@@ -44,7 +44,7 @@ except ImportError:  # Windows
     fcntl = None
     import msvcrt
 
-from binwitness import nvd
+from binwitness import fixes, nvd
 from binwitness.net import RETRY_STATUSES, USER_AGENT, default_cache_dir, map_parallel, open_url
 from binwitness.vulns import KEV, OSV_ECOSYSTEM
 
@@ -75,6 +75,13 @@ CENTRAL_CHECK_DAYS = 7
 CSV_CHUNK = 64 * 1024
 # NVD's modified feed holds the changes of the last eight days; a day is kept spare.
 NVD_MODIFIED_DAYS = 7
+# NVD serves a connection at a small part of a line's speed (about 100 kB/s seen, as much again for each further
+# connection): a full download fetches its yearly feeds a few at a time.
+NVD_WORKERS = 4
+# GitHub serves a commit's diff to anyone, within limits per address: a few at a time, and stop when it refuses.
+FIX_WORKERS = 4
+FIX_BATCH = 40
+FIX_FAILURES_TO_STOP = 8
 # The data behind spring.io/security: every advisory of the Spring projects, in one file.
 SPRING_ADVISORIES = "https://spring.io/page-data/security/page-data.json"
 MONTHS = {month: number for number, month in enumerate(
@@ -102,6 +109,9 @@ DATASETS = {
                    "235 MB download, then 15 MB a day", "nvd.sqlite"),
     "spring": Dataset("Spring security advisories (spring.io), for the modules each names, for candidates",
                       "260 kB download, 50 kB on disk", "spring.json"),
+    # Last: it is read from the NVD records of the packages OSV knows.
+    "fixes": Dataset("Files changed by the GitHub commits NVD records cite as their fix, for candidates",
+                     "about 170 commits from github.com, 3 MB download; then those of new records", "fixes.json"),
 }
 GROUPS = {"vulns": ("osv-maven", "osv-npm", "kev"), "java": ("osv-maven", "kev", "maven-hashes"),
           "all": tuple(DATASETS)}
@@ -288,6 +298,7 @@ class LocalDb:
         self._connections: dict[str, sqlite3.Connection] = {}
         self._kev: dict[str, str] | None = None
         self._advisories: dict[str, dict] | None = None
+        self._fixes: dict | None = None
         self.used: set[str] = set()
         self.state = self._read_state()
 
@@ -444,6 +455,17 @@ class LocalDb:
         entry = self._advisories.get(cve)
         return list(entry["modules"]) if entry else None
 
+    def fix_of(self, cve: str) -> dict | None:
+        """What the GitHub commits a record cites as its fix changed (see ``fixes.fix_of``); None when the dataset
+        is not installed or the record cites no commit of its project."""
+        if not self.has("fixes"):
+            return None
+        with self._lock:
+            if self._fixes is None:
+                self._fixes = json.loads(self.path("fixes").read_text("utf-8"))
+            self.used.add("fixes")
+        return fixes.fix_of(self._fixes["records"].get(cve), self._fixes["commits"])
+
     def provenance(self) -> dict:
         return {n: {"data_as_of": self.state[n].get("data_as_of"), "synced": self.state[n].get("synced")}
                 for n in sorted(self.used)}
@@ -477,7 +499,10 @@ class LocalDb:
                          "download": dataset.size,
                          **({key: entry.get(key) for key in ("base_as_of", "chunk", "checked", "recent_records")}
                             if name == "maven-hashes" else {}),
-                         **({"without_cpe": entry.get("without_cpe")} if name == "nvd" else {})})
+                         **({"without_cpe": entry.get("without_cpe"),
+                             "layout_current": entry.get("layout") == nvd.LAYOUT} if name == "nvd" else {}),
+                         **({key: entry.get(key) for key in ("commits", "commits_not_read")}
+                            if name == "fixes" else {})})
         return rows
 
     def _files(self, name: str) -> list[Path]:
@@ -512,6 +537,8 @@ class LocalDb:
                     entry, outcome = self._sync_nvd(full, fetcher, log)
                 elif name == "spring":
                     entry, outcome = self._sync_spring(fetcher)
+                elif name == "fixes":
+                    entry, outcome = self._sync_fixes(fetcher, log)
                 else:
                     entry, outcome = self._sync_maven_hashes(full, hashes_every, fetcher, log)
             except (SyncError, OSError, ValueError, KeyError, sqlite3.Error, zipfile.BadZipFile,
@@ -733,19 +760,137 @@ class LocalDb:
         named = sum(1 for a in advisories.values() if a["modules"])
         return entry, f"downloaded {len(advisories)} advisories, {named} of them naming modules"
 
+    # ---- fix commits ----------------------------------------------------------------------------------
+
+    def _sync_fixes(self, fetcher, log):
+        if not (self.has("nvd") and self.has("osv-maven")):
+            raise SyncError("fixes are read from the NVD records of Maven packages: install nvd and osv-maven first "
+                            "(binwitness db sync nvd osv-maven fixes)")
+        records = self._fix_records()
+        cited = {key for entry in records.values() for key in entry["commits"]}
+        # A commit does not change once made: what was read stays, also from a sync that was interrupted, and only
+        # commits not read before are fetched.
+        try:
+            held = json.loads(self.path("fixes").read_text("utf-8")).get("commits") or {}
+        except (OSError, ValueError):
+            held = {}
+        commits = {key: value for key, value in held.items() if key in cited}
+        wanted = sorted(cited - commits.keys())
+        failures, lock = [0], threading.Lock()
+
+        def read(key):
+            # GitHub limits what one address may fetch; once it keeps refusing, asking on only waits out each retry.
+            if failures[0] >= FIX_FAILURES_TO_STOP:
+                return None
+            answer = self._read_fix(fetcher, key)
+            with lock:
+                failures[0] = failures[0] + 1 if answer is None else 0
+            return answer
+        for start in range(0, len(wanted), FIX_BATCH):
+            batch = wanted[start:start + FIX_BATCH]
+            commits.update((k, v) for k, v in zip(batch, map_parallel(read, batch, FIX_WORKERS)) if v is not None)
+            self._write_fixes(records, commits)
+            log(f"fixes: {min(start + FIX_BATCH, len(wanted))} of {len(wanted)} commits fetched")
+        self._write_fixes(records, commits)
+        pending = len(cited - commits.keys())
+        entry = {"data_as_of": self.state["nvd"].get("data_as_of", ""), "records": len(records),
+                 "commits": len(commits), "commits_not_read": pending}
+        if not wanted:
+            return entry, f"up to date: {len(commits)} commits cited by {len(records)} records"
+        fetched = len(wanted) - pending
+        outcome = f"fetched {fetched} commit{'' if fetched == 1 else 's'}; {len(commits)} of the {len(cited)} cited " \
+                  f"by {len(records)} records held"
+        if pending:
+            outcome += (f"; {pending} not fetched ("
+                        + ("GitHub stopped answering" if failures[0] >= FIX_FAILURES_TO_STOP else "downloads failed")
+                        + "): sync fixes again later")
+        return entry, outcome
+
+    def _read_fix(self, fetcher, key: str) -> dict | None:
+        """A commit as ``fixes.read_diff`` reads it; ``{"unread": "not found"}`` when GitHub has no such commit,
+        None when it could not be fetched now."""
+        url = fixes.commit_url(key) + ".diff"
+
+        def attempt():
+            status, _, stream = fetcher.opener(url, {"Accept": "text/plain"})
+            with closing(stream):
+                if status != 200:
+                    return status, None
+                return 200, fixes.read_diff(iter(lambda: stream.readline(1 << 16), b""))
+        # Not fetcher.read: a 429 there means a quota for the day, while GitHub's passes in a minute or two.
+        try:
+            status, answer = fetcher._retry(url, attempt)
+        except SyncError:
+            return None
+        if status in (404, 410, 422):
+            return {"unread": "not found"}
+        return answer if status == 200 else None
+
+    def _fix_records(self) -> dict[str, dict]:
+        """Record id -> the commits it cites, for the records that can become candidates of a Maven package: not
+        attributed by OSV, with a CPE that some CVE OSV does attribute carries. Only commits in a repository those
+        attributed CVEs refer to are read; the others are kept apart, since a record may cite the fix of another
+        product (one that bundles the library)."""
+        attributed = {c for (c,) in self._rows("osv-maven", "SELECT DISTINCT cve FROM cves", ())}
+        cpes_of: dict[str, set[str]] = {}
+        for ident, vendor, product in self._rows("nvd", "SELECT id, vendor, product FROM cpes", ()):
+            cpes_of.setdefault(ident, set()).add(f"{vendor}:{product}")
+        repositories: dict[str, set[str]] = {}
+        for ident in sorted(attributed & cpes_of.keys()):
+            record = self.nvd_record(ident) or {}
+            cited = fixes.repositories_cited([*record.get("references", []),
+                                              *(url for url, _ in record.get("fix_refs") or [])])
+            for cpe in cpes_of[ident]:
+                repositories.setdefault(cpe, set()).update(cited)
+        out = {}
+        for ident, cpes in sorted(cpes_of.items()):
+            linked = [repositories[cpe] for cpe in sorted(cpes) if cpe in repositories]
+            if ident in attributed or not linked:
+                continue
+            record = self.nvd_record(ident) or {}
+            # Records stored before 0.4.4 keep the first references only, and not the tags NVD gave them.
+            refs = record.get("fix_refs")
+            cited = fixes.commits_cited([url for url, _ in refs] if refs is not None else record.get("references", []))
+            if not cited:
+                continue
+            known = set().union(*linked)
+            entry = {"commits": [f"{r}@{s}" for r, s in cited if r in known],
+                     "elsewhere": [fixes.commit_url(f"{r}@{s}") for r, s in cited if r not in known], "patch": None}
+            if refs is not None:
+                tagged = {f"{r}@{s}" for r, s in fixes.commits_cited([url for url, patch in refs if patch])}
+                entry["patch"] = [key for key in entry["commits"] if key in tagged]
+            out[ident] = entry
+        return out
+
+    def _write_fixes(self, records: dict, commits: dict):
+        temporary = self.path("fixes").with_name("fixes.json.tmp")
+        temporary.write_text(json.dumps({"records": records, "commits": commits}, sort_keys=True), "utf-8")
+        os.replace(temporary, self.path("fixes"))
+        with self._lock:
+            self._fixes = None
+
     # ---- NVD ------------------------------------------------------------------------------------------
 
     def _sync_nvd(self, full, fetcher, log):
         entry = self.state.get("nvd", {}) if self.has("nvd") else {}
-        if not full and entry and time.time() - _epoch(entry["data_as_of"]) < NVD_MODIFIED_DAYS * 86400:
+        current = entry.get("layout") == nvd.LAYOUT
+        if not full and entry and current and time.time() - _epoch(entry["data_as_of"]) < NVD_MODIFIED_DAYS * 86400:
             return self._nvd_update(entry, fetcher, log)
+        if entry and not current:
+            log("nvd: stored by an earlier version without the fix commits' tags; downloading it again (about "
+                "235 MB). The copy held stays in use until it is done, and is kept if the download fails")
         building = self.path("nvd").with_name(self.path("nvd").name + ".building")
         building.unlink(missing_ok=True)
         newest, stored = "", 0
+        names = [f"nvdcve-2.0-{year}" for year in range(nvd.FIRST_YEAR, datetime.now(timezone.utc).year + 1)]
+        scratch = self._scratch()
+        # Newest first: the recent years are the largest, and started last one of them would finish alone.
+        map_parallel(lambda name: fetcher.download(f"{nvd.NVD_FEEDS}/{name}.json.gz", scratch / f"{name}.json.gz",
+                                                   progress=self._progress(log, name)), names[::-1], NVD_WORKERS)
         with closing(sqlite3.connect(building)) as connection:
             connection.executescript(nvd.SCHEMA)
-            for year in range(nvd.FIRST_YEAR, datetime.now(timezone.utc).year + 1):
-                (feed_newest, feed_stored, _), _ = self._nvd_feed(connection, f"nvdcve-2.0-{year}", fetcher, log)
+            for name in names:
+                (feed_newest, feed_stored, _), _ = self._nvd_feed(connection, name, fetcher, log, fetched=True)
                 newest, stored = max(newest, feed_newest), stored + feed_stored
             # Built after the bulk insert, as for OSV.
             connection.execute("CREATE INDEX cpes_product ON cpes(vendor, product)")
@@ -754,7 +899,8 @@ class LocalDb:
             entry = self._nvd_entry(connection, newest)
         self.close()
         os.replace(building, self.path("nvd"))
-        return {**entry, "full_download": _now(), "modified_sha256": None}, f"downloaded {stored} records with a CPE"
+        return ({**entry, "full_download": _now(), "modified_sha256": None, "layout": nvd.LAYOUT},
+                f"downloaded {stored} records with a CPE")
 
     def _nvd_update(self, entry, fetcher, log):
         meta = self._nvd_meta("nvdcve-2.0-modified", fetcher)
@@ -783,14 +929,16 @@ class LocalDb:
         fields = dict(line.partition(":")[::2] for line in body.decode("utf-8").splitlines() if ":" in line)
         return {k.strip(): v.strip() for k, v in fields.items()}
 
-    def _nvd_feed(self, connection, name, fetcher, log, meta=None, replace=False):
+    def _nvd_feed(self, connection, name, fetcher, log, meta=None, replace=False, fetched=False):
         """Load one feed: ((newest modification, records stored, records dropped first), its .meta). The feed
         is checked against the digest in the .meta while it is read. One that does not match (left by an
-        earlier attempt, or regenerated in between) is downloaded once more."""
+        earlier attempt, or regenerated in between) is downloaded once more. ``fetched``: it was just
+        downloaded."""
         target = self._scratch() / f"{name}.json.gz"
         for attempt in (1, 2):
             meta = meta or self._nvd_meta(name, fetcher)
-            fetcher.download(f"{nvd.NVD_FEEDS}/{name}.json.gz", target, progress=self._progress(log, name))
+            if not (fetched and attempt == 1):
+                fetcher.download(f"{nvd.NVD_FEEDS}/{name}.json.gz", target, progress=self._progress(log, name))
             loaded, digest = _nvd_load(connection, target, replace)
             if not meta.get("sha256") or digest.upper() == meta["sha256"].upper():
                 connection.commit()
