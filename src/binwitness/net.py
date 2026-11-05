@@ -152,6 +152,9 @@ def default_cache_dir() -> Path:
     return Path(base) / "binwitness"
 
 
+STORE_ATTEMPTS = 5
+
+
 @dataclass
 class Net:
     cache_dir: Path = field(default_factory=default_cache_dir)
@@ -265,7 +268,16 @@ class Net:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
         temporary.write_text(json.dumps(record), "utf-8")
-        os.replace(temporary, path)
+        # Windows refuses to replace a file that is open, as when two jars ask the same URL at once and one reads
+        # the answer the other is storing. The answer is in hand either way: try a few times, then leave the
+        # cache as it is.
+        for attempt in range(STORE_ATTEMPTS):
+            try:
+                os.replace(temporary, path)
+                return
+            except PermissionError:
+                self.sleep(0.01 * (attempt + 1))
+        temporary.unlink(missing_ok=True)
 
     def _note(self, url: str, epoch: float):
         host = urllib.parse.urlsplit(url).hostname or url

@@ -90,3 +90,30 @@ def test_requests_go_through_the_bounded_lookup():
         assert ("localhost", port) in net._addresses
     finally:
         server.shutdown()
+
+
+def answering(method, url, body, headers):
+    return 200, b"answer", {}
+
+
+def test_an_answer_whose_cache_file_cannot_be_replaced_is_still_returned_and_stored_once_it_can(tmp_path, monkeypatch):
+    refusals, replace = [2], net.os.replace
+
+    def refusing(source, target):
+        if refusals[0]:
+            refusals[0] -= 1
+            raise PermissionError(13, "Access is denied")
+        replace(source, target)
+    monkeypatch.setattr(net.os, "replace", refusing)
+    fetcher = net.Net(cache_dir=tmp_path, transport=answering, sleep=lambda s: None)
+    assert fetcher.get("https://repo.example/a.sha1", stable=True) == b"answer"
+    assert [path.suffix for path in tmp_path.rglob("*.*")] == [".json"]
+
+
+def test_an_answer_whose_cache_file_is_never_replaced_is_returned_and_leaves_no_temporary(tmp_path, monkeypatch):
+    def refusing(source, target):
+        raise PermissionError(13, "Access is denied")
+    monkeypatch.setattr(net.os, "replace", refusing)
+    fetcher = net.Net(cache_dir=tmp_path, transport=answering, sleep=lambda s: None)
+    assert fetcher.get("https://repo.example/a.sha1", stable=True) == b"answer"
+    assert not [path for path in tmp_path.rglob("*") if path.is_file()]

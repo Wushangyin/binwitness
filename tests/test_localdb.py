@@ -529,7 +529,7 @@ def test_second_fetches_fetch_no_more_than_a_piece_twice_in_all(tmp_path, quick_
     data = bytes(range(256)) * 20
     server = RangeServer(data)
     release, moved = threading.Event(), {2: threading.Event(), 3: threading.Event()}
-    seconds = []
+    seconds, asked = [], []
 
     def opener(url, headers):
         status, answer, stream = server(url, headers)
@@ -545,6 +545,7 @@ def test_second_fetches_fetch_no_more_than_a_piece_twice_in_all(tmp_path, quick_
             deadline = time.monotonic() + 10
             while (tmp_path / f"file.{k + 1}-of-4").stat().st_size < 1000 and time.monotonic() < deadline:
                 time.sleep(0.005)
+        asked.append(span)
         seconds.append(Held(stream.read(), (0, own_fetch_gets_900_more)))
         return status, answer, seconds[-1]
 
@@ -561,8 +562,10 @@ def test_second_fetches_fetch_no_more_than_a_piece_twice_in_all(tmp_path, quick_
     threading.Thread(target=let_go_once_another_would_have_started, daemon=True).start()
     Fetcher(opener=opener, sleep=lambda s: None).download("https://x/f", tmp_path / "file", connections=4)
     assert (tmp_path / "file").read_bytes() == data
-    # 900 bytes of the first were fetched twice: the other's 1180 left would make more than a piece.
-    assert len(seconds) == 1
+    # 900 bytes of the first were fetched twice: the other's 1180 left would make more than a piece. Once let go,
+    # the other may be fetched again for what it has left by then (280 bytes), which keeps within a piece.
+    lengths = [int(end) - int(start) + 1 for start, end in (span[len("bytes="):].split("-") for span in asked)]
+    assert lengths[0] == 1180 and all(900 + length <= 1280 for length in lengths[1:])
 
 
 def test_a_sync_stopped_during_a_second_fetch_resumes_the_piece_from_its_own_file(tmp_path, quick_seconds):
