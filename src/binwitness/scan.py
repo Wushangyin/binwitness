@@ -187,7 +187,11 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None, cand
             failure = None
         if hit:
             method = f"file SHA-1 matches the published artifact ({hit['source']})"
-            if hit.get("named_by"):
+            if hit.get("named_by") == "packages":
+                method = (f"file SHA-1 matches {':'.join(hit['alternatives'][0])} in the Maven Central index "
+                          f"(local copy), a one-off republication; the groupId is the one the jar's packages are "
+                          f"in, which published earlier versions and has no file under this one")
+            elif hit.get("named_by"):
                 method = (f"file SHA-1 matches {':'.join(hit['alternatives'][0])} in the Maven Central index "
                           f"(local copy), which republishes it; the coordinates come from the jar's "
                           f"{hit['named_by']}, and the index has no file under them")

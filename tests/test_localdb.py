@@ -1210,6 +1210,55 @@ def test_the_jar_s_own_coordinate_names_the_original_of_a_republished_file(tmp_p
     assert maven.lookup_hash(quiet, shared, "json-lib-2.4-jdk15.jar", agreeing, original)["coordinate"] == original
 
 
+ACTIVATION = "d4" * 20
+GFW = ("one.gfw", "activation", "1.1.1")
+JAVAX_ACTIVATION = ("javax.activation", "activation", "1.1.1")
+ACTIVATION_LINES = {GFW[:2]: ["1.1.1"], JAVAX_ACTIVATION[:2]: ["1.1", "1.1-rev-1"],
+                    ("eu.ocathain.javax.activation", "activation"): ["1.1.1"], ("jaxb", "activation"): ["1.0.2"]}
+
+
+def test_a_one_off_republication_that_fits_the_file_name_gives_way_to_the_groupid_of_the_packages(tmp_path):
+    # The jar has no pom.properties; the index filed it under the republisher, whose name fits the file.
+    index = OneCoordinateIndex({ACTIVATION: GFW}, ACTIVATION_LINES)
+    net = quiet_net(tmp_path, offline=True)
+    hit = maven.lookup_hash(net, ACTIVATION, "activation-1.1.1.jar", index, package=lambda: "javax.activation")
+    assert (hit["coordinate"], hit["named_by"], hit["alternatives"]) == (JAVAX_ACTIVATION, "packages", [GFW])
+    # An online scan, which sees both coordinates, names it the same.
+    online = Net(cache_dir=tmp_path / "online", sleep=lambda s: None,
+                 transport=ScriptedTransport({"api.deps.dev": deps_dev_answer(GFW, JAVAX_ACTIVATION)}))
+    assert maven.lookup_hash(online, ACTIVATION, "activation-1.1.1.jar",
+                             package=lambda: "javax.activation")["coordinate"] == JAVAX_ACTIVATION
+    assert net.offline_misses == 0
+
+
+def test_the_indexed_coordinate_that_fits_the_file_name_stays_unless_it_is_a_one_off_outside_the_packages(tmp_path):
+    net = quiet_net(tmp_path, offline=True)
+
+    def named(index, filename, package):
+        hit = maven.lookup_hash(net, ACTIVATION, filename, index, package=lambda: package)
+        return hit["coordinate"], "named_by" in hit
+
+    # A project that moved its groupId and kept its packages goes on releasing under the new one.
+    groovy = ("org.apache.groovy", "groovy", "4.0.0")
+    moved = OneCoordinateIndex({ACTIVATION: groovy}, {groovy[:2]: ["4.0.0", "4.0.1"],
+                                                      ("org.codehaus.groovy", "groovy"): ["3.0.8", "3.0.9"]})
+    assert named(moved, "groovy-4.0.0.jar", "org.codehaus.groovy.runtime") == (groovy, False)
+    # A groupId with no release before the version did not publish it: org.dom4j began at 2.0.0.
+    mirror = ("org.example.mirror", "dom4j", "1.6.1")
+    later = OneCoordinateIndex({ACTIVATION: mirror}, {mirror[:2]: ["1.6.1"], ("org.dom4j", "dom4j"): ["2.0.0", "2.1.3"]})
+    assert named(later, "dom4j-1.6.1.jar", "org.dom4j.tree") == (mirror, False)
+    # A file for the version under the groupId of the packages is another file than this one.
+    taken = OneCoordinateIndex({ACTIVATION: GFW}, {**ACTIVATION_LINES, JAVAX_ACTIVATION[:2]: ["1.1", "1.1.1"]})
+    assert named(taken, "activation-1.1.1.jar", "javax.activation") == (GFW, False)
+    # Packages in no groupId's namespace, or in the indexed one's, prove nothing.
+    index = OneCoordinateIndex({ACTIVATION: GFW}, ACTIVATION_LINES)
+    assert named(index, "activation-1.1.1.jar", "com.example.mail") == (GFW, False)
+    assert named(index, "activation-1.1.1.jar", None) == (GFW, False)
+    own = OneCoordinateIndex({ACTIVATION: GFW}, {**ACTIVATION_LINES, ("one.gfw.activation", "activation"): ["1.0"]})
+    assert named(own, "activation-1.1.1.jar", "one.gfw.activation") == (GFW, False)
+    assert net.offline_misses == 0
+
+
 BOUNCY = "b1" * 20
 OLD_BOUNCY = ("bouncycastle", "bcprov-jdk14", "138")
 BOUNCY_LINES = {OLD_BOUNCY[:2]: ["124", "136", "138", "139", "140"],

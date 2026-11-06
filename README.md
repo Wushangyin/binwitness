@@ -174,7 +174,12 @@ case, unless it names the indexed artifact itself with another version (`7.4.1` 
 snapshot). Failing that, the file name (`bcprov-jdk14-1.38.jar`) does, when the index knows that artifact,
 lists no file for that version and numbers its releases the same way; of several groupIds that publish the
 artifact, the one the packages are in is taken, then one with releases before and after that version, the
-indexed one, the one with more releases. A jar whose contents match several copies
+indexed one, the one with more releases. When the indexed coordinate fits the file name too
+(`activation-1.1.1.jar` under `one.gfw:activation`), it gives way only if it is a one-off outside the jar's
+packages: the indexed groupId has no other version of the artifact and the packages are not in it, while a
+groupId they are in (`javax.activation`) published earlier versions and lists no file for this one. A
+project that moved its groupId goes on releasing under the new one, so it stays; so does a coordinate
+whose packages' groupId began later (`dom4j:dom4j` 1.6.1, not `org.dom4j`). A jar whose contents match several copies
 of the same release is named by the one whose packaging differs least from it: the original, not the
 `commons-collections` that `org.lucee` republishes. The rest are listed with the file
 (`also_published_as`), and advisories filed under any of them count for the component, marked with the

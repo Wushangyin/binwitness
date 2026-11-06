@@ -128,8 +128,9 @@ def _displaced(db, indexed: list, stem: str, declared, package) -> tuple[tuple[s
     if declared and (_names(stem, declared) or any(_related(declared[1], c[1]) for c in indexed)):
         found = declared[0] in db.maven_groups(declared[1]) and missing(*declared)
         return (declared, "pom.properties") if found else None
-    if any(_names(stem, c) for c in indexed):
-        return None
+    fitting = [c for c in indexed if _names(stem, c)]
+    if fitting:
+        return _behind_republication(db, fitting, package)
     for split in reversed(list(re.finditer(r"-(?=\d)", stem))):
         artifact, version = stem[:split.start()], stem[split.end():]
         if not any(_related(artifact, c[1]) for c in indexed):
@@ -146,6 +147,36 @@ def _displaced(db, indexed: list, stem: str, declared, package) -> tuple[tuple[s
                                                -len(db.maven_versions(g, artifact)), g))
             return (group, artifact, version), "file name"
     return None
+
+
+def _behind_republication(db, fitting: list, package) -> tuple[tuple[str, str, str], str] | None:
+    """The original of a jar the index files under a republication that fits its file name just as well:
+    activation-1.1.1.jar, without pom.properties, sits under one.gfw:activation:1.1.1, the javax.activation
+    file unchanged. An online scan sees both coordinates and takes the one the jar's packages are in; the
+    index shows only the republisher, so the original is told by what the index lacks there: a groupId the
+    packages are in, that published the artifact before this version, but has no file for this version.
+
+    Only a republisher with no other version of the artifact gives way. A project that moved its groupId and
+    kept its packages goes on releasing under the new one (org.apache.groovy from 4.0, packages still
+    org.codehaus.groovy), and a groupId without an earlier release did not publish the version (org.dom4j
+    began at 2.0.0, so dom4j-1.6.1 stays dom4j:dom4j)."""
+    if len({c[1:] for c in fitting}) != 1 or any(len(db.maven_versions(*c[:2])) > 1 for c in fitting):
+        return None
+    namespace = package()
+    if not namespace or any(_shared(c[0], namespace) for c in fitting):
+        return None
+    artifact, version = fitting[0][1:]
+
+    def original(group) -> bool:
+        versions = db.maven_versions(group, artifact)
+        return _shared(group, namespace) > 0 and version not in versions and \
+            any(compare("maven", v, version) < 0 for v in versions)
+
+    groups = [g for g in db.maven_groups(artifact) if original(g)]
+    if not groups:
+        return None
+    group = min(groups, key=lambda g: (-_shared(g, namespace), -len(db.maven_versions(g, artifact)), g))
+    return (group, artifact, version), "packages"
 
 
 def _deps_dev(net: Net, sha1: str) -> list[tuple]:
