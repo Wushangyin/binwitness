@@ -190,7 +190,8 @@ coordinate they name.
 | File | Content |
 |---|---|
 | `binwitness.json` | everything: components with evidence, locations, file hashes, published-artifact comparison, other coordinates of the same file, licenses, vulnerabilities, upgrade advice; first-party and unidentified files; warnings; data sources with fetch times |
-| `sbom.cdx.json` | CycloneDX 1.5 SBOM with vulnerabilities, identity evidence and occurrences. A component found in several different files has one entry per file, each with its hashes; first-party and unidentified jars are `file` components with their hashes. Licenses with an SPDX id are given as `license.id`. `metadata.component` describes what was scanned |
+| `sbom.cdx.json` | CycloneDX 1.5 SBOM with vulnerabilities, identity evidence, occurrences and the [dependency graph](#dependency-graph). A component found in several different files has one entry per file, each with its hashes; first-party and unidentified jars are `file` components with their hashes. Licenses with an SPDX id are given as `license.id`. `metadata.component` describes what was scanned |
+| `sbom.spdx.json` | SPDX 2.3 SBOM with the same packages, one per input and per file, each with its checksums, purl and declared license. `CONTAINS` follows where each was found (a jar in a war, a library shaded into the jar it is in), `DEPENDS_ON` the dependency graph. Vulnerabilities are `SECURITY` references to OSV on the packages they affect. A license name without an SPDX id is declared as a `LicenseRef-` that carries the name |
 | `components.csv`, `vulnerabilities.csv` | the same in spreadsheet form, UTF-8 with a byte order mark so that Excel reads non-ASCII paths correctly. The last two columns of `components.csv` are the upgrade advice and the release family; for a family member the advice is the family's, with its own in parentheses |
 | `candidates.csv` | the [NVD candidates](#nvd-candidates), one row per record and component. When candidates were not looked for, a single row says why |
 
@@ -213,6 +214,23 @@ are grouped into families: `permissive`, `weak-copyleft`, `copyleft-with-excepti
 that does not say which version or variant, such as a bare `BSD`, is kept as it is. A GPL text that says
 neither "only" nor "or later" keeps SPDX's older id (`GPL-2.0`, `GPL-2.0-with-classpath-exception`), which
 claims no more than the text does.
+
+### Dependency graph
+
+Each jar's dependencies are those its own POM declares (`META-INF/maven/.../pom.xml`). A jar that carries
+none, such as a Gradle build, takes those of the POM published with it, if the file is the published one.
+A dependency is linked to a jar delivered with the one that declares it: in the same innermost archive
+(a war, a distribution zip), the same container image or the same scanned directory, or carried inside it
+(a Spring Boot jar's `BOOT-INF/lib`). It is matched by groupId and artifactId; versions are not compared,
+since the version delivered is the one the build chose. Test dependencies are left out; provided and
+optional ones count when the delivery carries them anyway.
+
+In `binwitness.json`, `depends_on` on each component and first-party or unidentified jar lists what it
+depends on, by purl (`file:<sha1>` for a jar without one). `[]` means none of its dependencies is
+delivered, `null` that they are not known. `summary.dependencies` counts where they were read from. The
+SBOMs carry the same graph: `dependencies` in CycloneDX, `DEPENDS_ON` in SPDX. A jar whose dependencies
+are not known has no entry there, and each input depends on the jars in it that no other jar there
+depends on.
 
 ### NVD candidates
 
@@ -363,7 +381,7 @@ left out. Five more things are flagged, never acted on:
 Candidates are leads for manual review. A CPE names a product, and a product can be wider than the
 component: one CPE may stand for every module of a framework, as with netty above, or for a vendor's
 drivers in several languages. They are not counted with the findings, do not take part in `--fail-on`,
-and are left out of `sbom.cdx.json` and `vulnerabilities.csv`. They are written to `binwitness.json`
+and are left out of the SBOMs and `vulnerabilities.csv`. They are written to `binwitness.json`
 (`candidates`, and the evidence of each link in `candidate_links`) and to `candidates.csv`. There the
 learned-link column reads like `3/6 / 3/4 / 3/6; versions meet on 3 of 3`: the package's CVEs with the
 CPE out of those with any CPE, the CPE's attributed CVEs of the same project out of all its attributed
@@ -741,8 +759,8 @@ scan a machine with no internet access, copy the dataset directory and, optional
 | Service | Used for |
 |---|---|
 | [deps.dev](https://deps.dev) | jar hash to coordinates; licenses |
-| [Maven Central](https://central.sonatype.com) | hash search fallback; published checksums; POM licenses; `--class-search`; version lists for upgrade advice; the modules of a groupId for `crosscheck`; for candidates, POMs that tell a relocation or a packaging and the file listings of other modules' jars |
-| repositories given with `--maven-repo` | checksums, jar directories, POM licenses and version lists of releases Central does not have |
+| [Maven Central](https://central.sonatype.com) | hash search fallback; published checksums; POM licenses and dependencies; `--class-search`; version lists for upgrade advice; the modules of a groupId for `crosscheck`; for candidates, POMs that tell a relocation or a packaging and the file listings of other modules' jars |
+| repositories given with `--maven-repo` | checksums, jar directories, POM licenses and dependencies, and version lists of releases Central does not have |
 | [OSV.dev](https://osv.dev) | vulnerabilities (GitHub Security Advisories and others); all advisories of a vulnerable package, for upgrade advice |
 | [npm registry](https://www.npmjs.com) | published versions of vulnerable npm packages, for upgrade advice, and of packages a JavaScript file matched |
 | [jsDelivr](https://www.jsdelivr.com) | JavaScript file hashes; file lists of the releases next to a match |
@@ -804,6 +822,12 @@ These limits are deliberate, so read them before relying on a result:
 - **Ecosystems: Java (Maven) and JavaScript (npm).** OS packages, Python, Go, .NET and native libraries
   are out of scope; use Trivy or Syft for an image's OS layer. Their dependency files are named in a
   warning. JDK/JRE runtime jars are skipped.
+- **The dependency graph is what the POMs declare.** Dependencies a parent POM or a profile adds are not
+  followed, nor what a build resolved beyond its POM (Gradle module metadata, shading). A groupId left to a
+  property the POM does not define is matched by artifactId only when one jar delivered with it has that
+  artifactId. Jars loose in a scanned directory are delivered together, so a directory holding several
+  applications is linked across them. With `--lookup local` or `--offline`, published POMs are read only
+  from the cache. npm packages have no edges.
 - **Unusual licenses need a human.** Non-standard licenses and contradictory declarations end up as
   `unknown`. Dual licenses listed without an SPDX expression are read as alternatives.
 - **Scanning speed depends on the network.** A cold-cache scan is almost entirely waiting for lookups: a

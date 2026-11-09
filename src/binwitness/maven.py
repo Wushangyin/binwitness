@@ -355,19 +355,26 @@ def registry_licenses(net: Net, coordinate: tuple[str, str, str]) -> list[str]:
     return [e for e in found.get("licenses", []) if e and e.lower() != "non-standard"]
 
 
-def central_licenses(net: Net, group: str, artifact: str, version: str, depth: int = 0,
-                     repositories: tuple[str, ...] = ()) -> list[str]:
-    """``<licenses>`` of the published POM, following ``<parent>`` the way Maven inherits it (4 levels).
-    ``repositories`` are consulted after Maven Central."""
-    pom = None
+def published_pom(net: Net, coordinate: tuple[str, str, str], repositories: tuple[str, ...] = ()
+                  ) -> tuple[str, str] | None:
+    """The POM published for ``coordinate`` and the repository it came from: Maven Central, then ``repositories``."""
+    group, artifact, version = coordinate
     for repository in (CENTRAL, *repositories):
         pom = net.get(f"{repository}/{group.replace('.', '/')}/{artifact}/{version}/{artifact}-{version}.pom",
                       stable=True)
         if pom:
-            break
-    if not pom:
+            return pom.decode("utf-8", "replace"), repository
+    return None
+
+
+def central_licenses(net: Net, group: str, artifact: str, version: str, depth: int = 0,
+                     repositories: tuple[str, ...] = ()) -> list[str]:
+    """``<licenses>`` of the published POM, following ``<parent>`` the way Maven inherits it (4 levels).
+    ``repositories`` are consulted after Maven Central."""
+    found = published_pom(net, (group, artifact, version), repositories)
+    if not found:
         return []
-    text = pom.decode("utf-8", "replace")
+    text = found[0]
     names = pom_licenses(text)
     parent = re.search(r"<parent>(.*?)</parent>", re.sub(r"<!--.*?-->", "", text, flags=re.S), re.S)
     if names or not parent or depth >= 4:

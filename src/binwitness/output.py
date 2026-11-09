@@ -1,15 +1,17 @@
-"""Result files: native JSON, CycloneDX 1.5 SBOM with vulnerabilities, CSV tables, terminal summary."""
+"""Result files: native JSON, CycloneDX 1.5 and SPDX 2.3 SBOMs, CSV tables, terminal summary."""
 from __future__ import annotations
 
 import csv
 import functools
 import json
+import re
 import uuid
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 
-from binwitness import __version__
-from binwitness.licenses import spdx_id
+from binwitness import __version__, dependencies
+from binwitness.licenses import is_spdx_expression, spdx_id
 from binwitness.scan import HASH_INDEX_MISSING, OFFLINE_UNKNOWN
 from binwitness.versions import compare
 from binwitness.vulns import SEVERITIES
@@ -22,18 +24,20 @@ _SCOPE = {"runtime": "required", "dev": "excluded"}
 def write_all(result: dict, out_dir: Path) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     paths = [out_dir / "binwitness.json", out_dir / "sbom.cdx.json", out_dir / "components.csv",
-             out_dir / "vulnerabilities.csv", out_dir / "candidates.csv"]
+             out_dir / "vulnerabilities.csv", out_dir / "candidates.csv", out_dir / "sbom.spdx.json"]
     paths[0].write_text(json.dumps(result, ensure_ascii=False, indent=1), "utf-8")
     paths[1].write_text(json.dumps(cyclonedx(result), ensure_ascii=False, indent=1), "utf-8")
     components_csv(result, paths[2])
     vulnerabilities_csv(result, paths[3])
     candidates_csv(result, paths[4])
+    paths[5].write_text(json.dumps(spdx(result), ensure_ascii=False, indent=1), "utf-8")
     return paths
 
 
 def cyclonedx(result: dict) -> dict:
     components = []
     refs: dict[str, list[str]] = {}
+    file_refs: dict[str, str] = {}  # SHA-1 -> bom-ref, for the dependency graph
     families = families_of(result)
     for c in result["components"]:
         group, name = c["name"].split(":", 1) if c["ecosystem"] == "maven" else ("", c["name"])
@@ -82,6 +86,8 @@ def cyclonedx(result: dict) -> dict:
             elif properties:
                 copy["properties"] = properties
             refs.setdefault(c["purl"], []).append(copy["bom-ref"])
+            if file:
+                file_refs[file["sha1"]] = copy["bom-ref"]
             components.append(copy)
     # A file the scan could not name is still part of what was delivered.
     for kind, entries in (("first-party", result["first_party"]), ("unidentified", result["unidentified"])):
@@ -98,6 +104,7 @@ def cyclonedx(result: dict) -> dict:
                 entry["properties"].append({"name": "binwitness:manifest-says", "value": jar["hint"]})
             if (jar.get("license") or {}).get("names"):
                 entry["licenses"] = _license_entries(jar["license"]["names"])
+            file_refs.setdefault(jar["sha1"], entry["bom-ref"])
             components.append(entry)
     vulnerabilities = []
     for v in result["vulnerabilities"].values():
@@ -136,8 +143,174 @@ def cyclonedx(result: dict) -> dict:
         "bomFormat": "CycloneDX", "specVersion": "1.5", "serialNumber": f"urn:uuid:{uuid.uuid4()}", "version": 1,
         "metadata": metadata,
         "components": components,
+        "dependencies": _dependency_graph(result, file_refs, [s["bom-ref"] for s in subjects],
+                                          metadata.get("component", {}).get("bom-ref")),
         "vulnerabilities": vulnerabilities,
     }
+
+
+def _dependency_graph(result: dict, file_refs: dict[str, str], input_refs: list[str], root: str | None) -> list[dict]:
+    """A jar whose dependencies are known is listed, with none when none of them is delivered; a jar whose POM
+    could not be read is not, which in CycloneDX means not known. Each input depends on the jars in it that no
+    other jar there is found to depend on."""
+    graph = dependencies.edges(result)
+    out = []
+    for sha1, ref in file_refs.items():
+        if sha1 in graph:
+            out.append({"ref": ref, "dependsOn": sorted({file_refs[t] for t in graph[sha1] if t in file_refs})})
+    names = [i["name"] for i in result["inputs"]]
+    in_input: dict[int, set[str]] = {}
+    for node in dependencies.nodes(result):
+        for location in node["locations"]:
+            number = dependencies.input_of(location, names)
+            if number is not None:
+                in_input.setdefault(number, set()).add(node["sha1"])
+    tops = []
+    for number, ref in enumerate(input_refs):
+        inside = in_input.get(number, set())
+        reached = {t for s in inside for t in graph.get(s, ())}
+        tops.append({"ref": ref, "dependsOn": sorted({file_refs[s] for s in inside - reached if s in file_refs})})
+    if root and root not in input_refs:
+        tops.insert(0, {"ref": root, "dependsOn": list(input_refs)})
+    return tops + out
+
+
+def spdx(result: dict) -> dict:
+    """SPDX 2.3: a package per input and per delivered file (a component found in several different files has
+    one per file, as in CycloneDX); CONTAINS follows where each was found, DEPENDS_ON the dependency graph.
+    Vulnerabilities are advisory references of the packages they affect."""
+    names = [i["name"] for i in result["inputs"]]
+    packages, relationships, extracted = [], [], {}
+    input_ids = []
+    for number, described in enumerate(result["inputs"], 1):
+        ident = f"SPDXRef-Input-{number}"
+        entry = {"SPDXID": ident, "name": described["name"], "downloadLocation": "NOASSERTION",
+                 "filesAnalyzed": False, "primaryPackagePurpose": "APPLICATION"}
+        if described.get("sha256"):
+            entry["checksums"] = [{"algorithm": "SHA256", "checksumValue": described["sha256"]}]
+        packages.append(entry)
+        input_ids.append(ident)
+        relationships.append(_relationship("SPDXRef-DOCUMENT", "DESCRIBES", ident))
+    advisories: dict[str, list[dict]] = {}
+    for v in result["vulnerabilities"].values():
+        for affected in v["affects"]:
+            advisories.setdefault(affected, []).append(v)
+    by_file, at = {}, {}  # SHA-1 -> SPDXID; location of a file -> SPDXID
+    placed = []  # (SPDXID, locations, host found at the same location)
+    for c in result["components"]:
+        for file in c["files"] or [None]:
+            ident = f"SPDXRef-Package-{len(placed) + 1}"
+            entry = {"SPDXID": ident, "name": c["name"], "versionInfo": c["version"], "downloadLocation": "NOASSERTION",
+                     "filesAnalyzed": False, "primaryPackagePurpose": "LIBRARY",
+                     "licenseConcluded": "NOASSERTION",
+                     "licenseDeclared": _spdx_license(c.get("license"), extracted),
+                     "copyrightText": "NOASSERTION",
+                     "comment": "identified by " + "; ".join(e["method"] for e in c["evidence"]),
+                     "externalRefs": [{"referenceCategory": "PACKAGE-MANAGER", "referenceType": "purl",
+                                       "referenceLocator": c["purl"]}]
+                     + [{"referenceCategory": "SECURITY", "referenceType": "advisory",
+                         "referenceLocator": f"https://osv.dev/vulnerability/{v['osv_ids'][0]}",
+                         "comment": f"{v['id']}, {v['severity'].lower()}"} for v in advisories.get(c["purl"], [])]}
+            if file:
+                entry["checksums"] = _spdx_checksums(file)
+                by_file[file["sha1"]] = ident
+                for location in file["locations"]:
+                    at.setdefault(location, ident)
+            packages.append(entry)
+            placed.append((ident, file["locations"] if file else c["locations"], not file))
+    for kind, entries in (("first-party", result["first_party"]), ("unidentified", result["unidentified"])):
+        for jar in entries:
+            ident = f"SPDXRef-Package-{len(placed) + 1}"
+            entry = {"SPDXID": ident, "name": jar["filename"], "downloadLocation": "NOASSERTION",
+                     "filesAnalyzed": False, "primaryPackagePurpose": "FILE", "checksums": _spdx_checksums(jar),
+                     "licenseConcluded": "NOASSERTION", "licenseDeclared": _spdx_license(jar.get("license"), extracted),
+                     "copyrightText": "NOASSERTION",
+                     "comment": kind + (f": {jar['reason']}" if jar.get("reason") else "")
+                     + (f"; declares {jar['coordinate']}" if jar.get("coordinate") else "")}
+            packages.append(entry)
+            by_file.setdefault(jar["sha1"], ident)
+            for location in jar["locations"]:
+                at.setdefault(location, ident)
+            placed.append((ident, jar["locations"], False))
+    for ident, locations, shaded in placed:
+        holders = []
+        for location in locations:
+            # A library shaded into a jar is reported at the jar's own location.
+            holder = at.get(location) if shaded else None
+            if not holder or holder == ident:
+                holder = next((at[p] for p in reversed(list(dependencies.containers(location))) if p in at), None)
+            if not holder:
+                number = dependencies.input_of(location, names)
+                holder = input_ids[number] if number is not None else None
+            if holder and holder != ident and holder not in holders:
+                holders.append(holder)
+        relationships += [_relationship(holder, "CONTAINS", ident) for holder in holders]
+    for sha1, targets in dependencies.edges(result).items():
+        relationships += [_relationship(by_file[sha1], "DEPENDS_ON", related)
+                          for related in sorted(by_file[t] for t in targets if t in by_file)]
+    stamp = datetime.fromisoformat(result["finished"]).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    document = {
+        "spdxVersion": "SPDX-2.3", "dataLicense": "CC0-1.0", "SPDXID": "SPDXRef-DOCUMENT",
+        "name": ", ".join(names) or "binwitness scan",
+        "documentNamespace": f"https://spdx.org/spdxdocs/binwitness-{uuid.uuid4()}",
+        "creationInfo": {"created": stamp, "creators": [f"Tool: binwitness-{__version__}"]},
+        "packages": packages,
+        "relationships": relationships,
+    }
+    if extracted:
+        document["hasExtractedLicensingInfos"] = list(extracted.values())
+    return document
+
+
+def _relationship(element: str, kind: str, related: str) -> dict:
+    return {"spdxElementId": element, "relationshipType": kind, "relatedSpdxElement": related}
+
+
+def _spdx_checksums(file: dict) -> list[dict]:
+    return [{"algorithm": "SHA1", "checksumValue": file["sha1"]}] + (
+        [{"algorithm": "SHA256", "checksumValue": file["sha256"]}] if file.get("sha256") else [])
+
+
+def _spdx_license(license_: dict | None, extracted: dict) -> str:
+    """An SPDX expression for a declaration: the expression the registry gives, or the names joined as
+    alternatives (how binwitness reads licenses listed side by side). A name without an SPDX id, or an
+    expression SPDX tools would refuse, becomes a ``LicenseRef-`` that carries the text as found."""
+    license_ = license_ or {}
+    source = license_.get("source") or "the component"
+    expressions = list(dict.fromkeys(license_.get("expressions") or []))
+    if expressions:
+        parts = []
+        for expression in expressions:
+            if not is_spdx_expression(expression, any_id=source == "deps.dev"):
+                parts.append(_license_ref(expression, source, extracted))
+                continue
+            for old, new in _SPDX_23.items():
+                expression = re.sub(rf"(?<![\w.+-]){re.escape(old)}(?![\w.+-])", new, expression)
+            parts.append(f"({expression})" if len(expressions) > 1 and re.search(r" (AND|OR) ", expression)
+                         else expression)
+        return " OR ".join(parts)
+    names = list(dict.fromkeys(license_.get("names") or []))
+    if not names:
+        return "NOASSERTION"
+    parts = [_SPDX_23.get(spdx_id(name), spdx_id(name)) or _license_ref(name, source, extracted) for name in names]
+    return parts[0] if len(parts) == 1 else " OR ".join(parts)
+
+
+# Ids the SPDX license list keeps only as deprecated, that SPDX 2.3 tools read as an exception: the expression
+# that replaced them, still without "only" or "or later".
+_SPDX_23 = {"GPL-2.0-with-classpath-exception": "GPL-2.0 WITH Classpath-exception-2.0"}
+
+
+def _license_ref(text: str, source: str, extracted: dict) -> str:
+    for ident, entry in extracted.items():
+        if entry["extractedText"] == text:
+            return ident
+    ident = "LicenseRef-" + (re.sub(r"[^A-Za-z0-9.]+", "-", text).strip("-.")[:60] or "unnamed")
+    while ident in extracted:
+        ident += "-1"
+    extracted[ident] = {"licenseId": ident, "extractedText": text, "name": text,
+                        "comment": f"named so by {source}; binwitness has the name, not the license text"}
+    return ident
 
 
 def _hashes(file: dict) -> list[dict]:
@@ -464,6 +637,7 @@ INCOMPLETE = {
     "licenses_not_looked_up": "licenses not looked up for {n} components",
     "kev_catalog_unavailable": "CISA KEV catalog unavailable",
     "upgrade_versions_not_checked": "upgrade targets not checked for {n} components",
+    "dependencies_not_read": "dependencies not read for {n} jars",
 }
 _VERDICT_LABEL = {"remove-malicious": "remove (malicious)", "upgrade": "upgrade on the same line",
                   "upgrade-across-major": "only across a major version", "relocated": "at new coordinates",

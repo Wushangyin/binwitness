@@ -12,8 +12,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from binwitness import __version__, maven, nvd, staticjs, upgrades, vulns
+from binwitness import __version__, dependencies, maven, nvd, staticjs, upgrades, vulns
 from binwitness.archive import Walker
+from binwitness.dependencies import containers, declared as declared_dependencies
 from binwitness.jar import (JarFacts, entries, file_digests, jar_facts, name_hints, representative_class,
                            split_name, version_hints)
 from binwitness.licenses import FAMILIES, UNKNOWN, expression_family, family
@@ -79,12 +80,6 @@ def purl(ecosystem: str, name: str, version: str) -> str:
 
 def _where(repository: str | None) -> str:
     return "Maven Central" if repository in (None, maven.CENTRAL) else repository
-
-
-def _containers(location: str):
-    """Locations of the archives a location sits in, outermost first: ``a.zip!/b.jar!/c.jar`` -> a.zip, a.zip!/b.jar."""
-    parts = location.split("!/")
-    return ("!/".join(parts[:i]) for i in range(1, len(parts)))
 
 
 class _Components:
@@ -424,7 +419,7 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None, cand
         # kryo 2.21 as released carries its own builds of minlog and reflectasm. They differ from the files
         # published under those names, but whoever shipped kryo did not change them.
         if verdict["published"] != "identical" and all(
-                any(parent in published_jar_locations for parent in _containers(loc)) for loc in locations):
+                any(parent in published_jar_locations for parent in containers(loc)) for loc in locations):
             return "inside-published"
         return verdict["published"]
 
@@ -439,6 +434,9 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None, cand
         embedded = [x for x in facts.embedded if x != coordinate] + ([demoted] if demoted and demoted != coordinate else [])
         # A license read from the embedded pom.xml is the shaded library's, not this jar's.
         own_licenses = facts.licenses if not (demoted and facts.license_source == "jar: pom.xml") else []
+        # So are the dependencies it declares.
+        own_dependencies = ({"source": "jar: pom.xml", "declared": facts.dependencies}
+                            if facts.dependencies is not None and not demoted else None)
         parent_label = None
         if not coordinate and inside_third_party(jar.locations):
             # An unrecognised jar shipped inside a recognised library (ehcache's sizeof-agent.jar) is part of it.
@@ -448,6 +446,8 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None, cand
             first_party.append({"filename": facts.filename, "sha1": sha1, "sha256": facts.sha256,
                                 "coordinate": ":".join(coordinate or facts.coordinate or ()) or None,
                                 "locations": jar.locations})
+            if own_dependencies:
+                first_party[-1]["dependencies"] = own_dependencies
             parent_label = facts.filename
         elif coordinate:
             file = {"filename": facts.filename, "sha1": sha1, "sha256": facts.sha256,
@@ -459,6 +459,8 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None, cand
                 file["comparison"] = verdict["comparison"]
             if verdict.get("copy_of"):
                 file["same_entries_as"] = verdict["copy_of"]
+            if own_dependencies:
+                file["dependencies"] = own_dependencies
             others = [("maven", f"{g}:{a}", v) for g, a, v in verdict.get("alternatives") or []]
             if others:
                 file["also_published_as"] = [purl(*other) for other in others]
@@ -492,6 +494,8 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None, cand
                                  "license": ({"names": own_licenses, "source": facts.license_source,
                                               "family": family(own_licenses)} if own_licenses else None),
                                  "locations": jar.locations})
+            if own_dependencies:
+                unidentified[-1]["dependencies"] = own_dependencies
             parent_label = facts.filename
         hosts.setdefault(parent_label, []).append(sha1)
         for group, artifact, version in embedded:
@@ -572,6 +576,8 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None, cand
     if options.licenses:
         licenses_not_looked_up = _attach_licenses(net, items, jar_hints, options.workers, warnings,
                                                   options.maven_repos)
+    dependencies_not_read = _attach_published_dependencies(net, items, options.workers, warnings,
+                                                           options.maven_repos)
     kev_dates = {}
     vulnerabilities = {}
     kev_available = True
@@ -653,8 +659,10 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None, cand
                                  + ")"] if net.offline_misses else []) + (db.stale() if db else [])
                     + (store.stale() if store is not None and store is not db else []),
     }
+    dependency_summary = dependencies.attach(result)
     result["summary"] = summarize(result, len(jars), walker.skipped_runtime_jars, kev_dates,
                                   resources_of_third_party)
+    result["summary"]["dependencies"] = dependency_summary
     result["summary"]["scripts"] = {
         "matched": matched_scripts,
         "version_not_determined": sum(len(x["locations"]) for x in unpinned_scripts),
@@ -671,6 +679,7 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None, cand
         "licenses_not_looked_up": licenses_not_looked_up,
         "kev_catalog_unavailable": options.vulnerabilities and not kev_available,
         "upgrade_versions_not_checked": upgrades_not_checked,
+        "dependencies_not_read": dependencies_not_read,
     }
     result["summary"]["incomplete"] = {k: v for k, v in incomplete.items() if v}
     result["summary"]["candidates"] = candidate_summary
@@ -820,6 +829,50 @@ def _attach_licenses(net, items, jar_hints, workers, warnings, repositories=()) 
     for item, found in zip(items, found_all):
         item["license"] = _classified(found) if found else {"family": UNKNOWN, "source": None}
     return len(unresolved) + len(failed)
+
+
+def _attach_published_dependencies(net, items, workers, warnings, repositories=()) -> int:
+    """What a jar without a pom.xml of its own depends on, from the POM published for it (Gradle builds carry
+    none: Spring's jars). Only for files the registry has: a POM is published with them. Returns how many
+    such files could not be read."""
+    pending = {}
+    for item in items:
+        if item["ecosystem"] != "maven":
+            continue
+        for file in item["files"]:
+            if "dependencies" not in file and file["confidence"] in ("exact", "content"):
+                group, artifact = item["name"].split(":", 1)
+                pending.setdefault((group, artifact, item["version"]), []).append(file)
+
+    def read(coordinate):
+        try:
+            found = maven.published_pom(net, coordinate, repositories)
+        except OfflineMiss:
+            return "offline"
+        except NetError as error:
+            return error
+        if not found:
+            return None
+        text, repository = found
+        return {"source": "Maven Central POM" if repository == maven.CENTRAL else f"POM from {repository}",
+                "declared": declared_dependencies(text)}
+
+    offline, failed = 0, []
+    for coordinate, answer in zip(pending, map_parallel(read, list(pending), workers)):
+        if isinstance(answer, dict):
+            for file in pending[coordinate]:
+                file["dependencies"] = answer
+        elif answer == "offline":
+            offline += len(pending[coordinate])
+        elif answer is not None:
+            failed += [(coordinate, answer)] * len(pending[coordinate])
+    if failed:
+        warnings.append(f"dependencies not known for {len(failed)} jar{'' if len(failed) == 1 else 's'}: the "
+                        f"published POM could not be read ({':'.join(failed[0][0])}: {failed[0][1]})")
+    if offline:
+        warnings.append(f"dependencies not known for {offline} jar{'' if offline == 1 else 's'} without a pom.xml "
+                        "of their own: the published POM is not in the cache, and this scan does not go online")
+    return offline + len(failed)
 
 
 def _declared_license(net, ecosystem, name, version, hint=None, repositories=()) -> dict | None:

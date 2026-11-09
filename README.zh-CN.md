@@ -112,7 +112,8 @@ binwitness scan INPUT... -o OUTDIR [options]
 | 文件 | 内容 |
 |---|---|
 | `binwitness.json` | 全部信息：组件及其证据、位置、文件哈希、与发布件的比对、同一文件的其他坐标、许可证、漏洞、升级建议；自有文件和未识别文件；警告；各数据源及获取时间 |
-| `sbom.cdx.json` | CycloneDX 1.5 SBOM，含漏洞、识别证据和出现位置。同一组件出现在几个不同文件里的，每个文件一条，各带哈希；自有 jar 和未识别 jar 作为 `file` 组件列出，带哈希。有 SPDX 编号的许可证写在 `license.id` 中。`metadata.component` 描述被扫描的对象 |
+| `sbom.cdx.json` | CycloneDX 1.5 SBOM，含漏洞、识别证据、出现位置和[依赖关系图](#依赖关系图)。同一组件出现在几个不同文件里的，每个文件一条，各带哈希；自有 jar 和未识别 jar 作为 `file` 组件列出，带哈希。有 SPDX 编号的许可证写在 `license.id` 中。`metadata.component` 描述被扫描的对象 |
+| `sbom.spdx.json` | SPDX 2.3 SBOM，包与 CycloneDX 相同：每个输入、每个文件一个，各带校验和、purl 和声明的许可证。`CONTAINS` 按各自的发现位置给出（war 里的 jar、shade 进某个 jar 的库），`DEPENDS_ON` 即依赖关系图。漏洞写成受影响包上指向 OSV 的 `SECURITY` 引用。没有 SPDX 编号的许可证名称声明为带有该名称的 `LicenseRef-` |
 | `components.csv`、`vulnerabilities.csv` | 同样的内容，表格形式，UTF-8 带字节顺序标记，Excel 打开非 ASCII 路径不会乱码。`components.csv` 的最后两列是升级建议和发布族；发布族成员的升级建议写族的目标，自己单独升级的目标放在括号里 |
 | `candidates.csv` | [NVD 候选](#nvd-候选)，每条记录、每个组件一行。没有查候选时，只有一行写明原因 |
 
@@ -121,6 +122,12 @@ binwitness scan INPUT... -o OUTDIR [options]
 严重等级优先取公告自己给出的等级（GitHub 的评级），没有时按 CVSS v3 向量计算。来自 OpenSSF 恶意包数据源的记录按严重（critical）计。发现按 CVE 合并，同一漏洞的 GHSA 与 CVE 只计一次。每条发现都列出各组件的修复版本；已列入 CISA 已知被利用漏洞目录（KEV）的，注明列入日期。
 
 许可证优先从构件本身取：内嵌的 `pom.xml`、`Bundle-License` 头或 LICENSE 文件。LICENSE 会完整读取，以免漏看附在 GPL 正文之后的例外条款。构件本身没有时，依次查 deps.dev 和已发布的 POM（包括其父 POM）。许可证分为以下几类：`permissive`、`weak-copyleft`、`copyleft-with-exception`、`strong-copyleft`、`source-available`、`unknown`。许可证名称写成 SPDX 编号，并带上原文写明的版本（`The Apache Software License, Version 2.0` 写作 `Apache-2.0`，`New BSD License` 写作 `BSD-3-Clause`）。原文没说明版本或变体的，例如单写一个 `BSD`，保持原样。GPL 原文既没写「only」也没写「or later」的，沿用 SPDX 的旧编号（`GPL-2.0`、`GPL-2.0-with-classpath-exception`），不替原文多说什么。
+
+### 依赖关系图
+
+每个 jar 的依赖取自它自带的 POM（`META-INF/maven/.../pom.xml`）所声明的依赖。不带 POM 的 jar（如 Gradle 构建的），只要文件与已发布的一致，就取随它发布的 POM。声明的依赖连到与声明方一起交付的 jar：同在最内层的归档里（war、发行版 zip）、同在一个容器镜像或同一个被扫描的目录里，或者装在声明方内部（Spring Boot jar 的 `BOOT-INF/lib`）。按 groupId 和 artifactId 匹配，不比较版本，因为交付的版本就是构建选定的版本。test 范围的依赖不算；provided 和 optional 的依赖，交付物里实际带了就算。
+
+`binwitness.json` 中，每个组件、每个自有 jar 和未识别 jar 上的 `depends_on` 列出它依赖的对象，用 purl 表示（没有 purl 的 jar 写作 `file:<sha1>`）。`[]` 表示它的依赖一个都没随交付，`null` 表示不知道它依赖什么。`summary.dependencies` 统计各依赖取自何处。两份 SBOM 带的是同一张图：CycloneDX 的 `dependencies`，SPDX 的 `DEPENDS_ON`。不知道依赖的 jar 在图中没有条目；每个输入依赖于其中没有被其他 jar 依赖的那些 jar。
 
 ### NVD 候选
 
@@ -157,7 +164,7 @@ OSV 常常只把一个 CVE 归到项目的另一个坐标下：整个发行版�
 - 厂商公告点名了别的模块：装了 `spring` 数据集时，Spring 自己对该 CVE 的公告点名了该项目的模块，却没有点这一个。公告点名的模块按名落到，如同记录点了它们；但不据此剔除任何组件对：厂商点的可能是功能的使用入口，而不是修复实际改动的共享模块（CVE-2025-41232 的修复只改了 `spring-security-core`，公告点的是 `spring-security-aspects`）。点名了模块且 OSV 也有归属的 Spring 公告中，有 23/137 条与 OSV 所列的包一个都不重合（2026 年 10 月）；
 - 修复改动的类都不在此 jar 中：装了 `fixes` 数据集时，读取记录所引用的、该项目自己仓库里的 GitHub 提交，取其修改、删除或改名的主代码类（按修复前的类名；NVD 给某些提交标了 Patch 时只取这些提交），而该 jar 一个都没有。主代码指 `src/main/java`，Tomcat 这类 Ant 构建则是 `java/`。NVD 尚未分析的记录，其 CNA 记录引用的提交，只在 OSV 已归属、且产品名相同的 CVE 所引用的仓库里才算；Apache Tomcat 的安全页为该 CVE 列出的提交也算。OSV 归到某个模块、而 OSV 还知道该项目其他模块的 CVE（即上文会落到别的模块 jar 上的那类），其 OSV 公告和 NVD 记录引用的提交，在 NVD 标了 Patch、或该项目另有公告引用同一仓库时也算。多版本 jar 的版本目录、重定位副本，以及按上一条可能属于该库的类，都算。修复新增的类单独列出、不拿来查，因为受影响的版本本来就没有它们。jar 里有其中一部分类的不标记：修复常常顺带改了各模块共用的类。类缺失也可能另有原因：它在较早的版本里叫别的名字，或者被引用为修复的提交并不就是修复本身。在下文那份交付物的候选中，656 个组件对里标出了 102 个，其中经复核的 73 个没有一个被判为成立或可能成立。三份交付物中 Apache Tomcat 的记录落到的 70 个组件对里，落在修复没改动的模块上的 39 个全部标出，其余的一个也没标。
 
-候选是供人工复核的线索。CPE 指的是产品，产品可能比组件宽：一个 CPE 可能代表一个框架的所有模块（如上面的 netty），也可能代表某厂商多种语言的驱动。候选不计入发现，不参与 `--fail-on`，也不写进 `sbom.cdx.json` 和 `vulnerabilities.csv`。它们写在 `binwitness.json`（`candidates`，每条关联的依据在 `candidate_links`）和 `candidates.csv` 中。`candidates.csv` 的「学到的关联」列形如 `3/6 / 3/4 / 3/6; versions meet on 3 of 3`：该包带此 CPE 的 CVE 数 / 带任意 CPE 的 CVE 数，该 CPE 已归属 CVE 中同一项目的数量 / 已归属 CVE 总数，按整个项目算的第一组数，以及学习所依据、两边都给出版本的 CVE 中有几个版本相交。下一列列出学到这条关联所依据的 CVE。后面几列给出该组件对是怎么来的（学到的关联、为迁移坐标学到的关联、OSV 归到另一个模块的 CVE 经学到的关联、记录点名、厂商公告点名，或 [CNA 记录](#nvd-之前cna-的记录)的某种落法）、版本由谁判定，CNA 的名称、其记录写的产品名和发布日期，厂商公告点名的模块、修复改动的类（及其中该 jar 有的类、读取所依据的提交），以及上述各项标记。
+候选是供人工复核的线索。CPE 指的是产品，产品可能比组件宽：一个 CPE 可能代表一个框架的所有模块（如上面的 netty），也可能代表某厂商多种语言的驱动。候选不计入发现，不参与 `--fail-on`，也不写进两份 SBOM 和 `vulnerabilities.csv`。它们写在 `binwitness.json`（`candidates`，每条关联的依据在 `candidate_links`）和 `candidates.csv` 中。`candidates.csv` 的「学到的关联」列形如 `3/6 / 3/4 / 3/6; versions meet on 3 of 3`：该包带此 CPE 的 CVE 数 / 带任意 CPE 的 CVE 数，该 CPE 已归属 CVE 中同一项目的数量 / 已归属 CVE 总数，按整个项目算的第一组数，以及学习所依据、两边都给出版本的 CVE 中有几个版本相交。下一列列出学到这条关联所依据的 CVE。后面几列给出该组件对是怎么来的（学到的关联、为迁移坐标学到的关联、OSV 归到另一个模块的 CVE 经学到的关联、记录点名、厂商公告点名，或 [CNA 记录](#nvd-之前cna-的记录)的某种落法）、版本由谁判定，CNA 的名称、其记录写的产品名和发布日期，厂商公告点名的模块、修复改动的类（及其中该 jar 有的类、读取所依据的提交），以及上述各项标记。
 
 新 CVE 也往往先出现在候选里。CVE 带着 CPE 发布后，常常要过几周甚至几个月才有公告指名到包。在一份约 1,100 个 jar 的交付物（2026 年 10 月下旬扫描）的候选中，复核判为对至少一个组件成立或可能成立的记录有 37 条，其中 30 条发布于 2026 年 6 月以后，36 条只有 GitHub 未审核的公告。CNA 的记录又带来 64 条 NVD 还没配 CPE 的记录，其中 47 条发布于 2026 年 10 月；经复核的 40 条中，32 条对至少一个组件成立或可能成立。
 
@@ -357,8 +364,8 @@ binwitness 会向公共服务发送以下内容：
 | 服务 | 用途 |
 |---|---|
 | [deps.dev](https://deps.dev) | jar 哈希查坐标；许可证 |
-| [Maven Central](https://central.sonatype.com) | 哈希搜索兜底；发布的校验和；POM 中的许可证；`--class-search`；升级建议的版本列表；`crosscheck` 查 groupId 下的模块；候选用的判断迁移和打包方式的 POM、其他模块 jar 的文件目录 |
-| 用 `--maven-repo` 指定的仓库 | 中央仓没有的版本的校验和、jar 目录、POM 许可证和版本列表 |
+| [Maven Central](https://central.sonatype.com) | 哈希搜索兜底；发布的校验和；POM 中的许可证和依赖；`--class-search`；升级建议的版本列表；`crosscheck` 查 groupId 下的模块；候选用的判断迁移和打包方式的 POM、其他模块 jar 的文件目录 |
+| 用 `--maven-repo` 指定的仓库 | 中央仓没有的版本的校验和、jar 目录、POM 中的许可证和依赖、版本列表 |
 | [OSV.dev](https://osv.dev) | 漏洞（GitHub 安全公告及其他来源）；升级建议所需的有漏洞的包的全部公告 |
 | [npm registry](https://www.npmjs.com) | 升级建议所需的有漏洞的 npm 包的已发布版本；JavaScript 文件匹配到的包的已发布版本 |
 | [jsDelivr](https://www.jsdelivr.com) | JavaScript 文件哈希；匹配版本前后相邻版本的文件列表 |
@@ -384,6 +391,7 @@ binwitness 会向公共服务发送以下内容：
 - **升级建议只针对公告，不涉及兼容性**。它说明哪个已发布版本不在 OSV 中该包公告的影响范围内。应用换上它能否构建和运行、版本是否由 BOM、父 POM 或其他包决定、受影响的代码是否可达，都不做评估。读取版本列表之后才发布的版本不在考虑之内。
 - **前端打包产物是不透明的**。webpack 或 rollup 合并进 chunk 的代码无法按哈希匹配。请把锁文件，或构建时用的 `node_modules`，随打包产物一起交付。文件头注释只能覆盖一部分。认出的打包产物单独计数（`bundled_scripts`），不当作未知的库。
 - **生态：Java（Maven）和 JavaScript（npm）**。操作系统软件包、Python、Go、.NET 和原生库不在范围内；镜像的操作系统层请用 Trivy 或 Syft。这些生态的依赖文件会在警告中点名。JDK/JRE 运行时 jar 会跳过。
+- **依赖关系图只反映 POM 的声明**。父 POM 或 profile 里加的依赖不追，构建在 POM 之外解析出的东西（Gradle 模块元数据、shade）也不追。groupId 交给 POM 自己没定义的属性的，只有在一起交付的 jar 里恰好一个有该 artifactId 时才按 artifactId 连上。散放在被扫描目录里的 jar 算作一起交付，所以一个目录里放了几个应用时，会跨应用连线。使用 `--lookup local` 或 `--offline` 时，已发布的 POM 只从缓存里读。npm 包没有依赖边。
 - **非常规许可证需要人工判断**。非标准许可证和自相矛盾的声明归为 `unknown`。并列多个许可证而没有写成 SPDX 表达式的，按任选其一理解。
 - **扫描速度取决于网络**。冷缓存扫描几乎全部时间都在等待查询：含 190 个 jar 的 war 约需三分钟，上千个 jar 的交付物约需一刻钟。10 秒内建不起来的连接、卡住 30 秒的请求（包括域名解析）都会放弃并重试。`--class-search` 依赖的 Maven Central 搜索服务会把部分请求压上最长一分钟才回答，binwitness 对它最多同时发两个请求，8 秒没有回答就重发。用缓存重跑只需几秒，为一个交付物查过的常见库，扫下一个交付物时已在缓存中。
 - **在线服务可能宕机或限流**。查询失败会退避重试约一分钟，之后记为警告，扫描不会因此整体失败。此时结果标为 `INCOMPLETE`，`--fail-on` 以状态码 4 而不是 0 退出。

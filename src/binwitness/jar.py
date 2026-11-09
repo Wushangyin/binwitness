@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from binwitness.archive import listed_once
+from binwitness.dependencies import declared as declared_dependencies
 from binwitness.licenses import detect, manifest_value, pom_licenses
 
 MANIFEST_KEYS = ("Implementation-Title", "Implementation-Version", "Implementation-Vendor",
@@ -33,6 +34,8 @@ class JarFacts:
     manifest: dict[str, str] = field(default_factory=dict)
     licenses: list[str] = field(default_factory=list)
     license_source: str = ""
+    # groupId:artifactId of what the jar's own pom.xml depends on; None when it carries no pom.xml of its own.
+    dependencies: list[str] | None = None
     readable: bool = True
     damaged: list[str] = field(default_factory=list)  # entries that could not be read
     # zlib-compressed "crc size name" lines of the file entries, for comparison with a published artifact.
@@ -118,9 +121,12 @@ def _read_facts(facts: JarFacts, archive: zipfile.ZipFile):
         facts.coordinate = (g, a, v)
         facts.embedded = sorted({x[:3] for x in gavs if x[:3] != (g, a, v)})
         if f"{base}/pom.xml" in names:
-            found = pom_licenses(read(f"{base}/pom.xml").decode("utf-8", "replace"))
+            pom = read(f"{base}/pom.xml").decode("utf-8", "replace")
+            found = pom_licenses(pom)
             if found:
                 facts.licenses, facts.license_source = found, "jar: pom.xml"
+            # An entry that could not be read says nothing, not "no dependencies".
+            facts.dependencies = declared_dependencies(pom) if "<project" in pom else None
     else:
         # No pom.properties matches the file: every embedded GAV is a candidate, none is the jar itself.
         facts.embedded = sorted({x[:3] for x in gavs})

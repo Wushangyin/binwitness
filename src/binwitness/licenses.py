@@ -197,6 +197,56 @@ def expression_family(expression: str) -> str:
     return UNKNOWN if value is None else FAMILIES[value]
 
 
+_ID_SHAPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*\+?$")
+
+
+def is_spdx_expression(expression: str, any_id: bool = False) -> bool:
+    """Whether a text is an SPDX license expression made of license ids alone, as an SPDX document can carry it
+    without extra declarations. Ids are those of :data:`SPDX_IDS`; ``any_id`` accepts any id-shaped name, for a
+    source that gives SPDX ids (deps.dev). Operators are upper case, as the specification writes them."""
+    tokens = re.findall(r"\(|\)|[^\s()]+", expression)
+    position = 0
+
+    def take(*expected) -> str:
+        nonlocal position
+        if position >= len(tokens) or (expected and tokens[position] not in expected):
+            raise ValueError
+        position += 1
+        return tokens[position - 1]
+
+    def identifier():
+        token = take()
+        # A LicenseRef is looked for among the document's own declarations.
+        if token in ("(", ")", "AND", "OR", "WITH") or not _ID_SHAPE.match(token) \
+                or token.startswith(("LicenseRef-", "DocumentRef-")) or not (any_id or token.rstrip("+") in SPDX_IDS):
+            raise ValueError
+
+    def term():
+        if position < len(tokens) and tokens[position] == "(":
+            take("(")
+            either()
+            take(")")
+            return
+        identifier()
+        if position < len(tokens) and tokens[position] == "WITH":
+            take("WITH")
+            exception = take()
+            if not (any_id and _ID_SHAPE.match(exception)):
+                raise ValueError
+
+    def either():
+        term()
+        while position < len(tokens) and tokens[position] in ("AND", "OR"):
+            take()
+            term()
+
+    try:
+        either()
+    except ValueError:
+        return False
+    return position == len(tokens) and bool(tokens)
+
+
 def pom_licenses(pom: str) -> list[str]:
     block = re.search(r"<licenses>(.*?)</licenses>", re.sub(r"<!--.*?-->", "", pom, flags=re.S), re.S)
     if not block:
