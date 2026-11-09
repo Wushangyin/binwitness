@@ -486,6 +486,41 @@ def test_cna_records_reach_the_jars_nvd_cannot_tell_of_yet(cna_world):
     assert summary["data_as_of"]["cvelist"] == "2026-10-30T01:00:00Z"
 
 
+def test_a_cpe_in_a_cnas_record_carries_a_cve_osv_attributes_to_the_release_as_a_whole(tmp_path, monkeypatch):
+    # OSV attributes CVE-2026-2101 to org.acme.web:web, a POM without a jar; NVD has not analysed it yet, and the
+    # CNA's record gives the CPE the family's jars learned.
+    monkeypatch.setattr(nvd, "FIRST_YEAR", YEAR)
+    umbrella = osv("GHSA-u1", "CVE-2026-2101", "org.acme.web:web")
+    umbrella["affected"][0]["versions"] = ["1.0"]
+    umbrella["affected"][0]["ranges"][0]["events"] = [{"introduced": "0"}, {"fixed": "2.0"}]
+    db = LocalDb(tmp_path / "db")
+    transport = ScriptedTransport({
+        "/Maven/all.zip": osv_zip(*FAMILY_OSV, umbrella), **feed_routes(f"nvdcve-2.0-{YEAR}", *FAMILY_NVD),
+        "/releases.atom": releases("cve_2026-10-29_2300Z"),
+        "/2026-10-29_all_CVEs_at_midnight.zip.zip": snapshot(
+            *SNAPSHOT[:3], cve5("CVE-2026-2101", affected("n/a", "n/a", UP_TO_2,
+                                                           cpes=["cpe:2.3:a:acme:web:*:*:*:*:*:*:*:*"]))),
+        "/2026-10-29_delta_CVEs_at_2300Z.zip": delta()})
+    for names in (["osv-maven", "nvd"], ["cvelist"]):
+        db.sync(names, fetcher=fetcher(transport), log=lambda m: None)
+    asked = []
+
+    def packaging(name, version):
+        asked.append((name, version))
+        return "pom"
+    table, _, summary = nvd.attach(LocalDb.open(tmp_path / "db"), FAMILY_ITEMS, FAMILY_FINDINGS, {},
+                                   {"maven": "osv-maven"}, None, FAMILY_LISTINGS, packaging=packaging)
+    core = FAMILY_ITEMS[0]["purl"]
+    entry = table["CVE-2026-2101"]
+    assert entry["record_from"] == "cna" and list(entry["affects"]) == [core]
+    pair = entry["affects"][core]
+    assert {k: pair[k] for k in ("cpe", "versions", "basis", "versions_from", "sibling", "sibling_evidence")} == {
+        "cpe": "acme:web", "versions": "< 2.0", "basis": "sibling", "versions_from": "osv", "sibling": "umbrella",
+        "sibling_evidence": "main_module"}
+    assert asked == [("org.acme.web:web", "1.0")]
+    assert summary["pairs_left_out"]["sibling_on_another_module"] == 2
+
+
 def test_a_package_read_from_a_repository_url_is_known_by_a_jar_that_is_its_published_artifact(cna_world):
     db, transport, sync, _ = cna_world
     transport.routes["/releases.atom"] = releases("cve_2026-10-30_0200Z")

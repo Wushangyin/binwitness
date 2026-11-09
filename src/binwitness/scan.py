@@ -193,8 +193,8 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None, cand
                           f"in, which published earlier versions and has no file under this one")
             elif hit.get("named_by"):
                 method = (f"file SHA-1 matches {':'.join(hit['alternatives'][0])} in the Maven Central index "
-                          f"(local copy), which republishes it; the coordinates come from the jar's "
-                          f"{hit['named_by']}, and the index has no file under them")
+                          f"(local copy), which republishes it; the index records one coordinate per file, so "
+                          f"the coordinates come from the jar's {hit['named_by']}")
             return {"coordinate": hit["coordinate"], "method": method, "confidence": "exact",
                     "published": "identical", "licenses": hit["licenses"], "alternatives": hit["alternatives"]}
         demoted = None
@@ -581,10 +581,14 @@ def scan(inputs: list[Path], net: Net, options: Options, log=None, db=None, cand
     store = candidates_db or db
     candidates, candidate_links, candidate_summary = nvd.attach(
         store, items, vulnerabilities, kev_dates, OSV_DATASET, _candidates_unavailable(options, store),
-        _Listings(jars, hosts, items), lambda name: upgrades.relocated_to(net, name, options.maven_repos))
+        _Listings(jars, hosts, items), lambda name: upgrades.relocated_to(net, name, options.maven_repos),
+        lambda name, version: maven.published_entries(net, name, version, options.maven_repos),
+        lambda name, version: upgrades.packaging(net, name, version, options.maven_repos))
     if candidate_summary["checked"]:
         log(f"candidates: {candidate_summary['total']} NVD records not attributed to a package, for "
             f"{candidate_summary['components']['with_link']} components with a learned CPE")
+    if warning := nvd.siblings_left_out(candidate_summary, net.offline):
+        warnings.append(warning)
     upgrades_not_checked = 0
     families: list[dict] = []
     if options.vulnerabilities and options.upgrades:

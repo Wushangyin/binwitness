@@ -37,6 +37,7 @@ import urllib.error
 import urllib.request
 import zipfile
 import zlib
+from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
@@ -156,7 +157,8 @@ DATASETS = {
                        "CPE yet", "650 MB download, then about 5 MB a day", "cvelist.sqlite"),
     # Last: it is read from the NVD and CNA records of the packages OSV knows.
     "fixes": Dataset("Files changed by the GitHub commits CVE records or vendor pages cite as the fix, for "
-                     "candidates", "about 430 commits from github.com, 8 MB download; then those of new records",
+                     "candidates", "about 4,500 commits from github.com, 50-90 MB download over half an hour; "
+                     "then those of new records",
                      "fixes.json"),
 }
 GROUPS = {"vulns": ("osv-maven", "osv-npm", "kev"), "java": ("osv-maven", "kev", "maven-hashes"),
@@ -1484,6 +1486,7 @@ class LocalDb:
             out[ident] = entry
         if self.has("cvelist"):
             self._cna_fix_records(attributed, out)
+        self._sibling_fix_records(out)
         for found in (pages or {}).values():
             for ident, keys in sorted(found.items()):
                 if ident in attributed:
@@ -1492,6 +1495,48 @@ class LocalDb:
                 entry["commits"] = list(dict.fromkeys([*entry["commits"], *keys]))
                 entry["patch"] = list(dict.fromkeys([*(entry["patch"] or []), *keys]))
         return out
+
+    def _sibling_fix_records(self, out: dict):
+        """The commits OSV's own advisories cite, for the CVEs it attributes to a module of a project it knows more
+        modules of: a jar of another module, or an all-in-one one, reaches such a CVE as a candidate (nvd.attach's
+        siblings), and the fix tells whether the jar holds the flawed code. The commits NVD's record of the CVE tags
+        as a patch count as the fix; the others the advisory or the record cite count as the project's own when
+        another advisory of the project cites their repository, since an advisory may also cite the fix of a product
+        that bundles the module."""
+        projects: dict[str, set[str]] = {}
+        advisories = []
+        for (body,) in self._rows("osv-maven", "SELECT body FROM records WHERE withdrawn = 0 ORDER BY id", ()):
+            record = json.loads(zlib.decompress(body))
+            names = {n for a in record.get("affected") or [] if ":" in (n := (a.get("package") or {}).get("name") or "")}
+            # A project with its subprojects, as nvd.family: the groupId cut to its first three parts.
+            homes = {".".join(n.split(":", 1)[0].split(".")[:3]) for n in names}
+            for name in names:
+                projects.setdefault(".".join(name.split(":", 1)[0].split(".")[:3]), set()).add(name)
+            idents = sorted({i for i in [record.get("id", ""), *(record.get("aliases") or [])] if i.startswith("CVE-")})
+            if idents and homes:
+                advisories.append((idents, homes, record.get("references") or []))
+        cited_by: dict[str, Counter] = {}
+        for _, homes, references in advisories:
+            for home in homes:
+                cited_by.setdefault(home, Counter()).update(fixes.repositories_cited(r.get("url") or "" for r in references))
+        for idents, homes, references in advisories:
+            if not any(len(projects.get(home, ())) > 1 for home in homes):
+                continue
+            for ident in idents:
+                if ident in out:
+                    continue
+                # NVD's record tells which commits are the patch; OSV's references carry no such tag.
+                refs = (self.nvd_record(ident) or {}).get("fix_refs")
+                cited = fixes.commits_cited([*(r.get("url") or "" for r in references), *(u for u, _ in refs or [])])
+                if not cited:
+                    continue
+                patch = None if refs is None else \
+                    {f"{r}@{s}" for r, s in fixes.commits_cited([u for u, tagged in refs if tagged])}
+                own = [f"{r}@{s}" for r, s in cited
+                       if f"{r}@{s}" in (patch or ()) or any(cited_by.get(home, Counter())[r] > 1 for home in homes)]
+                out[ident] = {"commits": own,
+                              "elsewhere": [fixes.commit_url(f"{r}@{s}") for r, s in cited if f"{r}@{s}" not in own],
+                              "patch": None if patch is None else [key for key in own if key in patch]}
 
     def _cna_fix_records(self, attributed: set[str], out: dict):
         """The commits the CNAs' records of CVEs NVD has given no CPE cite, in the repositories that the CVEs OSV

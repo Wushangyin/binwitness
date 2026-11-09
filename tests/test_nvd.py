@@ -568,6 +568,242 @@ def test_an_artifact_is_relocated_from_one_whose_last_word_it_shortens(tmp_path,
     assert summary["relocations_not_read"] == 0
 
 
+def listing_osv(osv_id, cve, name, *versions):
+    """An advisory that lists the versions it affects, as OSV's GitHub advisories do."""
+    entry = osv(osv_id, cve, name)
+    entry["affected"][0]["versions"] = list(versions)
+    entry["affected"][0]["ranges"][0]["events"] = [{"introduced": "0"}, {"fixed": "2.0"}]
+    return entry
+
+
+# A server (org.acme.srv) published as modules, a release as a whole without a jar (srv, the umbrella), and a
+# module (srv-catalina) whose classes the embedded server's jar bundles. OSV attributes some CVEs to srv or
+# srv-catalina only; NVD gives them the CPE the delivered modules learned.
+SRV_OSV = [*[osv(f"GHSA-c{n}", f"CVE-2024-300{n}", "org.acme.srv:srv-core") for n in (1, 2, 3)],
+           *[osv(f"GHSA-j{n}", f"CVE-2024-301{n}", "org.acme.srv:srv-jasper") for n in (1, 2)],
+           *[osv(f"GHSA-e{n}", f"CVE-2024-302{n}", "org.acme.srv:srv-embed") for n in (1, 2)],
+           listing_osv("GHSA-u1", "CVE-2025-3101", "org.acme.srv:srv", "1.0", "1.1"),
+           listing_osv("GHSA-u2", "CVE-2025-3102", "org.acme.srv:srv-catalina", "1.0"),
+           listing_osv("GHSA-u3", "CVE-2025-3103", "org.acme.srv:srv-unread", "1.0"),
+           listing_osv("GHSA-u4", "CVE-2025-3104", "org.acme.srv:srv", "1.0"),
+           listing_osv("GHSA-u5", "CVE-2025-3105", "org.acme.srv:srv", "2.0"),
+           listing_osv("GHSA-u6", "CVE-2025-3106", "org.acme.srv:srv-core-jdk18on", "1.0"),
+           listing_osv("GHSA-u7", "CVE-2025-3107", "org.acme.srv:srv-gone", "1.0"),
+           listing_osv("GHSA-u8", "CVE-2025-3108", "org.acme.srv:srv-catalina", "1.0"),
+           # The release as a whole and a module with a jar no delivered jar holds: the latter places the flaw.
+           listing_osv("GHSA-u9", "CVE-2025-3109", "org.acme.srv:srv", "1.0"),
+           listing_osv("GHSA-u10", "CVE-2025-3109", "org.acme.srv:srv-coyote", "1.0")]
+SRV_NVD = [*[record(f"CVE-2024-30{n}", cpe("acme", "srv", versionEndExcluding="0.5"))
+             for n in ("01", "02", "03", "11", "12", "21", "22")],
+           *[record(f"CVE-2025-310{n}", cpe("acme", "srv", versionEndExcluding="2.0")) for n in (2, 3, 5, 6, 7, 9)],
+           # The umbrella's own name begins every module's and names none of them.
+           record("CVE-2025-3101", cpe("acme", "srv", versionEndExcluding="2.0"),
+                  description="org.acme.srv:srv before 2.0 accepts a malformed request line."),
+           record("CVE-2025-3104", cpe("acme", "srv", versionEndExcluding="2.0"),
+                  description="The JSP compiler of org.acme.srv:srv-jasper before 2.0 runs any page."),
+           record("CVE-2025-3108", cpe("acme", "srv", versionEndExcluding="2.0"),
+                  description="StandardValve.invoke() of Acme Srv before 2.0 skips the next ValveBase.")]
+SRV_ITEMS = [item("org.acme.srv:srv-core"), item("org.acme.srv:srv-jasper"), item("org.acme.srv:srv-embed")]
+SRV_LISTINGS = Listings({
+    "org.acme.srv:srv-core": {"org/acme/srv/core/Server.class", "org/acme/srv/core/ValveBase.class"},
+    "org.acme.srv:srv-jasper": {"org/acme/srv/jasper/JspCompiler.class"},
+    "org.acme.srv:srv-embed": {"org/acme/srv/core/Server.class", "org/acme/srv/catalina/StandardValve.class",
+                               "org/acme/srv/catalina/Realm.class"},
+})
+CATALINA = frozenset({"META-INF/MANIFEST.MF", "org/acme/srv/catalina/StandardValve.class",
+                      "org/acme/srv/catalina/Realm.class", "org/acme/srv/catalina/Engine.class"})
+PACKAGING = {"org.acme.srv:srv": "pom", "org.acme.srv:srv-catalina": "jar", "org.acme.srv:srv-core-jdk18on": "jar",
+             "org.acme.srv:srv-coyote": "jar",
+             "org.acme.srv:srv-gone": None}
+PUBLISHED = {"org.acme.srv:srv-catalina": CATALINA,
+             "org.acme.srv:srv-core-jdk18on": frozenset({"org/acme/srv/core/jdk18/Provider.class"}),
+             "org.acme.srv:srv-coyote": frozenset({"org/acme/srv/coyote/Http11Processor.class"})}
+
+
+@pytest.fixture
+def srv_world(tmp_path, monkeypatch):
+    monkeypatch.setattr(nvd, "FIRST_YEAR", YEAR)
+    db = LocalDb(tmp_path / "srv")
+    transport = ScriptedTransport({"/Maven/all.zip": osv_zip(*SRV_OSV), **feed_routes(f"nvdcve-2.0-{YEAR}", *SRV_NVD)})
+    db.sync(["osv-maven", "nvd"], fetcher=fetcher(transport), log=lambda m: None)
+    return LocalDb.open(tmp_path / "srv")
+
+
+def poms_asked(asked, offline=False):
+    def packaging(name, version):
+        asked.append(("packaging", name, version))
+        if offline or name == "org.acme.srv:srv-unread":
+            raise NetError("not in the cache" if offline else "no answer")
+        return PACKAGING[name]
+
+    def published(name, version):
+        asked.append(("entries", name, version))
+        if offline:
+            raise NetError("not in the cache")
+        return PUBLISHED.get(name)
+    return packaging, published
+
+
+def test_a_cve_osv_attributes_to_another_module_reaches_the_jar_that_holds_it_or_one_module(srv_world):
+    asked = []
+    packaging, published = poms_asked(asked)
+    table, _, summary = nvd.attach(srv_world, SRV_ITEMS, {}, {}, {"maven": "osv-maven"}, None, SRV_LISTINGS,
+                                   jar_entries=published, packaging=packaging)
+    core, jasper, embed = (i["purl"] for i in SRV_ITEMS)
+
+    def pairs(ident):
+        return {ref: (a["sibling"], a["sibling_evidence"]) for ref, a in table[ident]["affects"].items()}
+    # srv publishes no jar: its CVE goes to the module the record names, or else to the project's main module.
+    assert pairs("CVE-2025-3101") == {core: ("umbrella", "main_module")}
+    assert pairs("CVE-2025-3104") == {jasper: ("umbrella", "modules_named")}
+    # srv-catalina does: its CVEs go to the jar that holds its classes, as the record names them or by listing;
+    # not to srv-core, which holds a class the record names that is not srv-catalina's (ValveBase).
+    assert pairs("CVE-2025-3102") == {embed: ("aggregate", "listing")}
+    assert pairs("CVE-2025-3108") == {embed: ("aggregate", "named_classes")}
+    # Not: a version srv's advisory does not list; a module whose POM could not be read (srv-unread) or is not
+    # published (srv-gone); for srv-core, a build of its own module, which is OSV's judgement on it, and for the
+    # others that build's classes are not in their jars; srv's CVE that OSV attributes to srv-coyote too, whose
+    # classes no jar holds.
+    assert not {"CVE-2025-3103", "CVE-2025-3105", "CVE-2025-3106", "CVE-2025-3107", "CVE-2025-3109"} & set(table)
+    pair = table["CVE-2025-3101"]["affects"][core]
+    assert {k: pair[k] for k in ("cpe", "versions", "basis", "versions_from", "attributed_to")} == {
+        "cpe": "acme:srv", "versions": "< 2.0", "basis": "sibling", "versions_from": "osv",
+        "attributed_to": ["org.acme.srv:srv"]}
+    assert summary["pairs_by_basis"] == {"sibling": 4}
+    assert summary["pairs_flagged"]["sibling_module_undetermined"] == 1
+    assert summary["pairs_left_out"] == {"sibling_classes_not_in_jar": 6, "sibling_not_read": 3, "sibling_not_told": 3,
+                                         "sibling_on_another_module": 7}
+    assert summary["siblings_not_read"] == 1
+    # Each POM and jar directory is read once, and only where the index does not tell (it is not installed here).
+    assert sorted(asked) == [
+        ("entries", "org.acme.srv:srv-catalina", "1.0"), ("entries", "org.acme.srv:srv-core-jdk18on", "1.0"),
+        ("entries", "org.acme.srv:srv-coyote", "1.0"),
+        ("packaging", "org.acme.srv:srv", "1.0"), ("packaging", "org.acme.srv:srv-catalina", "1.0"),
+        ("packaging", "org.acme.srv:srv-core-jdk18on", "1.0"), ("packaging", "org.acme.srv:srv-coyote", "1.0"),
+        ("packaging", "org.acme.srv:srv-gone", "1.0"), ("packaging", "org.acme.srv:srv-unread", "1.0")]
+
+
+def test_the_main_module_is_not_given_a_cve_whose_fix_or_named_classes_it_does_not_hold(tmp_path, monkeypatch):
+    monkeypatch.setattr(nvd, "FIRST_YEAR", YEAR)
+    extra_osv = [listing_osv("GHSA-u11", "CVE-2025-3110", "org.acme.srv:srv", "1.0"),
+                 listing_osv("GHSA-u12", "CVE-2025-3111", "org.acme.srv:srv", "1.0")]
+    # A Java source file names its class, however short the name.
+    leak = "Acme Srv before 2.0 discloses passwords via admin/controller/UserController.java."
+    extra_nvd = [record("CVE-2025-3110", cpe("acme", "srv", versionEndExcluding="2.0"), description=leak),
+                 record("CVE-2025-3111", cpe("acme", "srv", versionEndExcluding="2.0"),
+                        description="Acme Srv before 2.0 lists its services to anyone.")]
+    db = LocalDb(tmp_path / "srv")
+    transport = ScriptedTransport({"/Maven/all.zip": osv_zip(*SRV_OSV, *extra_osv),
+                                   **feed_routes(f"nvdcve-2.0-{YEAR}", *SRV_NVD, *extra_nvd)})
+    db.sync(["osv-maven", "nvd"], fetcher=fetcher(transport), log=lambda m: None)
+    world = LocalDb.open(tmp_path / "srv")
+    facts = nvd.Naming.of({"description": leak})
+    assert ("UserController" in facts.classes, "UserController" in facts.confirmed) == (True, True)
+    fixed = {"CVE-2025-3111": {"classes": ["org.acme.srv.transport.ServiceListWriter"]}}
+    monkeypatch.setattr(world, "fix_of", lambda ident: fixed.get(ident))
+    packaging, published = poms_asked([])
+    table, _, summary = nvd.attach(world, SRV_ITEMS, {}, {}, {"maven": "osv-maven"}, None, SRV_LISTINGS,
+                                   jar_entries=published, packaging=packaging)
+    # The flaw is in a module the delivery does not hold: neither CVE goes to the main module; srv's others still do.
+    assert not {"CVE-2025-3110", "CVE-2025-3111"} & set(table)
+    assert {a["sibling_evidence"] for a in table["CVE-2025-3101"]["affects"].values()} == {"main_module"}
+    assert summary["pairs_left_out"]["sibling_classes_not_in_jar"] == 6 + 2 * len(SRV_ITEMS)
+
+
+def test_a_fix_of_another_line_or_of_one_class_of_several_does_not_keep_the_cve_off_and_a_finding_places_it(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(nvd, "FIRST_YEAR", YEAR)
+    extra_osv = [listing_osv(f"GHSA-u{n}", f"CVE-2025-31{n}", "org.acme.srv:srv", "1.0") for n in (12, 13, 14)]
+    extra_nvd = [record("CVE-2025-3112", cpe("acme", "srv", versionEndExcluding="2.0"),
+                        description="Acme Srv before 2.0 lets cookies bypass the httpOnly flag."),
+                 record("CVE-2025-3113", cpe("acme", "srv", versionEndExcluding="2.0"),
+                        description="Acme Srv before 2.0 lets ValveBase or JspCompiler loop on a crafted request."),
+                 record("CVE-2025-3114", cpe("acme", "srv", versionEndExcluding="2.0"),
+                        description="Acme Srv before 2.0 smuggles requests.")]
+    db = LocalDb(tmp_path / "srv")
+    transport = ScriptedTransport({"/Maven/all.zip": osv_zip(*SRV_OSV, *extra_osv),
+                                   **feed_routes(f"nvdcve-2.0-{YEAR}", *SRV_NVD, *extra_nvd)})
+    db.sync(["osv-maven", "nvd"], fetcher=fetcher(transport), log=lambda m: None)
+    world = LocalDb.open(tmp_path / "srv")
+    # 3112's commits are of the project's older line under another package; 3113's fix one class it names, not
+    # in the delivery, while ValveBase is in srv-core's jar and JspCompiler in srv-jasper's.
+    fixed = {"CVE-2025-3112": {"classes": ["org.ancient.srv.http.CookieDecoder"]},
+             "CVE-2025-3113": {"classes": ["org.acme.srv.transport.Loop"]}}
+    monkeypatch.setattr(world, "fix_of", lambda ident: fixed.get(ident))
+
+    def run(items, vulnerabilities):
+        packaging, published = poms_asked([])
+        return nvd.attach(world, items, vulnerabilities, {}, {"maven": "osv-maven"}, None, SRV_LISTINGS,
+                          jar_entries=published, packaging=packaging)[0]
+
+    def evidence(table, ident):
+        return {ref.split("/")[-1]: a["sibling_evidence"] for ref, a in table.get(ident, {}).get("affects", {}).items()}
+    table = run(SRV_ITEMS, {})
+    assert evidence(table, "CVE-2025-3112") == {"srv-core@1.0": "main_module"}
+    assert evidence(table, "CVE-2025-3113") == {"srv-core@1.0": "named_classes", "srv-jasper@1.0": "named_classes"}
+    assert evidence(table, "CVE-2025-3114") == {"srv-core@1.0": "main_module"}
+    # A finding of srv-embed (an online lookup knows the attribution) places 3114 there.
+    found = [item("org.acme.srv:srv-core"), item("org.acme.srv:srv-jasper"),
+             item("org.acme.srv:srv-embed", vulnerabilities=["GHSA-x14"])]
+    table = run(found, {"GHSA-x14": {"aliases": ["CVE-2025-3114"]}})
+    assert "CVE-2025-3114" not in table and evidence(table, "CVE-2025-3112") == {"srv-core@1.0": "main_module"}
+    # A finding of another line (srv-embed 0.9) places nothing in 1.0.
+    other_line = [item("org.acme.srv:srv-core"), item("org.acme.srv:srv-jasper"),
+                  item("org.acme.srv:srv-embed", version="0.9", vulnerabilities=["GHSA-x14"])]
+    table = run(other_line, {"GHSA-x14": {"aliases": ["CVE-2025-3114"]}})
+    assert evidence(table, "CVE-2025-3114") == {"srv-core@1.0": "main_module"}
+
+
+def test_classes_of_a_fix_the_jar_shares_with_the_module_say_nothing_when_the_classes_named_are_not_there(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(nvd, "FIRST_YEAR", YEAR)
+    monkeypatch.setitem(PUBLISHED, "org.acme.srv:srv-catalina",
+                        CATALINA | {"org/acme/srv/catalina/StandardEngine.class"})
+    extra_osv = [listing_osv(f"GHSA-u{n}", f"CVE-2025-31{n}", "org.acme.srv:srv-catalina", "1.0") for n in (15, 16)]
+    extra_nvd = [record("CVE-2025-3115", cpe("acme", "srv", versionEndExcluding="2.0"),
+                        description="StandardEngine of Acme Srv before 2.0 loops on a crafted request."),
+                 record("CVE-2025-3116", cpe("acme", "srv", versionEndExcluding="2.0"),
+                        description="Acme Srv before 2.0 accepts any password.")]
+    db = LocalDb(tmp_path / "srv")
+    transport = ScriptedTransport({"/Maven/all.zip": osv_zip(*SRV_OSV, *extra_osv),
+                                   **feed_routes(f"nvdcve-2.0-{YEAR}", *SRV_NVD, *extra_nvd)})
+    db.sync(["osv-maven", "nvd"], fetcher=fetcher(transport), log=lambda m: None)
+    world = LocalDb.open(tmp_path / "srv")
+    # 3115's commit is a release's, fixing StandardEngine and a flaw of the Realm srv-embed holds as well.
+    fixed = {"CVE-2025-3115": {"classes": ["org.acme.srv.catalina.Realm", "org.acme.srv.catalina.StandardEngine"]},
+             "CVE-2025-3116": {"classes": ["org.acme.srv.catalina.Realm"]}}
+    monkeypatch.setattr(world, "fix_of", lambda ident: fixed.get(ident))
+    packaging, published = poms_asked([])
+    table = nvd.attach(world, SRV_ITEMS, {}, {}, {"maven": "osv-maven"}, None, SRV_LISTINGS,
+                       jar_entries=published, packaging=packaging)[0]
+    assert "CVE-2025-3115" not in table
+    assert {ref.split("/")[-1]: a["sibling_evidence"] for ref, a in table["CVE-2025-3116"]["affects"].items()} \
+        == {"srv-embed@1.0": "fixed_classes"}
+
+
+def test_the_hash_index_tells_a_module_has_a_jar_and_offline_the_rest_is_counted(srv_world, monkeypatch):
+    has = srv_world.has
+    monkeypatch.setattr(srv_world, "has", lambda name: name == "maven-hashes" or has(name))
+    monkeypatch.setattr(srv_world, "maven_versions",
+                        lambda group, artifact: ["1.0"] if artifact == "srv-catalina" else [])
+    asked = []
+    packaging, published = poms_asked(asked, offline=True)
+    table, _, summary = nvd.attach(srv_world, SRV_ITEMS, {}, {}, {"maven": "osv-maven"}, None, SRV_LISTINGS,
+                                   jar_entries=published, packaging=packaging)
+    # srv-catalina's jar is in the index, so its POM is not read; but its classes cannot be had offline, so not even
+    # the CVE whose record names one of them is placed. srv's packaging cannot be read either.
+    assert table == {}
+    assert ("packaging", "org.acme.srv:srv-catalina", "1.0") not in asked
+    assert ("entries", "org.acme.srv:srv-catalina", "1.0") in asked
+    assert summary["pairs_left_out"] == {"sibling_not_read": 23}
+    assert summary["siblings_not_read"] == 6
+    assert nvd.siblings_left_out(summary, True) == ("candidates: 23 pairs for CVEs OSV attributes to another module of "
+                                                    "the project left out (sibling_not_read 23); an online scan can "
+                                                    "tell 23 of them")
+    assert nvd.siblings_left_out(summary, False).endswith("(sibling_not_read 23)")
+    assert nvd.siblings_left_out({"pairs_left_out": {"names_another_module": 2}}, True) is None
+
+
 def test_no_candidates_without_the_datasets(world, tmp_path):
     table, links, summary = nvd.attach(world, [item("org.example:lib")], {}, {}, {}, None)
     assert table == {} and summary["checked"] is False
@@ -608,7 +844,8 @@ def test_candidates_carry_what_their_records_name(family_world):
     assert summary["pairs"] == 14 and summary["components"]["with_link"] == 3
     assert summary["pairs_flagged"] == {"same_flaw_as_a_finding": 2, "other_language_only": 3,
                                         "named_classes_not_in_jar": 1, "advisory_names_another_module": 0,
-                                        "fixed_classes_not_in_jar": 0, "below_listed_lines": 0}
+                                        "fixed_classes_not_in_jar": 0, "below_listed_lines": 0,
+                                            "sibling_module_undetermined": 0}
     assert summary["pairs_by_basis"] == {"learned": 13, "named": 1} and summary["pairs_versions_from"] == {"nvd": 14}
     assert summary["pairs_reached_by_name"] == 1 and summary["pairs_left_out"] == {"names_another_module": 2}
     assert summary["links_refused"] == {"version_ranges_apart": 3}
@@ -790,8 +1027,9 @@ def cites(record_, *references):
 
 
 # The family's records, citing commits: the attributed ones pages and a commit of acme/web, which tell that it is the
-# project's repository (an attributed CVE's own commits are not read: only candidates are flagged by their fix); the
-# candidates its commits, tagged or not as the patch, and one of another project.
+# project's repository (an attributed CVE's own commits are read too, since the project has several modules: another
+# module's jar may reach it as a candidate); the candidates its commits, tagged or not as the patch, and one of
+# another project.
 FIX_CITED = {
     "CVE-2024-1001": [(f"{WEB}/releases/tag/v0.5", []), (f"{WEB}/commit/{E}", ["Patch"])],
     "CVE-2025-1302": [(f"{WEB}/commit/{D}", ["Patch"])],
@@ -916,7 +1154,7 @@ def test_fix_commits_sync_from_github_and_go_on_where_they_stopped(fix_world, tm
                                f"/acme/web/commit/{C}.diff": (503, b"")})
     assert fix_world.sync(["fixes"], fetcher=localdb.Fetcher(opener=opener(first), sleep=slept.append),
                           log=lambda m: None) == {
-        "fixes": "fetched 4 commits; 4 of the 5 cited by 4 records held; 1 not fetched (downloads failed): "
+        "fixes": "fetched 4 commits; 4 of the 5 cited by 5 records held; 1 not fetched (downloads failed): "
                  f"sync fixes again later{ALONE}"}
     # GitHub's 429 passes: it is waited out, as a server error is, rather than ending the sync.
     assert slept == [2, 4, 2, 4, 8, 16]
@@ -928,23 +1166,27 @@ def test_fix_commits_sync_from_github_and_go_on_where_they_stopped(fix_world, tm
     assert "4 commits read; 1 not fetched yet: sync fixes again" in capsys.readouterr().out
     assert [c["read"] for c in fix_world.fix_of("CVE-2025-1305")["commits"]] == ["main classes", "not read"]
     assert [c["read"] for c in fix_world.fix_of("CVE-2025-1302")["commits"]] == ["not found"]
+    # An attributed CVE's fix, as NVD tags it: its commit changed no main-code class.
+    attributed = fix_world.fix_of("CVE-2024-1001")
+    assert ([(c["patch_tag"], c["read"]) for c in attributed["commits"]], attributed["classes"]) == (
+        [(True, "no main-code class")], [])
     # What was fetched stays, also when the sync was cut short before it was recorded: only the rest is asked.
     del fix_world.state["fixes"]
     fix_world._write_state()
     rest = ScriptedTransport(DIFF_ROUTES)
     assert fix_world.sync(["fixes"], fetcher=fetcher(rest), log=lambda m: None) == {
-        "fixes": f"fetched 1 commit; 5 of the 5 cited by 4 records held{ALONE}"}
+        "fixes": f"fetched 1 commit; 5 of the 5 cited by 5 records held{ALONE}"}
     assert [url.rsplit("/", 1)[1] for url in commits_asked(rest)] == [f"{C}.diff"]
     again = ScriptedTransport(DIFF_ROUTES)
     assert fix_world.sync(["fixes"], fetcher=fetcher(again), log=lambda m: None) == {
-        "fixes": f"up to date: 5 commits cited by 4 records{ALONE}"}
+        "fixes": f"up to date: 5 commits cited by 5 records{ALONE}"}
     assert commits_asked(again) == []
     # When GitHub keeps refusing, the sync stops asking, and is not a failure: the next one goes on.
     fix_world.remove(["fixes"])
     monkeypatch.setattr(localdb, "FIX_FAILURES_TO_STOP", 2)
     refused = ScriptedTransport({"github.com": (429, b"")})
     assert fix_world.sync(["fixes"], fetcher=fetcher(refused), log=lambda m: None) == {
-        "fixes": "fetched 0 commits; 0 of the 5 cited by 4 records held; 5 not fetched (GitHub stopped answering): "
+        "fixes": "fetched 0 commits; 0 of the 5 cited by 5 records held; 5 not fetched (GitHub stopped answering): "
                  f"sync fixes again later{ALONE}"}
     assert len(commits_asked(refused)) == 2 * localdb.Fetcher.retries
     assert LocalDb(tmp_path / "none").sync(["fixes"], fetcher=fetcher(refused), log=lambda m: None) == {
@@ -1152,6 +1394,41 @@ def test_links_shared_by_relocation_reach_the_files_and_the_mcp_tools(tmp_path, 
     assert detail["links"][0]["meaning"].startswith(
         "learned for org.lonely:solo, which the POM of org.older:solo 2.0 relocates to or from the package: "
         "1 of the 1 CVEs OSV attributes to org.lonely:solo")
+
+
+def test_siblings_reach_the_files_and_the_mcp_tools(tmp_path, delivery, world, srv_world):  # noqa: F811
+    result = online_scan(tmp_path, delivery, world)
+    packaging, published = poms_asked([])
+    table, links, summary = nvd.attach(srv_world, SRV_ITEMS, {}, {}, {"maven": "osv-maven"}, None, SRV_LISTINGS,
+                                       jar_entries=published, packaging=packaging)
+    result["candidates"], result["candidate_links"], result["summary"]["candidates"] = table, links, summary
+    out = tmp_path / "out"
+    write_all(result, out)
+    rows = {(r["id"], r["component"]): r for r in csv.DictReader((out / "candidates.csv").open(encoding="utf-8-sig"))}
+    core, jasper, embed = (i["purl"] for i in SRV_ITEMS)
+    assert (rows[("CVE-2025-3101", core)]["reached by"], rows[("CVE-2025-3101", core)]["versions from"]) == (
+        "learned link; OSV attributes the CVE to org.acme.srv:srv, which publishes no jar at this version: the record "
+        "does not say which module; this is the project's main one", "OSV's advisory for the other module")
+    assert rows[("CVE-2025-3101", core)]["module not determined by the record"] == "yes"
+    assert rows[("CVE-2025-3102", embed)]["reached by"] == (
+        "learned link; OSV attributes the CVE to org.acme.srv:srv-catalina, whose code this jar bundles: it holds at "
+        "least half of its classes")
+    assert rows[("CVE-2025-3102", embed)]["module not determined by the record"] == ""
+    text = render_summary(result)
+    assert "learned link, for a CVE OSV attributes to another module of the project 4" in text
+    assert "module not determined by the record 1" in text
+    assert ("the jar holds none of the code of the module OSV names 6, the module OSV names could not be read 3, "
+            "nothing tells whether the jar holds the code of the module OSV names 3, the CVE is placed on another "
+            "module of the project 7") in text
+    assert "; 1 POMs or jar listings of other modules not read" in text
+    service = Service(Config(results=tmp_path / "results", lookup="local"),
+                      net=Net(cache_dir=tmp_path / "c", offline=True, transport=ScriptedTransport({"": never})))
+    scan_id = service.open_result(str(out))["scan_id"]
+    state = service.overview(scan_id)["candidates"]
+    assert state["siblings_not_read"] == 1 and state["pairs_flagged"]["sibling_module_undetermined"] == 1
+    [affected] = service.get_candidate(scan_id, "CVE-2025-3101")["affects"]
+    assert (affected["sibling"], affected["attributed_to"], affected["sibling_evidence"], affected["flags"]) == (
+        "umbrella", ["org.acme.srv:srv"], "main_module", ["sibling_module_undetermined"])
 
 
 def test_flags_reach_the_files_and_the_mcp_tools(tmp_path, delivery, world, family_world):  # noqa: F811

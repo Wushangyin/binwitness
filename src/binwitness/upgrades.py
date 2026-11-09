@@ -455,6 +455,31 @@ def relocation(net: Net, name: str, version: str, repositories: tuple[str, ...] 
     return None
 
 
+def packaging(net: Net, name: str, version: str, repositories: tuple[str, ...] = ()) -> str | None:
+    """The ``<packaging>`` the POM of ``version`` declares, ``jar`` when it declares none; None when no repository
+    has the POM. Raises NetError when none has it and one could not be read. The hash index cannot tell: it files
+    each file under one coordinate, so a version republished elsewhere has no file under its own."""
+    group, artifact = name.split(":", 1)
+    failure = None
+    for repository in (CENTRAL, *repositories):
+        try:
+            body = net.get(f"{repository}/{group.replace('.', '/')}/{artifact}/{version}/{artifact}-{version}.pom",
+                           stable=True)
+        except NetError as error:
+            failure = failure or error
+            continue
+        if body is not None:
+            body = re.sub(rb"<!--.*?-->", b"", body, flags=re.S)
+            # The project's own, not one inside <parent>, <dependencies> or a plugin's configuration.
+            body = re.sub(rb"<(parent|dependencies|dependencyManagement|build|profiles|reporting)\b.*?</\1\s*>", b"",
+                          body, flags=re.S)
+            match = re.search(rb"<packaging>\s*([^<\s]+)\s*</packaging>", body)
+            return match.group(1).decode("utf-8", "replace") if match else "jar"
+    if failure:
+        raise failure
+    return None
+
+
 def relocated_to(net: Net, name: str, repositories: tuple[str, ...] = ()) -> tuple[str, str] | None:
     """Where the latest POM of a Maven artifact relocates it, as :func:`relocation`. The versions are the
     repositories' own list: the hash index has none without a jar, and a POM that relocates comes without one

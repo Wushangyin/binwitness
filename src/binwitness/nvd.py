@@ -596,9 +596,10 @@ class Naming:
             [label for label, pattern in _LANGUAGE_PATTERNS.items() if pattern.search(text)] + bound))
         qualified = list(dict.fromkeys(_QUALIFIED_CLASS.findall(text)))
         tails = {q.rsplit(".", 1)[1] for q in qualified}
-        # A member of 2-4 letters is more often a domain or a file type (Node.js, Socket.IO) than a field.
+        # A member of 2-4 letters is more often a domain or a file type (Node.js, Socket.IO) than a field; a Java
+        # source file (UserController.java) is a class's.
         referenced = {w for w, member, call in _MEMBER.findall(text)
-                      if call or len(member) >= 5 or any(c.isupper() for c in member)}
+                      if call or len(member) >= 5 or any(c.isupper() for c in member) or member == "java"}
         referenced |= {f.rsplit(".", 1)[-1] for f in fixed}
         # A bare word counts when it reads as a class name (UrlFilenameViewController), or when it is one in a
         # jar at hand, or is followed by a member; WebFlux or GitHub could as well be a product or a concept.
@@ -664,15 +665,63 @@ def _holds(index: tuple[set[str], set[str]], name: str) -> bool:
     return name.lower() in simple
 
 
+def _file_index(entries: set[str]) -> dict[str, list[str]]:
+    """A jar's class files (given lowercase) by their name and each part of it (Outer and Inner of Outer$Inner)."""
+    # Lists, and the entries themselves: the jars of a large delivery hold some 100,000 classes.
+    index: dict[str, list[str]] = {}
+    for entry in entries:
+        stem = entry.rsplit("/", 1)[-1][:-len(".class")]
+        index.setdefault(stem, []).append(entry)
+        if "$" in stem:
+            for key in set(stem.split("$")):
+                index.setdefault(key, []).append(entry)
+    return index
+
+
+def _code_roots(classes: list[str]) -> set[str]:
+    """The folders that tell the project of qualified classes: the first three parts of the package (org/jboss/netty/),
+    or all of it when shorter (org/xnio/)."""
+    return {"/".join(name.split(".")[:-1][:3]) + "/" for name in classes if "." in name}
+
+
+def _folder_runs(entries: set[str]) -> set[str]:
+    """Each run of one to three folders in a jar's entry paths (org/, org/xnio/, xnio/nio/...): a project's folders
+    wherever they are, also relocated (shaded) below others."""
+    runs = set()
+    for folder in {e.rsplit("/", 1)[0] for e in entries if "/" in e}:
+        parts = folder.split("/")
+        for start in range(len(parts)):
+            for size in (1, 2, 3):
+                if start + size <= len(parts):
+                    runs.add("/".join(parts[start:start + size]) + "/")
+    return runs
+
+
+def _files_at(path: str, index: dict[str, list[str]]) -> set[str]:
+    """The class files of an index at a path (lowercase), also below a folder it was relocated (shaded) into."""
+    return {e for e in index.get(path.rsplit("/", 1)[-1][:-len(".class")], ()) if e == path or e.endswith("/" + path)}
+
+
+def _files_of(name: str, index: dict[str, list[str]]) -> set[str]:
+    """The class files of an index that are a class a record names: a plain name by name, a qualified one by path."""
+    if "." in name:
+        return _files_at(name.replace(".", "/").lower() + ".class", index)
+    return set(index.get(name.lower(), ()))
+
+
 # ---- candidates -----------------------------------------------------------------------------------------
 
 def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datasets: dict[str, str],
-           reason: str | None, listings=None, moved_to=None) -> tuple[dict, dict, dict]:
+           reason: str | None, listings=None, moved_to=None, jar_entries=None,
+           packaging=None) -> tuple[dict, dict, dict]:
     """(candidates by CVE id, links by purl, summary). ``datasets``: ecosystem -> its OSV dataset name;
     ``reason``: why candidates cannot be looked for at all, if so; ``listings``: the jar entries at hand, with
     ``of(item)`` (the class entries of the jar holding an item, None when unknown), ``has_class(name)`` and,
     optionally, ``unsure(item)`` (entries it may or may not hold); ``moved_to(name)``: where the latest POM of a
-    Maven artifact relocates it, as (new name, which POM says so), or None; NetError when it cannot be read."""
+    Maven artifact relocates it, as (new name, which POM says so), or None; ``jar_entries(name, version)``: the
+    entries of the jar a Maven artifact publishes at a version, None when it publishes none;
+    ``packaging(name, version)``: the packaging its POM declares, None when no repository has the POM. All three
+    raise NetError when they cannot be read."""
     if reason:
         return {}, {}, {"checked": False, "not_checked": reason}
     linker = Linker(db)
@@ -832,6 +881,34 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
                                         if any((relocations[other] or ("",))[0] != item["name"] for other, _ in others)}),
                      RELOCATION_READERS)
 
+    # OSV often attributes a CVE to another coordinate of the project only: the release as a whole, a POM or a
+    # distribution that has no jar (org.apache.tomcat:tomcat), or the module the flaw is in when the delivery holds a
+    # jar that bundles it (tomcat-catalina's classes in tomcat-embed-core). Such a CVE reaches a component of the
+    # family through the CPE linked with it, when the advisory lists the component's version for that coordinate.
+    sibling_affected: dict[str, dict[str, tuple[list, set[str]]]] = {}
+    leads: dict[tuple[str, str, str], dict[str, tuple[dict, str, Link, list[str]]]] = {}
+
+    def listed_for(name: str, ident: str) -> tuple[list, set[str]]:
+        # What the records say of the package, not the records: a family's advisories, held whole, are tens of MB.
+        if name not in sibling_affected:
+            by_cve: dict[str, list[dict]] = {}
+            for record in db.osv_records("maven", name):
+                for cve in cve_ids(record):
+                    by_cve.setdefault(cve, []).append(record)
+            sibling_affected[name] = {cve: osv_affected(found, name, cve) for cve, found in by_cve.items()}
+        return sibling_affected[name].get(ident) or ([], set())
+
+    def siblings(ident: str, item: dict, attributed: set) -> list[str]:
+        """The packages of the item's family OSV attributes the CVE to whose advisory lists the item's version;
+        none when OSV attributes it to a build of the item's own module, which is a judgement on it."""
+        if item["ecosystem"] != "maven" or ":" not in item["name"]:
+            return []
+        home, module = family("maven", item["name"]), module_of(item["name"].split(":", 1)[1])
+        kin = sorted(n for e, n in attributed if e == "maven" and ":" in n and family("maven", n) == home)
+        if any(module_of(n.split(":", 1)[1]) == module for n in kin):
+            return []
+        return [n for n in kin if item["version"] in listed_for(n, ident)[1]]
+
     item_links: dict[str, dict[str, Link]] = {}
     shared_links: dict[str, dict[str, tuple[str, str]]] = {}
     for item in items:
@@ -864,7 +941,13 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
         for cpe, link in links.items():
             ids, attributed = linker.product(cpe)
             for ident in ids:
-                if ident in own or attributed.get(ident):
+                if ident in own:
+                    continue
+                if attributed.get(ident):
+                    kin = siblings(ident, item, attributed[ident])
+                    if kin:
+                        leads.setdefault((ident, home, item["version"]), {}).setdefault(
+                            item["purl"], (item, cpe, link, kin))
                     continue
                 hit = hit_of(ident, cpe, ecosystem, item["version"])
                 if hit is None:
@@ -940,7 +1023,16 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
         name, version, own = item["name"], item["version"], _own_ids(item, vulnerabilities)
         home, linked_here = family("maven", name), item_links[purl]
         for ident, paths in sorted(found.items()):
-            if ident in own or attribution.get(ident) or purl in table.get(ident, {}).get("affects", {}):
+            if ident in own or purl in table.get(ident, {}).get("affects", {}):
+                continue
+            if attribution.get(ident):
+                # A CPE in the CNA's record carries a sibling's CVE as NVD's would, until NVD has analysed it.
+                via = next((v for basis, v in sorted(paths) if basis == "cna_cpe"), None)
+                if via and linker.record(ident) is None and ident not in explicit:
+                    kin = siblings(ident, item, attribution[ident])
+                    if kin:
+                        leads.setdefault((ident, home, version), {}).setdefault(
+                            purl, (item, via, linked_here[via], kin))
                 continue
             record = linker.record(ident)
             nvd_cpes = {match_of(m).cpe for m in (record or {}).get("matches", [])}
@@ -993,6 +1085,190 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
                 left_out[left] += 1
             elif undecided:
                 left_out["versions_not_told"] += 1
+    # A sibling that publishes a jar at the version (aggregate) reaches a component whose jar holds its code: those of
+    # the sibling's classes the fix changed, or else those of them the record names, or else at least half of them,
+    # from its jar in the delivery or as published. A class the record names that is not the sibling's says nothing:
+    # netty-codec holds the ReplayingDecoder a flaw of netty-codec-mqtt goes through. The hash index lists a jar under
+    # one coordinate only (the commons-io 2.6 file under a NetBeans module), so a version it lacks is told by the
+    # POM's packaging. A sibling without a jar (umbrella) reaches one module of the family at that version, unless OSV
+    # attributes the CVE to a module with a jar as well (tomcat with tomcat-embed-core and tomcat-catalina), which
+    # places the flaw: the one the record names, or holds the classes the fix changed or the record names, or else
+    # the family's main module, the one OSV attributes the most CVEs to, flagged: the record does not say which.
+    jar_versions: dict[str, set[str]] = {}
+    reads: dict[tuple[str, str, str], object] = {}
+    delivered: dict[str, list[dict]] = {}
+    for item in items:
+        delivered.setdefault(item["name"], []).append(item)
+
+    def read(key: tuple[str, str, str]):
+        """("entries" or "packaging", name, version) -> what ``jar_entries`` or ``packaging`` says, or the NetError."""
+        if key not in reads:
+            reader = jar_entries if key[0] == "entries" else packaging
+            try:
+                reads[key] = reader(*key[1:]) if reader else NetError("not read")
+            except NetError as error:
+                reads[key] = error
+        return reads[key]
+
+    def indexed(name: str, version: str) -> bool:
+        if not db.has("maven-hashes"):
+            return False
+        if name not in jar_versions:
+            jar_versions[name] = set(db.maven_versions(*name.split(":", 1)))
+        return version in jar_versions[name]
+
+    def failed(keys) -> bool:
+        return any(isinstance(reads.get(key), NetError) for key in keys)
+
+    def has_jar(name: str, version: str) -> bool | None:
+        if indexed(name, version):
+            return True
+        kind = read(("packaging", name, version))
+        return None if kind is None or isinstance(kind, NetError) else kind != "pom"
+
+    sibling_files: dict[tuple[str, str], tuple[set[str], dict] | None] = {}
+    files_inside: dict[str, tuple[set[str], dict] | None] = {}
+    folder_runs: dict[str, set[str]] = {}
+    found_on: dict[tuple[str, str], set[str]] = {}
+    for item in items:
+        if item["ecosystem"] == "maven" and ":" in item["name"]:
+            found_on.setdefault((family("maven", item["name"]), item["version"]), set()).update(
+                _own_ids(item, vulnerabilities))
+
+    def indexed_files(classes: set[str] | None) -> tuple[set[str], dict] | None:
+        if classes is None:
+            return None
+        lowered = {e.lower() for e in classes}
+        return lowered, _file_index(lowered)
+
+    def own_classes(name: str, version: str) -> tuple[set[str], dict] | None:
+        """A sibling's class files: of its jar in the delivery, the same version first, or else as published."""
+        if (name, version) not in sibling_files:
+            found = next((c for other in sorted(delivered.get(name, []),
+                                                key=lambda i: (i["version"] != version, i["version"]))
+                          if (c := entries(other)[0]) is not None), None)
+            if found is None:
+                listing = read(("entries", name, version))
+                found = None if listing is None or isinstance(listing, NetError) else \
+                    {e for e in listing if e.endswith(".class")}
+                if found is not None:
+                    # Read once per coordinate and version: what is kept of it is its classes, indexed below.
+                    reads[("entries", name, version)] = None
+            sibling_files[(name, version)] = indexed_files(found)
+        return sibling_files[(name, version)]
+
+    def evidence(ident: str, item: dict) -> str | bool | None:
+        """How the item's jar is found to hold the flawed code from the fix and the record alone; False when the
+        fix's classes are not in it, None when neither tells."""
+        inside = entries(item)[0]
+        fixed = (db.fix_of(ident) or {}).get("classes") or []
+        if fixed and inside is not None:
+            if fixes.held(fixed, inside):
+                return "fixed_classes"
+            # The commits cited may fix one of the classes the record names (one parser of several); and those of
+            # another line of the project (Netty 3's org.jboss.netty for io.netty) say nothing of this jar.
+            if placed(ident, item)[0]:
+                return "named_classes"
+            if item["purl"] not in folder_runs:
+                folder_runs[item["purl"]] = _folder_runs(inside)
+            return False if _code_roots(fixed) & folder_runs[item["purl"]] else None
+        return "named_classes" if placed(ident, item)[0] else None
+
+    def aggregate(ident: str, item: dict, whole: list[str], version: str) -> str | bool | None:
+        """How the item's jar is found to hold the code of siblings that publish a jar; False when it does not,
+        None when one of the siblings' classes could not be had."""
+        if item["purl"] not in files_inside:
+            files_inside[item["purl"]] = indexed_files(entries(item)[0])
+        inside = files_inside[item["purl"]]
+        if inside is None:
+            return None
+        theirs = [found for found in (own_classes(n, version) for n in whole) if found is not None]
+        unknown = len(theirs) < len(whole)
+        named = {f for _, index in theirs for name in naming(ident).classes for f in _files_of(name, index)}
+        if named and not any(_files_at(f, inside[1]) for f in named):
+            # The classes the record names are the sibling's, and none is here: classes of the fix this jar shares
+            # with the sibling say nothing (one commit of a release fixes a dozen flaws, and netty-codec holds the
+            # XmlFrameDecoder of the commit that fixes netty-codec-xml's XmlDecoder).
+            return None if unknown else False
+        for names, how in (((db.fix_of(ident) or {}).get("classes") or [], "fixed_classes"),
+                           (naming(ident).classes, "named_classes")):
+            files = {f for _, index in theirs for name in names for f in _files_of(name, index)}
+            if files:
+                if any(_files_at(f, inside[1]) for f in files):
+                    return how
+                return None if unknown else False
+        if any(classes and 2 * len(classes & inside[0]) >= len(classes) for classes, _ in theirs):
+            return "listing"
+        return None if unknown else False
+
+    def add_sibling(ident: str, item: dict, cpe: str, link: Link, kin: list[str], kind: str, how: str):
+        entry = table.get(ident) or table.setdefault(ident, candidate_of(ident))
+        ranges = [cna.Range("" if start == "0" else start, end, inclusive)
+                  for name in kin for start, end, inclusive in listed_for(name, ident)[0]]
+        entry["affects"][item["purl"]] = {
+            "cpe": cpe, "versions": cna.describe_ranges(ranges), "conditional": False, "basis": "sibling",
+            "single_cve_link": link.single, "versions_from": "osv", "below_listed_lines": False, "cna_product": "",
+            "sibling": kind, "attributed_to": kin, "sibling_evidence": how}
+
+    coordinates = sorted({(n, v) for (_, _, v), found in leads.items() for *_, kin in found.values() for n in kin})
+    map_parallel(read, [("packaging", n, v) for n, v in coordinates if not indexed(n, v)], RELOCATION_READERS)
+    kinds = {key: has_jar(*key) for key in coordinates}
+    unread = {("entries", n, version) for (_, _, version), found in leads.items() for item, *_, kin in found.values()
+              if entries(item)[0] is not None for n in kin
+              if kinds[(n, version)] and not any(entries(other)[0] is not None for other in delivered.get(n, []))}
+    map_parallel(read, sorted(unread), RELOCATION_READERS)
+    for (ident, home, version), found in sorted(leads.items()):
+        reached = [(item, cpe, link, kin) for item, cpe, link, kin in found.values()
+                   if item["purl"] not in table.get(ident, {}).get("affects", {})]
+        rest = []
+        for item, cpe, link, kin in reached:
+            outcome = None
+            whole = [n for n in kin if kinds[(n, version)]]
+            if whole:
+                how = aggregate(ident, item, whole, version)
+                if how:
+                    add_sibling(ident, item, cpe, link, whole, "aggregate", how)
+                    continue
+                outcome = "sibling_classes_not_in_jar" if how is False else \
+                    "sibling_not_read" if failed(("entries", n, version) for n in whole) else "sibling_not_told"
+            bare = [n for n in kin if kinds[(n, version)] is False]
+            if bare:
+                rest.append((item, cpe, link, bare))
+            elif outcome:
+                left_out[outcome] += 1
+            elif any(kinds[(n, version)] is None for n in kin):
+                not_read = failed(("packaging", n, version) for n in kin)
+                left_out["sibling_not_read" if not_read else "sibling_not_told"] += 1
+        if not rest or any(kinds[(n, version)] for *_, kin in found.values() for n in kin) \
+                or ident in found_on.get((home, version), ()):
+            # The flaw is placed on a module with a jar, or on one of the delivery's of that version by a finding (an
+            # online lookup may know an attribution the local copy lacks): the release's CVE stays off the family's
+            # other modules. A finding of another line (Netty 3's netty jar) places nothing in this one.
+            left_out["sibling_on_another_module"] += len(rest)
+            continue
+        # The umbrella coordinate itself (xxl-job) speaks for every module it begins (xxl-job-core) and says nothing.
+        stated = (modules_named(ident, "maven", home) | advisory_named(ident, "maven", home)) \
+            - {n for *_, kin in found.values() for n in kin}
+        if stated:
+            chosen = [(r, "modules_named") for r in rest if speaks_for(stated, r[0]["name"]) or placed(ident, r[0])[0]]
+            if not chosen:
+                left_out["names_another_module"] += len(rest)
+                continue
+        else:
+            chosen = [(r, how) for r in rest if (how := evidence(ident, r[0]))]
+            if not chosen:
+                main = min(rest, key=lambda r: (-len(db.osv_cves("maven", r[0]["name"])), r[0]["name"]))
+                # Not where the fix's classes, or the classes the record names, are known to be missing from it:
+                # the flaw is in a module the delivery does not hold.
+                if evidence(ident, main[0]) is False or placed(ident, main[0])[1]:
+                    left_out["sibling_classes_not_in_jar"] += len(rest)
+                    continue
+                chosen = [(main, "main_module")]
+        left_out["sibling_on_another_module"] += len(rest) - len(chosen)
+        for (item, cpe, link, kin), how in chosen:
+            add_sibling(ident, item, cpe, link, kin, "umbrella", how)
+    sibling_unread = {key[1:] for key, found in reads.items() if isinstance(found, NetError)}
+
     named = {item["purl"]: item for item in items}
     meta = db.cna_meta(table) if db.has("cvelist") else {}
     for ident, entry in table.items():
@@ -1043,6 +1319,7 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
             "advisory_names_another_module": sum(1 for a in pairs if a["advisory_names_another_module"]),
             "fixed_classes_not_in_jar": sum(1 for a in pairs if a["fixed_classes_not_in_jar"]),
             "below_listed_lines": sum(1 for a in pairs if a["below_listed_lines"]),
+            "sibling_module_undetermined": sum(1 for a in pairs if a.get("sibling_evidence") == "main_module"),
         },
         "fix_commits": _fix_counts(table) if db.has("fixes") else None,
         "pairs_reached_by_name": sum(1 for a in pairs if a["basis"] == "named"),
@@ -1050,12 +1327,13 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
         "pairs_by_basis": dict(sorted(Counter(a["basis"] for a in pairs).items())),
         "pairs_versions_from": dict(sorted(Counter(a["versions_from"] for a in pairs).items())),
         "records_from_cna": sum(1 for c in table.values() if c["record_from"] == "cna"),
-        "pairs_left_out": dict(left_out),
+        "pairs_left_out": {k: n for k, n in sorted(left_out.items()) if n},
         "links_refused": {"version_ranges_apart": len(refused)},
         "links_shared_by_relocation": [{"component": purl, "learned_for": other, "relocated_by": by}
                                        for purl, other, by in sorted({(purl, other, by) for purl, moved in
                                                                       shared_links.items() for other, by in moved.values()})],
         "relocations_not_read": len(relocations_unread),
+        "siblings_not_read": len(sibling_unread),
         "components": {"with_link": linked, "without_link": without, "not_checked": sum(not_checked.values())},
         "components_not_checked_because": dict(not_checked),
         "nvd_records_without_cpe": db.nvd_without_cpe(),
@@ -1065,6 +1343,18 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
                                                      "fixes"] if n in db.used},
     }
     return table, links_of, summary
+
+
+def siblings_left_out(summary: dict, offline: bool) -> str | None:
+    """The warning for the pairs a CVE OSV attributes to another module would make and were not made: whoever
+    reads the candidates sees what was not given, and an offline scan what an online one would tell."""
+    left = {k: n for k, n in (summary.get("pairs_left_out") or {}).items() if k.startswith("sibling_")}
+    if not left:
+        return None
+    unread = left.get("sibling_not_read", 0)
+    return (f"candidates: {sum(left.values())} pairs for CVEs OSV attributes to another module of the project left "
+            "out (" + ", ".join(f"{k} {n}" for k, n in left.items()) + ")"
+            + (f"; an online scan can tell {unread} of them" if unread and offline else ""))
 
 
 def _fix_counts(table: dict) -> dict:

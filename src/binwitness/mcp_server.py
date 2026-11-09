@@ -67,7 +67,13 @@ CANDIDATE_JUDGING = [
     "For a record NVD has given no CPE yet (record_from cna): basis cna_package means the CNA's record names the "
     "package (or another build of its module), cna_cpe a CPE in it that is linked with the package, cna_learned "
     "its product name (cna_product), linked with the package the way CPEs are; advisory_direct means the "
-    "vendor's advisory names the module, with versions of its own.",
+    "vendor's advisory names the module, with versions of its own. basis sibling means OSV attributes the CVE to "
+    "another module of the project (attributed_to) whose advisory lists this version, and the CVE reaches this "
+    "package through its own CPE link: sibling aggregate means that module publishes a jar and this one holds its "
+    "code (sibling_evidence: fixed_classes, named_classes, or listing for at least half its classes); sibling "
+    "umbrella means it publishes no jar at this version (the project's release as a whole), and the CVE is put on "
+    "one module: the one the record names (modules_named), holds the classes (fixed_classes, named_classes), or "
+    "else the project's main module (main_module, flagged sibling_module_undetermined).",
     "flags are facts for the reviewer, not verdicts: same_flaw_as lists findings of the component whose record "
     "refers to this CVE or the other way round (a copy of a flaw in another product gets its own CVE); "
     "other_language_only means the record names bindings for other languages and not the component's; "
@@ -750,7 +756,7 @@ class Service:
             return {"checked": False, "not_checked": summary.get("not_checked")}
         keep = ("total", "pairs", "by_severity", "disputed", "known_exploited", "only_from_single_cve_links",
                 "pairs_flagged", "pairs_reached_by_name", "pairs_left_out", "links_refused",
-                "links_shared_by_relocation", "relocations_not_read", "components",
+                "links_shared_by_relocation", "relocations_not_read", "siblings_not_read", "components",
                 "components_not_checked_because", "nvd_records_without_cpe", "data_as_of")
         return {"checked": True, **{k: summary.get(k) for k in keep}}
 
@@ -914,6 +920,8 @@ def _flags(affected: dict) -> list[str]:
         flags.append("fixed_classes_not_in_jar")
     if affected.get("below_listed_lines"):
         flags.append("below_listed_lines")
+    if affected.get("sibling_evidence") == "main_module":
+        flags.append("sibling_module_undetermined")
     return flags
 
 

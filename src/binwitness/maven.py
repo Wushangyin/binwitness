@@ -242,6 +242,20 @@ def compare_with_published(net: Net, coordinate: tuple[str, str, str], filename:
             **{kind: names[:LIST_LIMIT] for kind, names in content.items()}}
 
 
+def published_entries(net: Net, name: str, version: str, repositories: tuple[str, ...] = ()) -> frozenset[str] | None:
+    """The file entries of the jar published under ``groupId:artifactId`` at a version, read from its central
+    directory alone; None when no repository has one (the coordinates publish a POM or a distribution only) or its
+    directory cannot be read. ``repositories`` are consulted after Maven Central."""
+    group, artifact = name.split(":", 1)
+    for repository in (CENTRAL, *repositories):
+        url = _published_url((group, artifact, version), f"{artifact}-{version}.jar", repository)
+        tail = net.get(url, stable=True, headers={"Range": f"bytes=-{TAIL}"})
+        if tail is not None:
+            directory = _central_directory(net, url, tail)
+            return None if directory is None else frozenset(directory)
+    return None
+
+
 def _relocation(removed: list[str], added: list[str]) -> dict | None:
     """The package rename that carries the most removed entries onto added ones (``org/postgresql`` ->
     ``cn/vendor``), with the number of entries it carries. Relocating rewrites class files, so their CRCs

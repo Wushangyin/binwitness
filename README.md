@@ -261,10 +261,50 @@ for and the POM that says it moved. The summary counts the POMs that could not b
 those are the ones not in the cache.
 
 A record is left out when NVD rejected it, when an advisory in any installed OSV dataset attributes the
-CVE to a package (withdrawn advisories included), when the scan already reports it, under its own id or
-an alias, or when its CPE is for another language runtime (`target_sw` such as `node.js` on a Maven
-package). Records NVD marks as disputed are kept and flagged. A CPE that NVD lists only together with
-another product (a platform) is marked as conditional.
+CVE to a package (withdrawn advisories included; for another module of the component's project, see
+below), when the scan already reports it, under its own id or an alias, or when its CPE is for another
+language runtime (`target_sw` such as `node.js` on a Maven package). Records NVD marks as disputed are kept
+and flagged. A CPE that NVD lists only together with another product (a platform) is marked as conditional.
+
+OSV often attributes a CVE to another coordinate of the project only: the release as a whole, a POM or a
+distribution without a jar (`org.apache.tomcat:tomcat`), or the module the flaw is in, while the delivery
+holds a jar that bundles it (the classes of `tomcat-catalina` inside `tomcat-embed-core`). Such a CVE
+reaches a Maven component of the same project (groupIds alike in their first three parts) through the CPE
+linked with the component, or through a CPE in the CNA's record while NVD has not analysed it, when the
+OSV advisory for that coordinate lists the component's version. It does not when OSV attributes it to a
+build of the component's own module: that is OSV's judgement on it. Whether the coordinate publishes a
+jar at that version is read from the hash index and, for a version the index lacks (it records one
+coordinate per file, so a version republished elsewhere has no file under its own), from the
+`<packaging>` of that version's POM; in a `local` scan, from the cache only.
+
+- A jar (`sibling: aggregate`): the pair is made only when the component's jar holds that module's own
+  classes: those of them the CVE's fix changed, else those the record names, else at least half of them,
+  from its jar in the delivery or the file listing of its published jar (read with range requests). A
+  class the record names that the module does not have says nothing: netty-codec holds the base class a
+  flaw of netty-codec-mqtt goes through. When the classes it names are the module's and the jar holds none
+  of them, classes of the fix the jar shares with the module say nothing either: one commit of a release
+  can fix a dozen flaws.
+- No jar (`sibling: umbrella`): the CVE goes to one module of the project at that version: the one the
+  record or the vendor's advisory names, else one that holds the classes the fix changed, or, holding none
+  of them, the classes the record names (the commits cited may fix one parser of several the record
+  names), else the project's main module, the one OSV attributes the most CVEs to. That last is flagged:
+  module not determined by the record (`sibling_module_undetermined`). It is not chosen when the classes
+  the fix changed, or the classes the record names (a Java source file it names, `UserController.java`,
+  counts), are known to be missing from its jar: the flaw is then in a module the delivery does not hold
+  (`sibling_classes_not_in_jar`). Commits of another line of the project, whose packages the jar has none
+  of (Netty 3's `org.jboss.netty` for `io.netty`), say nothing. Not when OSV attributes the CVE to a
+  module with a jar as well (`tomcat` with `tomcat-embed-core`), or a finding of the scan puts it on a
+  module of the project at that version (an online lookup may know an attribution the local copy lacks):
+  that module places the flaw.
+
+Such pairs have `basis` `sibling`, the coordinates OSV attributes the CVE to (`attributed_to`), the kind
+(`sibling`), what decided (`sibling_evidence`: `fixed_classes`, `named_classes`, `listing`,
+`modules_named` or `main_module`), and OSV's versions for that coordinate (`versions_from` `osv`). The
+pairs not made are counted in the summary's `pairs_left_out` and in a warning: the jar holds none of that
+module's code (`sibling_classes_not_in_jar`), its POM or listing could not be read (`sibling_not_read`;
+offline, the warning says how many an online scan can tell), nothing tells (`sibling_not_told`: no POM is
+published, or the component's own entries are unknown), or the CVE is placed on another module
+(`sibling_on_another_module`). `siblings_not_read` counts the POMs and listings not read.
 
 The record's text is read for what it names. When it names Maven modules of the package's project, by
 coordinates (`groupId:artifactId`) or by an artifactId that carries a build (`bcpkix-fips`,
@@ -308,7 +348,10 @@ left out. Five more things are flagged, never acted on:
   tagged any), and the jar holds none of them. Main code is `src/main/java`, or `java/` in an Ant build
   such as Tomcat's. For a record NVD has not analysed, the commits its CNA's record cites count in the
   repositories that the CVEs OSV attributes, under the same product name, cite; for Apache Tomcat, the
-  commits its security pages list for the CVE count as well. Multi-release and relocated copies count, and
+  commits its security pages list for the CVE count as well. For a CVE OSV attributes to a module of a
+  project it knows other modules of (one that reaches another module's jar, above), the commits its OSV
+  advisory and NVD record cite count when NVD tagged them as the patch or another advisory of the project
+  cites their repository. Multi-release and relocated copies count, and
   so do classes a shaded library may hold as above. Classes the fix added are listed apart and not looked
   for, since an affected version lacks them. A jar that holds some of the classes is not flagged: a fix
   often changes a class every module shares as well. A class can also be missing because it had another
@@ -326,8 +369,9 @@ learned-link column reads like `3/6 / 3/4 / 3/6; versions meet on 3 of 3`: the p
 CPE out of those with any CPE, the CPE's attributed CVEs of the same project out of all its attributed
 ones, the same as the first for the whole project, and on how many of the CVEs it was learned from that
 give versions on both sides the versions meet. The next column lists the CVEs the link was learned from.
-Further columns say how the pair was reached (a learned link, one learned for relocated coordinates, named
-in the record, named in the vendor's advisory, or one of the ways of the
+Further columns say how the pair was reached (a learned link, one learned for relocated coordinates, a
+learned link for a CVE OSV attributes to another module, named in the record, named in the vendor's
+advisory, or one of the ways of the
 [CNAs' records](#before-nvd-the-cnas-records)) and whose
 versions decided it, name the CNA, the product its record names and the day it published the record, list
 the modules the vendor's advisory names and the classes the fix changed (with those the jar holds, and the
@@ -342,8 +386,8 @@ review, 32 were real or plausible for at least one component.
 
 Candidates come from local copies, in every lookup mode: the `nvd` dataset and the OSV dataset of
 each ecosystem (`binwitness db sync nvd vulns`), and the `cvelist` records, the `spring` advisories and
-`fixes` when installed. Only the POMs that tell a relocation are read from the Maven repositories, or from
-the cache in an offline scan.
+`fixes` when installed. Only the POMs that tell a relocation or a packaging, and the file listings of the
+jars of other modules, are read from the Maven repositories, or from the cache in an offline scan.
 An online scan takes its findings from the online services and its candidates from these copies. Their
 dates are given in the summary and in every row of `candidates.csv`. Without the copies, the summary says
 candidates were not checked, never that there are none. NVD records still awaiting analysis have no CPE
@@ -479,7 +523,7 @@ binwitness db remove osv-npm
 | `nvd` | NVD CVE records that name an application (CPE), for [candidates](#nvd-candidates) | 235 MB download, 225 MB on disk; then 15 MB a day |
 | `cvelist` | CVE records as their CNAs published them ([cvelistV5](https://github.com/CVEProject/cvelistV5)), for [candidates NVD has given no CPE yet](#before-nvd-the-cnas-records); needs `osv-maven` | 650 MB download, 130 MB on disk; then about 5 MB a day |
 | `spring` | The Spring projects' security advisories ([spring.io](https://spring.io/security)), for the modules and versions each names, for [candidates](#nvd-candidates) | 260 kB download, 140 kB on disk |
-| `fixes` | The classes changed by the GitHub commits that CVE records cite as their fix, or that Apache Tomcat's security pages list, for [candidates](#nvd-candidates); needs `nvd` and `osv-maven`, and `cvelist` for the commits the CNAs' records cite | about 430 commits from github.com: 8 MB download, 0.35 MB on disk |
+| `fixes` | The classes changed by the GitHub commits that CVE records cite as their fix, or that Apache Tomcat's security pages list, for [candidates](#nvd-candidates); needs `nvd` and `osv-maven`, and `cvelist` for the commits the CNAs' records cite | about 4,500 commits from github.com, half an hour or more the first time: 50-90 MB download, 2.2 MB on disk |
 
 Groups: `vulns` (both OSV datasets and `kev`), `java` (`osv-maven`, `kev`, `maven-hashes`), `all` (these,
 `nvd`, `cvelist`, `spring` and `fixes`).
@@ -558,8 +602,9 @@ With the hash index installed, a jar it lists is named from the jar and the inde
 deps.dev or the cache, so a `local` scan names a jar the same way whatever the cache holds, and `auto` names
 it as `local` does. A jar the index does not list is looked up on deps.dev, which lists every coordinate of
 a file but leaves out classifier jars (`json-lib-2.4-jdk15.jar`), then on Maven Central search. Where the
-index lists only a republication and the jar carries no clue to the original, a `local` and an `online`
-scan can still differ in a component's name.
+index lists only a republication and the jar carries no clue to the original that the index bears out, a
+`local` and an `online` scan can still differ in a component's name: an `online` scan does not read the
+index to identify jars, and deps.dev lists the other coordinates.
 
 The result records which local datasets were read and how current they were (`data_sources.local`),
 also in an `online` scan, whose candidates come from them; where the findings came from is `options.lookup`.
@@ -696,7 +741,7 @@ scan a machine with no internet access, copy the dataset directory and, optional
 | Service | Used for |
 |---|---|
 | [deps.dev](https://deps.dev) | jar hash to coordinates; licenses |
-| [Maven Central](https://central.sonatype.com) | hash search fallback; published checksums; POM licenses; `--class-search`; version lists for upgrade advice; the modules of a groupId for `crosscheck` |
+| [Maven Central](https://central.sonatype.com) | hash search fallback; published checksums; POM licenses; `--class-search`; version lists for upgrade advice; the modules of a groupId for `crosscheck`; for candidates, POMs that tell a relocation or a packaging and the file listings of other modules' jars |
 | repositories given with `--maven-repo` | checksums, jar directories, POM licenses and version lists of releases Central does not have |
 | [OSV.dev](https://osv.dev) | vulnerabilities (GitHub Security Advisories and others); all advisories of a vulnerable package, for upgrade advice |
 | [npm registry](https://www.npmjs.com) | published versions of vulnerable npm packages, for upgrade advice, and of packages a JavaScript file matched |
@@ -734,7 +779,11 @@ These limits are deliberate, so read them before relying on a result:
   (netty-handler's `io/netty/handler/ssl`), so they are never missing for it, and its pairs are flagged
   less. A class the fix changed may have had another name in an older version, so a pair on an old
   version can be flagged although the flaw is there; a fix that changed no Java code flags nothing; and a
-  commit that merges many changes is read whole as the fix.
+  commit that merges many changes is read whole as the fix. The other way round, a pair on an old version
+  is not flagged when its classes are there but the code the fix changed is not yet (hutool's `StrSplitter`
+  before it used `PatternFinder`), or when the record cites no commit and names, besides the class the flaw
+  is in, classes that older versions hold as well (netty's `SslClientHelloHandler`, which 4.1.29 lacks):
+  members of classes are not compared.
 - **Identification needs a published artifact or a declaration.** A private build, a fork or a relocated
   copy of a library with no `pom.properties` stays unidentified, unless the same delivery also carries a
   copy that was identified (or `--class-search` finds it). A release that only another repository
@@ -767,6 +816,19 @@ These limits are deliberate, so read them before relying on a result:
 - **Online services can be down or rate-limited.** Failed lookups are retried with backoff for about a
   minute and then recorded as warnings, so a scan does not fail outright. The result is then marked
   `INCOMPLETE`, and `--fail-on` exits with status 4 rather than 0.
+
+## Versioning
+
+From 1.0.0, binwitness follows [semantic versioning](https://semver.org) for what a script, a CI job or
+an MCP client relies on: the commands and options of the CLI and its exit statuses; the files a scan writes,
+the fields of `binwitness.json` and the columns of the CSV files; the names of the datasets; the MCP tools
+and their parameters. A minor release may add options, fields, columns and tools; only a major release
+removes or renames one, or changes what it means. Results written by an earlier 1.x release open in any
+later one.
+
+What a scan finds is not part of that promise. Findings follow OSV and the other sources as of the scan,
+and how candidates are reached, left out and flagged may change in any release, since they are leads for
+review; the release notes say what changed and why.
 
 ## Development
 

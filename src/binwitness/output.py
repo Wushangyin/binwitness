@@ -229,18 +229,30 @@ CANDIDATE_COLUMNS = ["id", "severity", "cvss score", "cvss vector", "cvss source
                      "modules the vendor's advisory names", "advisory names another module",
                      "same flaw as finding", "names only another language", "named classes in this jar",
                      "named classes not in this jar", "classes the fix changed", "of them in this jar",
-                     "none of the fix's classes in this jar", "fix commits", "cwe", "description", "url", "data as of"]
+                     "none of the fix's classes in this jar", "module not determined by the record", "fix commits",
+                     "cwe", "description", "url", "data as of"]
 REACHED_BY = {"learned": "learned link", "relocated": "link learned for relocated coordinates",
               "named": "named in the record", "advisory": "named in the vendor's advisory",
               "cna_package": "package named in the CNA's record", "cna_cpe": "CPE in the CNA's record",
               "cna_learned": "learned link (product in the CNA's record)",
-              "advisory_direct": "module named in the vendor's advisory, with its versions"}
-VERSIONS_FROM = {"nvd": "NVD", "cna": "CNA's record", "advisory": "vendor's advisory"}
+              "advisory_direct": "module named in the vendor's advisory, with its versions",
+              "sibling": "learned link, for a CVE OSV attributes to another module of the project"}
+VERSIONS_FROM = {"nvd": "NVD", "cna": "CNA's record", "advisory": "vendor's advisory",
+                 "osv": "OSV's advisory for the other module"}
+SIBLING_EVIDENCE = {"fixed_classes": "holds classes the fix changed", "named_classes": "holds classes the record names",
+                    "listing": "holds at least half of its classes", "modules_named": "the record names this module",
+                    "main_module": "the record does not say which module; this is the project's main one"}
 
 
 def _reached_text(pair: dict) -> str:
     if pair.get("basis") == "relocated":
         return f"link learned for {pair['learned_for']}, relocated by {pair['relocated_by']}"
+    if pair.get("basis") == "sibling":
+        kin = ", ".join(pair["attributed_to"])
+        return (f"learned link; OSV attributes the CVE to {kin}, "
+                + ("whose code this jar bundles: it " if pair["sibling"] == "aggregate" else
+                   "which publishes no jar at this version: ")
+                + SIBLING_EVIDENCE.get(pair["sibling_evidence"], pair["sibling_evidence"]))
     return REACHED_BY.get(pair.get("basis", "learned"), "")
 
 
@@ -276,6 +288,7 @@ def candidates_csv(result: dict, path: Path):
                              _classes_text(a.get("classes_in_jar"), c), _classes_text(a.get("classes_not_in_jar"), c),
                              " ".join(c.get("fixed_classes") or []), _fixed_text(a.get("fixed_classes_in_jar", []), c),
                              "yes" if a.get("fixed_classes_not_in_jar") else "",
+                             "yes" if a.get("sibling_evidence") == "main_module" else "",
                              " ".join(f["url"] for f in c.get("fix_commits") or []),
                              " ".join(c["cwe"]), c["description"], c["url"], dates])
         rows.sort(key=lambda r: (SEVERITIES.index(r[1]), r[0], r[9]))
@@ -409,7 +422,8 @@ def _candidate_lines(summary: dict | None) -> list[str]:
              ("named classes not in the jar", flagged["named_classes_not_in_jar"]),
              ("the vendor's advisory names another module", flagged.get("advisory_names_another_module", 0)),
              ("none of the classes its fix changed in the jar", flagged.get("fixed_classes_not_in_jar", 0)),
-             ("only on a line below those the vendor lists", flagged.get("below_listed_lines", 0))])
+             ("only on a line below those the vendor lists", flagged.get("below_listed_lines", 0)),
+             ("module not determined by the record", flagged.get("sibling_module_undetermined", 0))])
             # Results of 0.4.3 and 0.4.4 count only the pairs the advisory reached.
             + (f"; {summary['pairs_reached_by_advisory']} pairs reached through the vendor's advisory"
                if summary.get("pairs_reached_by_advisory") and not by_basis else "")
@@ -417,7 +431,9 @@ def _candidate_lines(summary: dict | None) -> list[str]:
                if sum(left_out.values()) else "")
             + (f"; {refused} CPE links refused: NVD's versions never meet OSV's" if refused else "")
             + (f"; {summary['relocations_not_read']} POMs not read to tell whether an artifact was relocated"
-               if summary.get("relocations_not_read") else ""))
+               if summary.get("relocations_not_read") else "")
+            + (f"; {summary['siblings_not_read']} POMs or jar listings of other modules not read"
+               if summary.get("siblings_not_read") else ""))
     fixes = summary.get("fix_commits")
     if fixes and fixes["candidates_citing_a_commit"]:
         read = fixes["commits"]
@@ -435,7 +451,11 @@ def _candidate_lines(summary: dict | None) -> list[str]:
 
 LEFT_OUT = {"names_another_module": "the record names another module",
             "package_name_narrows": "the CNA's package name leaves the build out",
-            "versions_not_told": "the CNA's record does not tell whether the version is affected"}
+            "versions_not_told": "the CNA's record does not tell whether the version is affected",
+            "sibling_classes_not_in_jar": "the jar holds none of the code of the module OSV names",
+            "sibling_not_read": "the module OSV names could not be read",
+            "sibling_not_told": "nothing tells whether the jar holds the code of the module OSV names",
+            "sibling_on_another_module": "the CVE is placed on another module of the project"}
 INCOMPLETE = {
     "jars_not_looked_up": "{n} jars not looked up",
     "scripts_not_looked_up": "{n} scripts not looked up",

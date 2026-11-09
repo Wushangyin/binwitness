@@ -8,10 +8,11 @@ import pytest
 
 from binwitness import upgrades
 from binwitness.maven import CENTRAL
-from binwitness.net import Net
+from binwitness.net import Net, NetError
 from binwitness.upgrades import Listing, advise, context_caveats, is_published, line_of, published_versions
 
 from helpers import ScriptedTransport
+from test_localdb import never
 
 DATA = Path(__file__).parent / "data" / "upgrade"
 
@@ -403,6 +404,30 @@ def test_a_relocated_artifact_is_followed_to_its_new_coordinates(tmp_path):
     assert upgrade_text(block) == "relocated org.moved:connector 1.3"
     assert finding_advice({"upgrade": block, "ecosystem": "maven", "version": "1.0"}, "CVE-2026-0011",
                           {"fixed": []}) == ", move to org.moved:connector 1.3"
+
+
+def test_the_packaging_a_pom_declares(tmp_path):
+    def project(inner):
+        return f"<project><modelVersion>4.0.0</modelVersion>{inner}</project>".encode()
+    transport = ScriptedTransport({
+        f"{CENTRAL}/org/acme/srv/srv/1.0/srv-1.0.pom": project(
+            "<parent><groupId>org.acme</groupId><packaging>jar</packaging></parent><packaging>pom</packaging>"),
+        # The project's own: not one a plugin is configured with, nor one commented out.
+        f"{CENTRAL}/org/acme/srv/srv-core/1.0/srv-core-1.0.pom": project(
+            "<!-- <packaging>pom</packaging> --><build><plugins><plugin><configuration><packaging>war</packaging>"
+            "</configuration></plugin></plugins></build>"),
+        "https://repo.example.org/maven/org/acme/srv/srv-osgi/1.0/srv-osgi-1.0.pom": project(
+            "<packaging> bundle </packaging>")})
+    net = Net(cache_dir=tmp_path / "cache", transport=transport)
+    assert upgrades.packaging(net, "org.acme.srv:srv", "1.0") == "pom"
+    assert upgrades.packaging(net, "org.acme.srv:srv-core", "1.0") == "jar"
+    assert upgrades.packaging(net, "org.acme.srv:srv-osgi", "1.0") is None
+    assert upgrades.packaging(net, "org.acme.srv:srv-osgi", "1.0", ("https://repo.example.org/maven",)) == "bundle"
+    # Offline, from the cache; what it does not hold is not read.
+    offline = Net(cache_dir=tmp_path / "cache", offline=True, transport=ScriptedTransport({"": never}))
+    assert upgrades.packaging(offline, "org.acme.srv:srv", "1.0") == "pom"
+    with pytest.raises(NetError):
+        upgrades.packaging(offline, "org.acme.srv:srv-web", "1.0")
 
 
 def test_without_a_relocation_the_advice_stays_on_the_coordinates(tmp_path):
