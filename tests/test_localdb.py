@@ -12,6 +12,7 @@ import time
 import urllib.parse
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -469,6 +470,87 @@ def test_pieces_are_fetched_again_at_once_as_far_as_their_rests_keep_within_a_pi
     assert (tmp_path / "file").read_bytes() == data
     # No own fetch got further meanwhile: nothing was fetched twice.
     assert (len(seconds), open_at_once[0]) == (again, most)
+
+
+class ClosedLate:
+    """A connection taken down slowly: its fetch ends a while after the piece is complete."""
+
+    def __init__(self, stream):
+        self.stream = stream
+
+    def read(self, size=-1):
+        return self.stream.read(size)
+
+    def close(self):
+        time.sleep(0.1)
+        self.stream.close()
+
+
+def test_a_second_fetchs_file_is_not_deleted_twice_at_once(tmp_path, quick_seconds, monkeypatch):
+    # Windows refuses to delete a file while another deletion of it is under way (WinError 5).
+    data = bytes(range(256)) * 20
+    release = threading.Event()
+    open_, _ = holding(RangeServer(data), {PARTS[3]: [(100, release)]})
+    asked_again = []
+
+    def opener(url, headers):
+        status, answer, stream = open_(url, headers)
+        if headers["Range"] in ("bytes=0-0", *PARTS):
+            return status, answer, stream
+        asked_again.append(headers["Range"])
+        return status, answer, ClosedLate(stream)
+    deleting, refused, lock, unlink = set(), [], threading.Lock(), Path.unlink
+
+    def slow_unlink(path, missing_ok=False):
+        if not path.name.endswith(".second") or not path.exists():
+            return unlink(path, missing_ok=missing_ok)
+        with lock:
+            if path in deleting:
+                refused.append(path.name)
+                raise PermissionError(13, "Access is denied", str(path))
+            deleting.add(path)
+        try:
+            time.sleep(0.2)  # the deletion under way, during which no other may begin
+            return unlink(path, missing_ok=missing_ok)
+        finally:
+            with lock:
+                deleting.discard(path)
+    monkeypatch.setattr(Path, "unlink", slow_unlink)
+    try:
+        Fetcher(opener=opener, sleep=lambda s: None).download("https://x/f", tmp_path / "file", connections=2)
+    finally:
+        release.set()
+    assert (tmp_path / "file").read_bytes() == data
+    assert len(asked_again) == 1 and refused == []
+    assert [p.name for p in tmp_path.iterdir()] == ["file"]
+
+
+def test_a_second_fetchs_file_that_cannot_be_deleted_is_left_to_the_next_download(tmp_path, quick_seconds,
+                                                                                   monkeypatch):
+    # As one a virus scanner holds open on Windows: nothing reads it, and the next download of the file removes it.
+    data = bytes(range(256)) * 20
+    release = threading.Event()
+    open_, _ = holding(RangeServer(data), {PARTS[3]: [(100, release)]})
+    held, unlink = [True], Path.unlink
+
+    def refuse(path, missing_ok=False):
+        if held[0] and path.name.endswith(".second") and path.exists():
+            raise PermissionError(13, "Access is denied", str(path))
+        return unlink(path, missing_ok=missing_ok)
+    monkeypatch.setattr(Path, "unlink", refuse)
+    target, digest = tmp_path / "file", f"sha256:{hashlib.sha256(data).hexdigest()}"
+    try:
+        Fetcher(opener=open_, sleep=lambda s: None).download("https://x/f", target, sha256=digest, connections=2)
+    finally:
+        release.set()
+    assert target.read_bytes() == data
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["file", "file.4-of-4.second"]
+    held[0] = False
+    target.unlink()
+    Fetcher(opener=RangeServer(data), sleep=lambda s: None).download("https://x/f", target, sha256=digest,
+                                                                    connections=2)
+    assert target.read_bytes() == data
+    assert [p.name for p in tmp_path.iterdir()] == ["file"]
 
 
 def test_bytes_a_second_fetch_got_before_it_failed_count_as_fetched_for_nothing(tmp_path, quick_seconds):

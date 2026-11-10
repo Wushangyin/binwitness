@@ -411,7 +411,7 @@ class Fetcher:
             nonlocal spent
             with cv:
                 asked, at = ask(k), have[k]
-            began, mode, twice = at, "wb", None  # "wb": over one a sync killed outright left
+            began, mode, twice = at, "wb", None  # "wb": over one a killed sync or earlier second fetch left
             try:
                 status, _, stream = self.opener(url, asked)
                 with closing(stream):
@@ -437,7 +437,6 @@ class Fetcher:
                 pass  # the piece's own fetch goes on
             finally:
                 with cv:
-                    seconds[k].unlink(missing_ok=True)
                     # A second fetch that lost or failed fetched its bytes for nothing.
                     del again[k]
                     spent += at - began if twice is None else twice
@@ -518,8 +517,14 @@ class Fetcher:
             with cv:
                 over = True
                 cv.notify_all()
+            # Second fetches' files are deleted here only, once none is written to: Windows refuses to delete a file
+            # while another deletion of it is under way. One it will not delete yet (a virus scanner has it open) is
+            # never read, and the next download of the file removes it.
             for stale in seconds:
-                stale.unlink(missing_ok=True)
+                try:
+                    stale.unlink(missing_ok=True)
+                except OSError:
+                    pass
         if errors:
             raise errors[0]
         statuses = [outcome.get(k) for k in range(count)]
