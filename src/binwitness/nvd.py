@@ -169,6 +169,13 @@ class Match:
             return False
         return True
 
+    @property
+    def start(self) -> str:
+        """The version the match begins at, "" when it says none: all versions up to its end."""
+        if self.version not in ("*", ""):
+            return self.version
+        return self.start_including or self.start_excluding or ""
+
     def describe(self) -> str:
         if self.version not in ("*", ""):
             return f"{self.version}" + ("" if self.update in ("*", "-", "") else f" {self.update}")
@@ -814,7 +821,8 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
         entry["affects"].setdefault(item["purl"], {"cpe": cpe, "versions": hit.describe(),
                                                    "conditional": hit.conditional, "basis": basis,
                                                    "single_cve_link": single, "versions_from": "nvd",
-                                                   "below_listed_lines": False, "cna_product": ""})
+                                                   "below_listed_lines": False, "cna_product": "",
+                                                   "_start": hit.start})
 
     # An artifact relocated to new coordinates is the same library published on under them: a CPE learned for
     # either stands for both (mysql:mysql-connector-java and com.mysql:mysql-connector-j, whose few CVEs of its own
@@ -1078,7 +1086,8 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
                         "cpe": via if basis == "cna_cpe" else "", "versions": versions, "conditional": False,
                         "basis": basis, "single_cve_link": single,
                         "versions_from": "advisory" if basis == "advisory_direct" else "cna",
-                        "below_listed_lines": cna.below_listed_lines(ranges, version), "cna_product": product}
+                        "below_listed_lines": cna.below_listed_lines(ranges, version), "cna_product": product,
+                        "_start": cna.start_of(ranges, version)}
                 left = undecided = None
                 break
             if left:
@@ -1205,10 +1214,13 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
         entry = table.get(ident) or table.setdefault(ident, candidate_of(ident))
         ranges = [cna.Range("" if start == "0" else start, end, inclusive)
                   for name in kin for start, end, inclusive in listed_for(name, ident)[0]]
+        # OSV often writes a module's range from the first version where the vendor's record names the line.
+        hit = hit_of(ident, cpe, "maven", item["version"])
+        begins = cna.start_of(ranges, item["version"]) or (hit.start if hit else "")
         entry["affects"][item["purl"]] = {
             "cpe": cpe, "versions": cna.describe_ranges(ranges), "conditional": False, "basis": "sibling",
             "single_cve_link": link.single, "versions_from": "osv", "below_listed_lines": False, "cna_product": "",
-            "sibling": kind, "attributed_to": kin, "sibling_evidence": how}
+            "sibling": kind, "attributed_to": kin, "sibling_evidence": how, "_start": begins}
 
     coordinates = sorted({(n, v) for (_, _, v), found in leads.items() for *_, kin in found.values() for n in kin})
     map_parallel(read, [("packaging", n, v) for n, v in coordinates if not indexed(n, v)], RELOCATION_READERS)
@@ -1288,8 +1300,8 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
             item = named[ref]
             advised = {module_of(m.split(":", 1)[1])
                        for m in advisory_named(ident, item["ecosystem"], family(item["ecosystem"], item["name"]))}
-            affected["advisory_names_another_module"] = bool(advised) and \
-                module_of(item["name"].split(":", 1)[-1]) not in advised
+            affected["advisory_names_module"] = module_of(item["name"].split(":", 1)[-1]) in advised
+            affected["advisory_names_another_module"] = bool(advised) and not affected["advisory_names_module"]
             affected["related_findings"] = _related(item, ident, facts, vulnerabilities, linker)
             affected["other_language_only"] = facts.other_language_only(item["ecosystem"])
             affected["classes_in_jar"], affected["classes_not_in_jar"] = placed(ident, item)
@@ -1299,6 +1311,12 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
             affected["fixed_classes_in_jar"] = fixed
             affected["fixed_classes_not_in_jar"] = fixed == [] and bool(entry["fixed_classes"]) \
                 and not fixes.held(entry["fixed_classes"], unsure)
+            # NVD writes one range across the lines a CNA lists apart (8.5.0 up to 9.0.121): the CNA's own record
+            # says where the component's line begins.
+            starts = [affected.pop("_start", ""), *cna.starts_of(cna.one_product_ranges(cna_record(ident)),
+                                                                  item["version"], item["ecosystem"])]
+            affected["corroborated_by"] = _corroborated(entry, affected, item["version"], starts)
+            affected["corroborated"] = affected["corroborated_by"] is not None
     table = dict(sorted(table.items()))
     pairs = [a for c in table.values() for a in c["affects"].values()]
     summary = {
@@ -1321,6 +1339,9 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
             "below_listed_lines": sum(1 for a in pairs if a["below_listed_lines"]),
             "sibling_module_undetermined": sum(1 for a in pairs if a.get("sibling_evidence") == "main_module"),
         },
+        "corroborated": sum(1 for c in table.values() if any(a["corroborated"] for a in c["affects"].values())),
+        "pairs_corroborated": sum(1 for a in pairs if a["corroborated"]),
+        "pairs_corroborated_by": dict(Counter(a["corroborated_by"] for a in pairs if a["corroborated"])),
         "fix_commits": _fix_counts(table) if db.has("fixes") else None,
         "pairs_reached_by_name": sum(1 for a in pairs if a["basis"] == "named"),
         "pairs_reached_by_advisory": sum(1 for a in pairs if a["basis"] == "advisory"),
@@ -1343,6 +1364,37 @@ def attach(db, items: list[dict], vulnerabilities: dict, kev_dates: dict, datase
                                                      "fixes"] if n in db.used},
     }
     return table, links_of, summary
+
+
+PATCH_COMMITS = ("patch-tagged commits", "commits, tags not known")
+
+
+def _corroborated(candidate: dict, pair: dict, version: str, starts: list[str]) -> str | None:
+    """What a pair stands on beyond a learned link, if anything. A record (NVD's, the advisory the pair's versions
+    are from, or the CNA's when it is about one product) states where the affected versions begin, on the
+    component's own major line; nothing points elsewhere; and either the jar holds classes the fix changed
+    (``"fixed_classes"``) or the vendor's own advisory names this very module (``"vendor_advisory"``). A range
+    open at the bottom, or one that begins on an earlier line (Tomcat 8.5.46 up to 9.0.121, for a 9.0.12), covers
+    the version without anyone having said so of it; classes of commits the record cites for another reason than
+    the fix (the change that introduced the flaw) place nothing. For a CVE OSV attributes to another module, the
+    classes are that module's own. The vendor naming the module stands in for a link learned from one CVE alone,
+    not for classes of the fix that the jar is known not to hold."""
+    if candidate["disputed"] or pair["conditional"] or pair["below_listed_lines"] \
+            or pair["advisory_names_another_module"] or pair["other_language_only"] or pair["related_findings"] \
+            or pair["classes_not_in_jar"] and not pair["classes_in_jar"]:
+        return None
+    if pair["basis"] == "sibling" and pair["sibling_evidence"] != "fixed_classes":
+        return None
+    if not any(_major(s) is not None and _major(s) == _major(version) for s in starts):
+        return None
+    # A reviewed advisory already places a sibling's CVE in the project: any commit its record cites, the fix or
+    # the change that brought the flaw in, tells which of the project's classes it is about.
+    cited = candidate["fixed_classes_from"] in PATCH_COMMITS or pair["basis"] == "sibling"
+    if pair["fixed_classes_in_jar"] and cited and not pair["single_cve_link"]:
+        return "fixed_classes"
+    if pair["advisory_names_module"] and not pair["fixed_classes_not_in_jar"]:
+        return "vendor_advisory"
+    return None
 
 
 def siblings_left_out(summary: dict, offline: bool) -> str | None:

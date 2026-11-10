@@ -330,6 +330,27 @@ def told(statuses) -> str | None:
     return "unaffected" if statuses and all(s == "unaffected" for s in statuses) else None
 
 
+def starts_of(ranges: list[Range | str], version: str, ecosystem: str = "maven") -> list[str]:
+    """Where each of the ranges that cover the version begins: "" for one from the first version."""
+    return [(item.start if isinstance(item, Range) else item if VERSIONISH.match(item) else "")
+            for item in ranges if _covers(item, ecosystem, version)]
+
+
+def start_of(ranges: list[Range | str], version: str, ecosystem: str = "maven") -> str:
+    """Where the ranges that cover the version begin: a stated version when one of them states it, else ""."""
+    found = starts_of(ranges, version, ecosystem)
+    return next((s for s in found if s), "")
+
+
+def one_product_ranges(record: dict | None) -> list[Range | str]:
+    """The affected versions a CNA's record gives, when all of it is about one product: the versions of a record
+    that lists several (a vendor's quarterly update) belong to no one of them without its name."""
+    entries = [e for e in (record or {}).get("affected") or [] if usable(e)]
+    if len({(e["vendor"].lower(), e["product"].lower(), e["package"].lower()) for e in entries}) != 1:
+        return []
+    return affected_ranges(entries)
+
+
 def affected_ranges(entries: list[dict]) -> list[Range | str]:
     return [item for e in entries for status, item in _ranges(e) if status == "affected"]
 

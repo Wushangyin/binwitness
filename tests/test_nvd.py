@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from binwitness import fixes, localdb, nvd
+from binwitness import cna, fixes, localdb, nvd, output
 from binwitness.cli import main
 from binwitness.crosscheck import crosscheck, load_other
 from binwitness.localdb import LocalDb
@@ -462,7 +462,8 @@ def test_candidates_are_the_unattributed_records_of_a_linked_cpe_that_cover_the_
         "cpe": "example:lib", "versions": "< 2.0", "conditional": False, "basis": "learned", "single_cve_link": False,
         "related_findings": [], "other_language_only": False, "classes_in_jar": [], "classes_not_in_jar": [],
         "advisory_names_another_module": False, "fixed_classes_in_jar": [], "fixed_classes_not_in_jar": False,
-        "versions_from": "nvd", "below_listed_lines": False, "cna_product": ""}}
+        "versions_from": "nvd", "below_listed_lines": False, "cna_product": "", "corroborated": False,
+            "corroborated_by": None, "advisory_names_module": False}}
     assert table["CVE-2025-0004"]["kev_date_added"] == "2025-07-01"
     assert table["CVE-2025-0007"]["affects"][lib]["conditional"] is True
     assert table["CVE-2025-0008"]["disputed"] is True and table["CVE-2025-0008"]["severity"] == "LOW"
@@ -1459,6 +1460,8 @@ def test_flags_reach_the_files_and_the_mcp_tools(tmp_path, delivery, world, fami
     assert [c["id"] for c in listed] == ["CVE-2025-1301", "CVE-2025-1302", "CVE-2025-1304", "CVE-2025-1305",
                                          "CVE-2025-1303"]
     assert listed[-1]["flags"] == ["other_language_only"] and listed[-1]["flagged_components"] == 3
+    # The records of this world give ranges open at the bottom: no pair is corroborated.
+    assert [c["corroborated_components"] for c in listed] == [0] * 5
     detail = service.get_candidate(scan_id, "CVE-2025-1302")
     assert [(a["component"].split("/")[-1], a["flags"]) for a in detail["affects"]] == [
         ("web-embed@1.0", []), ("web-all@1.0", []), ("web-core@1.0", ["same_flaw_as_a_finding"])]
@@ -1541,3 +1544,114 @@ def test_fix_classes_reach_the_files_and_the_mcp_tools(tmp_path, delivery, world
     write_all(result, tmp_path / "old")
     old = list(csv.DictReader((tmp_path / "old" / "candidates.csv").open(encoding="utf-8-sig")))
     assert {r["classes the fix changed"] for r in old} == {""} and "fixes:" not in render_summary(result)
+
+
+# ---- corroborated pairs ------------------------------------------------------------------------------------
+
+def _pair(**changed):
+    return {"conditional": False, "single_cve_link": False, "below_listed_lines": False, "basis": "learned",
+            "advisory_names_another_module": False, "other_language_only": False, "related_findings": [],
+            "classes_in_jar": [], "classes_not_in_jar": [], "fixed_classes_in_jar": ["org.acme.web.core.Server"],
+            "fixed_classes_not_in_jar": False, "advisory_names_module": False, **changed}
+
+
+def _cited(**changed):
+    return {"disputed": False, "fixed_classes_from": "patch-tagged commits", **changed}
+
+
+def test_a_pair_is_corroborated_by_a_stated_start_on_its_line_and_the_classes_of_the_fix():
+    def told(version="9.0.43", starts=("9.0.0.M1",), candidate=None, **pair):
+        return nvd._corroborated(candidate or _cited(), _pair(**pair), version, list(starts))
+    assert told() == "fixed_classes"
+    # The CNA's record, not yet analysed by NVD, cites its commits without tags.
+    assert told(candidate=_cited(fixed_classes_from="commits, tags not known"))
+    # Any of the records may state it: NVD's range begins a line earlier, the CNA's on the component's.
+    assert told(starts=("8.5.0", "9.0.0.M1")) and told(starts=("", "9.0.0"))
+    # A range open at the bottom, or one that begins on another major line, says nothing of the version.
+    assert not told(starts=("",)) and not told(starts=()) and not told(starts=("8.5.46",))
+    assert not told(version="8.5.29", starts=("9.0.0.M1",))
+    # Classes of the fix, from commits cited as the fix.
+    assert not told(fixed_classes_in_jar=[])
+    assert not told(candidate=_cited(fixed_classes_from="commits not tagged as the patch"))
+    assert not told(candidate=_cited(fixed_classes_from=None))
+    # Whatever points elsewhere takes it away.
+    assert not told(candidate=_cited(disputed=True))
+    for flag in ("conditional", "single_cve_link", "below_listed_lines", "advisory_names_another_module",
+                 "other_language_only"):
+        assert not told(**{flag: True}), flag
+        assert not told(advisory_names_module=True, **{flag: True}) or flag == "single_cve_link", flag
+    assert not told(related_findings=["GHSA-f"])
+    assert not told(classes_not_in_jar=["CertPinner"])
+    assert told(classes_not_in_jar=["CertPinner"], classes_in_jar=["Server"])
+    # For a CVE OSV attributes to another module, the classes are that module's own.
+    assert told(basis="sibling", sibling_evidence="fixed_classes")
+    # There the advisory OSV holds places the CVE in the project, and a commit not tagged as the patch does too.
+    untagged = _cited(fixed_classes_from="commits not tagged as the patch")
+    assert told(basis="sibling", sibling_evidence="fixed_classes", candidate=untagged) == "fixed_classes"
+    assert not told(basis="sibling", sibling_evidence="fixed_classes", candidate=untagged, starts=("",))
+    assert not told(basis="sibling", sibling_evidence="fixed_classes", candidate=untagged, single_cve_link=True)
+    for how in ("named_classes", "listing", "modules_named", "main_module"):
+        assert not told(basis="sibling", sibling_evidence=how), how
+        assert not told(basis="sibling", sibling_evidence=how, advisory_names_module=True), how
+    # The vendor's own advisory naming the module does for the classes of a fix no record cites, and for a link
+    # learned from one CVE alone; not for a version no record speaks of, nor for a jar without the fix's classes.
+    named = {"advisory_names_module": True, "fixed_classes_in_jar": []}
+    assert told(**named) == told(**named, single_cve_link=True) == "vendor_advisory"
+    assert told(**named, candidate=_cited(fixed_classes_from=None)) == "vendor_advisory"
+    assert told(advisory_names_module=True) == "fixed_classes"
+    assert not told(**named, starts=("",)) and not told(**named, version="8.5.29")
+    assert not told(**named, fixed_classes_not_in_jar=True) and not told(**named, candidate=_cited(disputed=True))
+    assert not told(**named, related_findings=["GHSA-f"]) and not told(**named, classes_not_in_jar=["CertPinner"])
+
+
+def test_ranges_of_a_cna_record_about_one_product_tell_where_a_line_begins():
+    def entry(product, *versions):
+        return {"vendor": "Acme", "product": product, "package": "", "repository": "", "cpes": [], "files": [],
+                "default": "", "source": "cna", "versions": list(versions)}
+    lines = [{"status": "affected", "version": "9.0.0.M1", "lessThanOrEqual": "9.0.118"},
+             {"status": "affected", "version": "8.5.0", "lessThanOrEqual": "8.5.100"},
+             {"status": "unaffected", "version": "9.0.119"}]
+    ranges = cna.one_product_ranges({"affected": [entry("Web", *lines)]})
+    assert cna.starts_of(ranges, "9.0.43") == ["9.0.0.M1"] and cna.starts_of(ranges, "8.5.29") == ["8.5.0"]
+    assert cna.starts_of(ranges, "9.0.119") == [] and cna.start_of(ranges, "9.0.119") == ""
+    # From the first version; an exact version; and a stated start goes before an open one.
+    opened = [cna.Range("", "2.0", False), "1.4", cna.Range("1.0", "2.0", False)]
+    assert cna.starts_of(opened, "1.4") == ["", "1.4", "1.0"] and cna.start_of(opened, "1.4") == "1.4"
+    assert cna.start_of(opened[:1], "1.4") == ""
+    # Several products in one record: its versions are no one's.
+    assert cna.one_product_ranges({"affected": [entry("Web", *lines), entry("Proxy", lines[1])]}) == []
+    assert cna.one_product_ranges({"affected": [entry("Web", lines[0]), entry("web", lines[1])]}) != []
+    assert cna.one_product_ranges(None) == [] and cna.one_product_ranges({"affected": []}) == []
+
+
+@pytest.mark.parametrize("bounds, corroborated", [
+    ({"versionStartIncluding": "1.0", "versionEndExcluding": "2.0"}, True),
+    ({"versionEndExcluding": "2.0"}, False),
+    ({"versionStartIncluding": "0.9", "versionEndExcluding": "2.0"}, False)])
+def test_corroborated_pairs_are_marked_and_counted_in_the_files(tmp_path, monkeypatch, bounds, corroborated):
+    monkeypatch.setattr(nvd, "FIRST_YEAR", YEAR)
+    records = [cites(record("CVE-2025-1305", cpe("acme", "web", **bounds)), *FIX_CITED["CVE-2025-1305"])
+               if r["id"] == "CVE-2025-1305" else r for r in FIX_NVD]
+    db = LocalDb(tmp_path / "db")
+    db.sync(["osv-maven", "nvd"], log=lambda m: None, fetcher=fetcher(ScriptedTransport(
+        {"/Maven/all.zip": osv_zip(*FAMILY_OSV), **feed_routes(f"nvdcve-2.0-{YEAR}", *records)})))
+    db.sync(["fixes"], fetcher=fetcher(ScriptedTransport(DIFF_ROUTES)), log=lambda m: None)
+    table, links, summary = nvd.attach(LocalDb.open(tmp_path / "db"), FAMILY_ITEMS, FAMILY_FINDINGS, {},
+                                       {"maven": "osv-maven"}, None, FIX_LISTINGS)
+    core, everything, embed, _ = (i["purl"] for i in FAMILY_ITEMS)
+    # web-core holds none of the fix's classes; web-embed holds them, on a link learned from one CVE alone.
+    assert {ref: a["corroborated"] for ref, a in table["CVE-2025-1305"]["affects"].items()} == {
+        core: False, everything: corroborated, embed: False}
+    assert not any("_start" in a for c in table.values() for a in c["affects"].values())
+    # CVE-2025-1304's classes are of a commit not tagged as the patch.
+    assert not any(a["corroborated"] for a in table["CVE-2025-1304"]["affects"].values())
+    assert (summary["corroborated"], summary["pairs_corroborated"]) == ((1, 1) if corroborated else (0, 0))
+    result = {"summary": {"candidates": summary}, "candidates": table, "candidate_links": links}
+    output.candidates_csv(result, tmp_path / "candidates.csv")
+    with (tmp_path / "candidates.csv").open(encoding="utf-8-sig", newline="") as handle:
+        rows = {(r["id"], r["component"]): r["corroborated"] for r in csv.DictReader(handle)}
+    assert rows[("CVE-2025-1305", everything)] == ("fixed classes" if corroborated else "")
+    assert summary["pairs_corroborated_by"] == ({"fixed_classes": 1} if corroborated else {})
+    assert rows[("CVE-2025-1305", core)] == ""
+    text = "\n".join(output._candidate_lines(summary))
+    assert ("1 of them corroborated on 1 component pairs" in text) == corroborated

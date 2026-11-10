@@ -403,7 +403,7 @@ CANDIDATE_COLUMNS = ["id", "severity", "cvss score", "cvss vector", "cvss source
                      "same flaw as finding", "names only another language", "named classes in this jar",
                      "named classes not in this jar", "classes the fix changed", "of them in this jar",
                      "none of the fix's classes in this jar", "module not determined by the record", "fix commits",
-                     "cwe", "description", "url", "data as of"]
+                     "cwe", "description", "url", "data as of", "corroborated"]
 REACHED_BY = {"learned": "learned link", "relocated": "link learned for relocated coordinates",
               "named": "named in the record", "advisory": "named in the vendor's advisory",
               "cna_package": "package named in the CNA's record", "cna_cpe": "CPE in the CNA's record",
@@ -463,7 +463,8 @@ def candidates_csv(result: dict, path: Path):
                              "yes" if a.get("fixed_classes_not_in_jar") else "",
                              "yes" if a.get("sibling_evidence") == "main_module" else "",
                              " ".join(f["url"] for f in c.get("fix_commits") or []),
-                             " ".join(c["cwe"]), c["description"], c["url"], dates])
+                             " ".join(c["cwe"]), c["description"], c["url"], dates,
+                             (a.get("corroborated_by") or "").replace("_", " ")])
         rows.sort(key=lambda r: (SEVERITIES.index(r[1]), r[0], r[9]))
         writer.writerows(rows)
 
@@ -582,6 +583,10 @@ def _candidate_lines(summary: dict | None) -> list[str]:
              + (f"; NVD has given no CPE yet to {sum(summary['nvd_records_without_cpe'].values()):,} records"
                 if summary.get("nvd_records_without_cpe") else "")
              + (f" (local {dates})" if dates else "")]
+    if summary.get("pairs_corroborated"):
+        lines.append(f"             {summary['corroborated']} of them corroborated on {summary['pairs_corroborated']} "
+                     "component pairs: a record states the affected versions of the component's own line, and its "
+                     "jar holds classes the fix changed or the vendor's advisory names the module")
     flagged, left_out = summary.get("pairs_flagged"), summary.get("pairs_left_out") or {}
     refused = sum((summary.get("links_refused") or {}).values())
     if flagged is not None:

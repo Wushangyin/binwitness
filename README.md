@@ -324,6 +324,32 @@ offline, the warning says how many an online scan can tell), nothing tells (`sib
 published, or the component's own entries are unknown), or the CVE is placed on another module
 (`sibling_on_another_module`). `siblings_not_read` counts the POMs and listings not read.
 
+A pair is marked `corroborated` when it stands on more than the learned link. All of these hold:
+
+1. a record states where the affected versions begin, on the component's own major line: NVD's range, the
+   advisory the pair's versions are from, or the CNA's own record when all of it is about one product (NVD
+   often writes one range across the lines the CNA lists apart, `8.5.0` up to `9.0.121`). A range open at the
+   bottom covers an old version without anyone having said so of it;
+2. nothing points elsewhere: the record is not disputed, the pair is not conditional, and it carries none of
+   the flags below;
+3. one of these places the flaw in the jar, and `corroborated_by` tells which:
+   - `fixed_classes`: the jar holds classes changed by the commits the record cites as the fix (those NVD
+     tagged as the patch, or the CNA's when NVD has not analysed the record), and the link does not rest on
+     one CVE. For a `sibling` pair they are classes of the module OSV names, and any commit the record cites
+     will do: the advisory OSV holds already places the CVE in the project;
+   - `vendor_advisory`: the vendor's own advisory names this very module, and the jar is not known to lack
+     the classes of the fix.
+
+Of the candidates of seven deliveries (3,627 pairs), 407 pairs are corroborated, 371 by the classes of the
+fix and 36 by the vendor's advisory. 292 of them are on `tomcat-embed-core`: 37 Tomcat CVEs, those of 2026
+that no reviewed advisory names yet and older ones OSV places on `tomcat-catalina` or `tomcat-coyote`, each
+with the versions a record lists and classes its commits changed. Of the CVEs Apache lists for the Tomcat
+versions in those deliveries, 56% are findings and 93% findings or corroborated candidates. A corroborated
+pair is still a candidate, kept out of the finding counts: no reviewed advisory names the package, and class
+members are not compared, so a fix to code that an old version does not have yet reads the same.
+`summary.candidates` counts them (`corroborated`, `pairs_corroborated`, `pairs_corroborated_by`), and
+`candidates.csv` has the column.
+
 The record's text is read for what it names. When it names Maven modules of the package's project, by
 coordinates (`groupId:artifactId`) or by an artifactId that carries a build (`bcpkix-fips`,
 `bcpkix-jdk18on`), the candidate is kept to those modules, in whichever build the scan has: it reaches

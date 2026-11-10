@@ -91,6 +91,12 @@ CANDIDATE_JUDGING = [
     "change several modules, and a commit a record cites is not always the fix. fix_source_directories names "
     "where the changed sources were (java, or a build variant's own such as jdk1.4); fix_commits_elsewhere are "
     "commits of other projects the record cites, not read.",
+    "corroborated means the pair stands on more than the learned link: a record (NVD's, the advisory its versions "
+    "are from, or the CNA's own when it is about one product) states where the affected versions begin, on the "
+    "component's own major line; no flag points elsewhere; and, as corroborated_by tells, either the jar holds "
+    "classes that the commits tagged as the fix changed (fixed_classes; for basis sibling, classes of the module "
+    "OSV names) or the vendor's own advisory names this module (vendor_advisory). It is still not a reviewed "
+    "advisory on the package, and class members are not compared: say so when reporting one.",
     "status is NVD's analysis state (Not in NVD when NVD does not have the record yet); cna is the organisation "
     "that published the record; disputed means the record says the CVE is disputed.",
     "Say which way you judged and why, that it is a first pass from the record's text, and that candidates are "
@@ -397,7 +403,8 @@ class Service:
             out["candidates"] = [{"id": c["id"], "severity": c["severity"], "disputed": c["disputed"],
                                   **{k: c["affects"][ref].get(k) for k in ("cpe", "versions", "versions_from",
                                                                            "conditional", "basis", "single_cve_link",
-                                                                           "below_listed_lines")},
+                                                                           "below_listed_lines", "corroborated",
+                                                                           "corroborated_by")},
                                   "flags": _flags(c["affects"][ref])} for c in mine]
             out["candidates_note"] = (
                 "leads, not findings; get_candidate shows one" if mine else
@@ -462,6 +469,7 @@ class Service:
                 "only_single_cve_links": all(a["single_cve_link"] for a in affects),
                 "flags": sorted({f for a in affects for f in _flags(a)}),
                 "flagged_components": sum(1 for a in affects if _flags(a)),
+                "corroborated_components": sum(1 for a in affects if a.get("corroborated")),
                 "description": description if len(description) <= DESCRIPTION_BRIEF
                 else description[:DESCRIPTION_BRIEF].rsplit(" ", 1)[0] + " ..."})
         return {"coverage": self._coverage(result, path), "note": CANDIDATE_NOTE, **paging, "candidates": listed,

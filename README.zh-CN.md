@@ -156,6 +156,16 @@ OSV 常常只把一个 CVE 归到项目的另一个坐标下：整个发行版�
 
 这类组件对的 `basis` 为 `sibling`，并写明 OSV 把该 CVE 归在哪些坐标下（`attributed_to`）、哪一种（`sibling`）、依据什么（`sibling_evidence`：`fixed_classes`、`named_classes`、`listing`、`modules_named` 或 `main_module`），版本取 OSV 对那个坐标给出的（`versions_from` 为 `osv`）。没有成对的，在摘要的 `pairs_left_out` 和一条警告里计数：jar 里没有那个模块的代码（`sibling_classes_not_in_jar`），读不到它的 POM 或目录（`sibling_not_read`；离线时警告写明联网扫描能判定其中多少对），无从判断（`sibling_not_told`：没有发布 POM，或组件自己的条目未知），或该 CVE 落到了另一个模块上（`sibling_on_another_module`）。`siblings_not_read` 计读不到的 POM 和目录数。
 
+组件对在不只靠学到的关联站得住时，标为 `corroborated`（佐证）。须同时满足：
+
+1. 有记录写明受影响版本从哪里开始，且起点与组件在同一条主版本线上：NVD 的范围、该组件对版本所出自的公告，或者 CNA 自己的记录（整条记录只讲一个产品时；NVD 常把 CNA 分线列出的范围并成一段，如 `8.5.0` 到 `9.0.121`）。下界敞开的范围盖住了旧版本，却没有谁明说过它受影响；
+2. 没有任何指向别处的迹象：记录未被争议，组件对不是「须与其他产品同用」，也不带下文的任何标记；
+3. 以下之一把缺陷落到这个 jar 上，`corroborated_by` 写明是哪一种：
+   - `fixed_classes`：组件的 jar 里有记录所引修复提交改动的类（NVD 标为补丁的提交，NVD 尚未分析时取 CNA 记录引用的提交），且关联不只靠一个 CVE。`sibling` 组件对要求是 OSV 所指那个模块自己的类，记录引用的任何提交都算：OSV 收录的公告已经把这个 CVE 落在该项目上；
+   - `vendor_advisory`：厂商自己的公告点名的就是这个模块，且未发现 jar 里缺少修复所改的类。
+
+七份交付物的候选（3,627 个组件对）中，407 对有佐证，371 对凭修复所改的类，36 对凭厂商公告。其中 292 对在 `tomcat-embed-core` 上，涉及 37 个 Tomcat CVE：2026 年还没有已审核公告指名到包的，以及 OSV 记在 `tomcat-catalina`、`tomcat-coyote` 名下的旧 CVE，版本取记录所列，类取其提交所改。这些交付物里的 Tomcat 版本，Apache 列出的 CVE 有 56% 报为漏洞，报为漏洞或有佐证候选的合计 93%。有佐证的组件对仍是候选，不计入漏洞数：没有已审核公告指名这个包，也不比较类的成员，所以修复改动的代码在旧版本里尚不存在时看起来一样。`summary.candidates` 给出计数（`corroborated`、`pairs_corroborated`、`pairs_corroborated_by`），`candidates.csv` 有对应的列。
+
 记录正文点名了什么，也会读出来。正文点名了该包所在项目的 Maven 模块时，无论用的是坐标（`groupId:artifactId`）还是带构建后缀的 artifactId（`bcpkix-fips`、`bcpkix-jdk18on`），候选都只落在这些模块上，扫描里是它的哪个构建都算：这些模块即使学不到 CPE 也会落到，项目的其他模块则不列入，除非其 jar 里有记录点名的类（合集 jar）。只点了构建名的，按 OSV 和手边 jar 所知的该模块 groupId 定位，装了哈希索引时也查它；定位不了的不予理会。包名以所点模块名开头的照样算（`bc-fips` 是 FIPS 版的 provider，对应 `bcprov`），拿不准时宁留不删。只点了不带构建后缀的 artifactId（如 `camel-http`）不据此剔除任何组件对：这类记录点的常常是漏洞的触发路径，缺陷本身在共享模块里。摘要给出因此不列入的组件对数。另有五项只做标记，不据此取舍：
 
 - 与发现同一缺陷：记录引用了该组件某条发现的 CVE，或那条发现的记录引用了这条候选（同一缺陷复制到别的产品里会另编一个 CVE）；
